@@ -1,11 +1,7 @@
-
 # Dependencies
 node_modules/
 .pnpm/
 .pnpm-store/
-
-# Workspace node_modules
-packages/*/node_modules/
 
 # Logs
 logs/
@@ -19,6 +15,7 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+!.env.test
 
 # TypeScript
 *.tsbuildinfo
@@ -27,7 +24,7 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# IDE 
+# IDE
 .vscode/
 .idea/
 Notes.md
@@ -37,3 +34,19 @@ Notes.md
 .tmp/
 .temp/
 
+# Build outputs
+dist/
+build/
+.output/
+
+# Deployment targets
+.vercel/
+.netlify/
+.wrangler/
+
+# SvelteKit
+.svelte-kit/
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
