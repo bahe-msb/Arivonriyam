@@ -1,13 +1,13 @@
 {
-  "name": "Arivonriyam",
+  "name": "arivonriyam",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
+    "dev:server": "pnpm --filter @arivonriyam/server dev",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Balasubramanian",
   "packageManager": "pnpm@10.33.0"
 }
