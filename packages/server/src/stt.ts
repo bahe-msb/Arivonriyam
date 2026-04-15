@@ -1,5 +1,6 @@
 import { execFile } from "child_process";
 import path from "node:path";
+import { json } from "node:stream/consumers";
 import { fileURLToPath } from "node:url";
 import { promisify } from "util";
 
@@ -17,11 +18,7 @@ export async function TranscribeAudio(audioPath: string): Promise<string> {
     WHISPER_MODEL,
     "-f",
     audioPath,
-    "-l",
-    "ta",
-    "-tr",
-    "oj",
+    "-nt",
   ]);
-  console.log("Whisper output:", stdout.trim());
   return stdout.trim();
 }

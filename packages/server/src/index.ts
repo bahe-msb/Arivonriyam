@@ -34,42 +34,57 @@ app.get("/api/stt", (req, res) => {
 });
 
 // Ollama route
-app.post("/api/ask", async (req, res) => {
-  const { prompt } = req.body;
+app.get("/api/ask", async (req, res) => {
+  // const { prompt } = req.body;
 
-  if (!prompt || typeof prompt !== "string") {
-    res.status(400).json({ error: "prompt must be a non-empty string" });
-    return;
+  // if (!prompt || typeof prompt !== "string") {
+  //   res.status(400).json({ error: "prompt must be a non-empty string" });
+  //   return;
+  // }
+
+  try {
+    // STT
+    const audioPath = path.resolve(__dirname, "../../whisper.cpp/samples/captial.wav");
+    if (!audioPath || typeof audioPath !== "string") {
+      res.status(400).json({ error: "audioPath must be a non-empty string" });
+      return;
+    }
+    const transcriptionText = await TranscribeAudio(audioPath);
+
+    // Set headers for streaming response
+    res.setHeader("Content-Type", "text/plain");
+    res.setHeader("Transfer-Encoding", "chunked");
+
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gemma4:latest",
+        prompt: transcriptionText,
+        stream: false,
+      }),
+    });
+
+    // Async iterable
+    // for await (const chunk of stream.body as AsyncIterable<Uint8Array>) {
+    //   const text = new TextDecoder().decode(chunk);
+    //   const json = JSON.parse(text) as { response: string; done: boolean };
+    //   res.write(json.response);
+
+    //   if (json.done) break;
+    // }
+    // res.end();
+
+    // Stream - false
+    const data = await response.json();
+    res.json({
+      input: transcriptionText,
+      output: data.response,
+    });
+  } catch (error) {
+    console.error("Error processing request:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  res.setHeader("Content-Type", "text/plain");
-  res.setHeader("Transfer-Encoding", "chunked");
-
-  const stream = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gemma4:latest",
-      prompt,
-      stream: false,
-      options: {
-        temperature: 0.7,
-        num_predict: 150,
-        repeat_penalty: 1.1,
-        top_p: 0.9,
-      },
-    }),
-  });
-
-  // Async iterable
-  for await (const chunk of stream.body as AsyncIterable<Uint8Array>) {
-    const text = new TextDecoder().decode(chunk);
-    const json = JSON.parse(text) as { response: string; done: boolean };
-    res.write(json.response);
-
-    if (json.done) break;
-  }
-  res.end();
 });
 
 // Serve SvelteKit static build
