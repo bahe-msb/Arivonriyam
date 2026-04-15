@@ -1,9 +1,14 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import dotenv from "dotenv";
+import { TranscribeAudio } from "./stt";
+
+dotenv.config();
 
 const app = express();
-const PORT = 9012;
+const PORT = process.env.PORT || 9012;
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_BUILD = path.resolve(__dirname, "../../client/build");
@@ -14,6 +19,18 @@ app.use(express.json());
 // Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+// STT - Test
+app.get("/api/stt", (req, res) => {
+  const audioPath = path.resolve(__dirname, "../../whisper.cpp/samples/tamil.wav");
+  console.log("audioPath:", audioPath);
+  TranscribeAudio(audioPath)
+    .then((transcription) => res.json({ transcription }))
+    .catch((error) => {
+      console.error("Error transcribing audio:", error);
+      res.status(500).json({ error: "Failed to transcribe audio" });
+    });
 });
 
 // Ollama route
@@ -28,7 +45,7 @@ app.post("/api/ask", async (req, res) => {
   res.setHeader("Content-Type", "text/plain");
   res.setHeader("Transfer-Encoding", "chunked");
 
-  const stream = await fetch("http://localhost:11434/api/generate", {
+  const stream = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
