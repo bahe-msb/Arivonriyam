@@ -43,6 +43,87 @@ const CLIENT_BUILD = path.resolve(__dirname, "../../client/build");
 // Middleware
 app.use(express.json());
 
+function createRequestId(): string {
+  return `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const ANSI = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+} as const;
+
+function color(text: string, ansiColor: string): string {
+  return `${ansiColor}${text}${ANSI.reset}`;
+}
+
+function formatMeta(meta?: Record<string, unknown>): string {
+  if (!meta || Object.keys(meta).length === 0) {
+    return "";
+  }
+
+  return Object.entries(meta)
+    .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(" ");
+}
+
+function printLog(
+  level: "INFO" | "ERROR",
+  requestId: string,
+  stage: string,
+  message: string,
+  meta?: Record<string, unknown>,
+): void {
+  const timestamp = new Date().toISOString();
+  const levelColor = level === "ERROR" ? ANSI.red : ANSI.green;
+  const stageColor =
+    stage === "upload"
+      ? ANSI.cyan
+      : stage === "stt"
+        ? ANSI.yellow
+        : stage === "ollama"
+          ? ANSI.green
+          : ANSI.cyan;
+
+  const prefix = [
+    color(timestamp, ANSI.dim),
+    color(`[${level}]`, levelColor),
+    color(`[${requestId}]`, ANSI.cyan),
+    color(`[${stage}]`, stageColor),
+  ].join(" ");
+
+  const metaText = formatMeta(meta);
+  const line = metaText ? `${prefix} ${message} | ${metaText}` : `${prefix} ${message}`;
+
+  if (level === "ERROR") {
+    console.error(line);
+    return;
+  }
+
+  console.log(line);
+}
+
+function logInfo(
+  requestId: string,
+  stage: string,
+  message: string,
+  meta?: Record<string, unknown>,
+): void {
+  printLog("INFO", requestId, stage, message, meta);
+}
+
+function logError(
+  requestId: string,
+  stage: string,
+  message: string,
+  meta?: Record<string, unknown>,
+): void {
+  printLog("ERROR", requestId, stage, message, meta);
+}
+
 class AppError extends Error {
   status: number;
   stage: string;
@@ -64,7 +145,6 @@ function sanitizeFileExtension(fileName: string): string {
 
 async function saveUploadedAudioToTemp(file: Express.Multer.File): Promise<string> {
   const extension = sanitizeFileExtension(file.originalname);
-  console.log("temp", os.tmpdir());
   const tempPath = path.join(
     os.tmpdir(),
     `arivonriyam-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${extension}`,
@@ -73,8 +153,15 @@ async function saveUploadedAudioToTemp(file: Express.Multer.File): Promise<strin
   return tempPath;
 }
 
-async function generateOllamaResponse(prompt: string): Promise<string> {
+async function generateOllamaResponse(prompt: string, requestId?: string): Promise<string> {
   try {
+    if (requestId) {
+      logInfo(requestId, "ollama", "Sending prompt to Ollama", {
+        model: OLLAMA_MODEL,
+        promptLength: prompt.length,
+      });
+    }
+
     const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -86,6 +173,13 @@ async function generateOllamaResponse(prompt: string): Promise<string> {
     });
 
     if (!response.ok) {
+      if (requestId) {
+        logError(requestId, "ollama", "Ollama returned a non-success status", {
+          status: response.status,
+          statusText: response.statusText,
+        });
+      }
+
       throw new AppError(
         `Ollama request failed: ${response.status} ${response.statusText}`,
         502,
@@ -94,10 +188,24 @@ async function generateOllamaResponse(prompt: string): Promise<string> {
     }
 
     const data = (await response.json()) as { response?: string };
-    return data.response?.trim() || "";
+    const output = data.response?.trim() || "";
+
+    if (requestId) {
+      logInfo(requestId, "ollama", "Ollama response received", {
+        outputLength: output.length,
+      });
+    }
+
+    return output;
   } catch (error) {
     if (error instanceof AppError) {
       throw error;
+    }
+
+    if (requestId) {
+      logError(requestId, "ollama", "Failed to connect to Ollama", {
+        error: error instanceof Error ? error.message : "unknown error",
+      });
     }
 
     throw new AppError(
@@ -115,17 +223,28 @@ app.get("/health", (req, res) => {
 
 app.post("/api/voice-file", upload.single("audio"), async (req, res) => {
   let tempAudioPath: string | null = null;
+  const requestId = createRequestId();
 
   try {
     if (!req.file) {
       res.status(400).json({ error: "Please upload an audio file using field name 'audio'." });
       return;
     }
+
+    logInfo(requestId, "upload", "Audio file received", {
+      filename: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    });
+
     // As in multer we are using multer.memoryStorage(), the uploaded file is available in req.file.buffer
     // We need to save it to a temp file for whisper.cpp to process it.
     tempAudioPath = await saveUploadedAudioToTemp(req.file);
+    logInfo(requestId, "upload", "Temporary audio file created");
+
     let transcription = "";
     try {
+      logInfo(requestId, "stt", "Starting whisper transcription");
       transcription = await TranscribeAudio(tempAudioPath);
     } catch {
       throw new AppError(
@@ -135,25 +254,36 @@ app.post("/api/voice-file", upload.single("audio"), async (req, res) => {
       );
     }
 
+    logInfo(requestId, "stt", "Whisper transcription completed", {
+      textLength: transcription.length,
+      preview: transcription.slice(0, 140),
+    });
+
     if (!transcription) {
       res
         .status(422)
         .json({ error: "Could not transcribe speech from this audio file.", stage: "stt" });
       return;
     }
-    console.log("Transcription:", transcription);
-    const output = await generateOllamaResponse(transcription);
+
+    const output = await generateOllamaResponse(transcription, requestId);
+    logInfo(requestId, "pipeline", "Voice pipeline completed successfully");
+
     res.json({
       transcription,
       output,
       meta: {
+        requestId,
         model: OLLAMA_MODEL,
         filename: req.file.originalname,
         size: req.file.size,
       },
     });
   } catch (error) {
-    console.error("/api/voice-file failed:", error);
+    logError(requestId, "pipeline", "/api/voice-file failed", {
+      error: error instanceof Error ? error.message : "unknown error",
+    });
+
     if (error instanceof AppError) {
       res.status(error.status).json({ error: error.message, stage: error.stage });
       return;
@@ -191,7 +321,6 @@ app.post("/api/test/ask", async (req, res) => {
 // STT - Test
 app.get("/api/test/stt", (req, res) => {
   const audioPath = path.resolve(__dirname, "../../whisper.cpp/samples/tamil.wav");
-  console.log("audioPath:", audioPath);
   TranscribeAudio(audioPath)
     .then((transcription) => res.json({ transcription }))
     .catch((error) => {

@@ -9,9 +9,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WHISPER_ROOT = path.resolve(__dirname, "../../whisper.cpp");
 
 const WHISPER_EXEC = path.join(WHISPER_ROOT, "build/bin/whisper-cli");
-const DEFAULT_MODEL_NAME = process.env.WHISPER_MODEL_SIZE || "base";
+const DEFAULT_MODEL_NAME = process.env.WHISPER_MODEL_SIZE || "large-v2";
 
 function getWhisperModelPath(modelName: string): string {
+  if (modelName === "large-v2") {
+    return path.join(WHISPER_ROOT, "models/ggml-large-v2.bin");
+  }
+
   if (modelName === "small") {
     return path.join(WHISPER_ROOT, "models/ggml-small.bin");
   }
@@ -22,7 +26,9 @@ function getWhisperModelPath(modelName: string): string {
 export interface TranscribeOptions {
   sourceLanguage?: string;
   translateToEnglish?: boolean;
-  modelName?: "base" | "small";
+  modelName?: "base" | "small" | "large-v2";
+  beamSize?: number;
+  bestOf?: number;
 }
 
 export async function transcribeAudio(
@@ -31,15 +37,29 @@ export async function transcribeAudio(
 ): Promise<string> {
   const sourceLanguage = options.sourceLanguage ?? "ta";
   const translateToEnglish = options.translateToEnglish ?? true;
+  const beamSize = options.beamSize ?? 5;
+  const bestOf = options.bestOf ?? 5;
   const modelPath = getWhisperModelPath(
-    options.modelName ?? (DEFAULT_MODEL_NAME as "base" | "small"),
+    options.modelName ?? (DEFAULT_MODEL_NAME as "base" | "small" | "large-v2"),
   );
 
   // Fail fast with a clear message when whisper binaries or models are missing.
   await fs.access(WHISPER_EXEC);
   await fs.access(modelPath);
 
-  const args = ["-m", modelPath, "-f", audioPath, "-l", sourceLanguage, "-nt"];
+  const args = [
+    "-m",
+    modelPath,
+    "-f",
+    audioPath,
+    "-l",
+    sourceLanguage,
+    "-bs",
+    String(beamSize),
+    "-bo",
+    String(bestOf),
+    "-nt",
+  ];
 
   if (translateToEnglish) {
     args.push("-tr");
