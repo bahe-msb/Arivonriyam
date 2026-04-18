@@ -87,17 +87,17 @@
 
   /* Notebook ruled-line pattern for lesson canvas */
   .bg-notebook-lines {
-    background-image: repeating-linear-gradient(transparent,
-        transparent 31px,
-        #c5c5d7 31px,
-        #c5c5d7 32px);
+    background-image: repeating-linear-gradient(
+      transparent,
+      transparent 31px,
+      #c5c5d7 31px,
+      #c5c5d7 32px
+    );
   }
 
   /* Kolam geometry dot grid — Mission Control sidebar accent */
   .bg-kolam-dots {
-    background-image: radial-gradient(circle,
-        rgba(255, 224, 136, 0.07) 1px,
-        transparent 1px);
+    background-image: radial-gradient(circle, rgba(255, 224, 136, 0.07) 1px, transparent 1px);
     background-size: 18px 18px;
   }
 }

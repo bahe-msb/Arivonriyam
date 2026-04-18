@@ -9,6 +9,6 @@
   let { children, class: className = "" }: Props = $props();
 </script>
 
-<aside data-sidebar="root" class={className}>
+<main data-sidebar="inset" class={className}>
   {@render children?.()}
-</aside>
+</main>
