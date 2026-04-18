@@ -10,6 +10,6 @@ export const upload = multer({
       callback(null, true);
       return;
     }
-    callback(new Error("Only audio files are supported."));
+    callback(new Error("Only .wav audio files are supported."));
   },
 });

@@ -14,7 +14,7 @@ export function handleKnownErrors(
     return;
   }
 
-  if (error instanceof Error && error.message === "Only audio files are supported.") {
+  if (error instanceof Error && error.message === "Only .wav audio files are supported.") {
     res.status(400).json({ error: error.message });
     return;
   }

@@ -2,22 +2,33 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Request, Response } from "express";
 import { AppError } from "../lib/errors";
+import { type SubjectName } from "../repositories";
 import { transcribeFromPath } from "../repositories";
 import { askPrompt } from "../services";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const allowedSubjects: ReadonlyArray<SubjectName> = ["tamil", "maths", "science"];
 
 /** Runs a simple text-to-LLM request for manual testing. */
 export async function postTestAsk(req: Request, res: Response): Promise<void> {
   const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+  const grade = typeof req.body?.grade === "string" ? req.body.grade.trim() : "3";
+  const subject =
+    typeof req.body?.subject === "string" ? req.body.subject.trim().toLowerCase() : "tamil";
+
   if (!prompt) {
     res.status(400).json({ error: "prompt must be a non-empty string" });
     return;
   }
 
+  if (!allowedSubjects.includes(subject as SubjectName)) {
+    res.status(400).json({ error: "subject must be one of tamil|maths|science" });
+    return;
+  }
+
   try {
-    const output = await askPrompt(prompt);
-    res.json({ input: prompt, output });
+    const output = await askPrompt(prompt, grade, subject as SubjectName);
+    res.json({ input: prompt, output, meta: { grade, subject } });
   } catch (error) {
     if (error instanceof AppError) {
       res.status(error.status).json({ error: error.message, stage: error.stage });

@@ -6,8 +6,11 @@ import { upload } from "../middleware";
 export function createApiRouter(): Router {
   const router = Router();
 
+  // Project Specific endpoints
   router.get("/health", getHealth);
-  router.post("/api/voice-file", upload.single("audio"), postVoiceFile);
+  router.post("/api/student/conservation", upload.single("audio"), postVoiceFile);
+
+  // Test endpoints
   router.post("/api/test/ask", postTestAsk);
   router.get("/api/test/stt", getTestStt);
 

@@ -2,13 +2,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const knownAudioExtensions = new Set([".wav", ".mp3", ".m4a", ".webm", ".ogg", ".flac"]);
+const knownAudioExtensions = new Set([".wav"]);
 
 /** Returns true when a file looks like a supported audio upload. */
 export function isSupportedAudioFile(fileName: string, mimeType: string): boolean {
   const ext = path.extname(fileName || "").toLowerCase();
   const hasKnownAudioExt = knownAudioExtensions.has(ext);
-  const mimeLooksAudio = mimeType.startsWith("audio/");
+  const mimeLooksAudio = mimeType === "audio/wav" || mimeType === "audio/x-wav";
   const mimeIsGeneric =
     mimeType === "application/octet-stream" ||
     mimeType === "" ||

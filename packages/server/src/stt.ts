@@ -38,7 +38,7 @@ export async function transcribeAudio(
   options: TranscribeOptions = {},
 ): Promise<string> {
   const sourceLanguage = options.sourceLanguage ?? "ta";
-  const translateToEnglish = options.translateToEnglish ?? true;
+  const translateToEnglish = options.translateToEnglish ?? false;
   const beamSize = options.beamSize ?? 5;
   const bestOf = options.bestOf ?? 5;
   const modelPath = getWhisperModelPath(
