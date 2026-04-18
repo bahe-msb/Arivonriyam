@@ -3,13 +3,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "util";
+import { env } from "./config";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WHISPER_ROOT = path.resolve(__dirname, "../../whisper.cpp");
 
 const WHISPER_EXEC = path.join(WHISPER_ROOT, "build/bin/whisper-cli");
-const DEFAULT_MODEL_NAME = process.env.WHISPER_MODEL_SIZE || "large-v2";
+const DEFAULT_MODEL_NAME = env.whisperModelSize;
 
 function getWhisperModelPath(modelName: string): string {
   if (modelName === "large-v2") {
@@ -31,6 +32,7 @@ export interface TranscribeOptions {
   bestOf?: number;
 }
 
+/** Transcribes speech from a local audio file with whisper.cpp. */
 export async function transcribeAudio(
   audioPath: string,
   options: TranscribeOptions = {},
@@ -69,6 +71,7 @@ export async function transcribeAudio(
   return stdout.trim();
 }
 
+/** Backward-compatible alias for transcription calls. */
 export async function TranscribeAudio(audioPath: string): Promise<string> {
   return transcribeAudio(audioPath);
 }
