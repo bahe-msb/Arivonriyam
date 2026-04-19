@@ -7,14 +7,14 @@ import { transcribeFromPath } from "../repositories";
 import { askPrompt } from "../services";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const allowedSubjects: ReadonlyArray<SubjectName> = ["tamil", "maths", "science"];
+const allowedSubjects: ReadonlyArray<SubjectName> = ["english"];
 
 /** Runs a simple text-to-LLM request for manual testing. */
 export async function postTestAsk(req: Request, res: Response): Promise<void> {
   const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
-  const grade = typeof req.body?.grade === "string" ? req.body.grade.trim() : "3";
+  const grade = typeof req.body?.grade === "string" ? req.body.grade.trim() : "1";
   const subject =
-    typeof req.body?.subject === "string" ? req.body.subject.trim().toLowerCase() : "tamil";
+    typeof req.body?.subject === "string" ? req.body.subject.trim().toLowerCase() : "english";
 
   if (!prompt) {
     res.status(400).json({ error: "prompt must be a non-empty string" });
@@ -22,7 +22,7 @@ export async function postTestAsk(req: Request, res: Response): Promise<void> {
   }
 
   if (!allowedSubjects.includes(subject as SubjectName)) {
-    res.status(400).json({ error: "subject must be one of tamil|maths|science" });
+    res.status(400).json({ error: "subject must be english" });
     return;
   }
 
@@ -38,9 +38,9 @@ export async function postTestAsk(req: Request, res: Response): Promise<void> {
   }
 }
 
-/** Runs transcription on bundled tamil sample for manual smoke checks. */
+/** Runs transcription on bundled English sample for manual smoke checks. */
 export async function getTestStt(_req: Request, res: Response): Promise<void> {
-  const audioPath = path.resolve(__dirname, "../../whisper.cpp/samples/tamil.wav");
+  const audioPath = path.resolve(__dirname, "../../whisper.cpp/samples/jfk.wav");
 
   try {
     const transcription = await transcribeFromPath(audioPath);

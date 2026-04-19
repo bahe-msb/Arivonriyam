@@ -5,7 +5,7 @@ import { type SubjectName } from "../repositories";
 import { askWithRag } from "../services";
 import { createRequestId } from "../utils";
 
-const allowedSubjects: ReadonlyArray<SubjectName> = ["tamil", "maths", "science"];
+const allowedSubjects: ReadonlyArray<SubjectName> = ["english"];
 
 /** Handles textbook RAG tutoring requests for a specific grade and subject. */
 export async function postRagAsk(req: Request, res: Response): Promise<void> {
@@ -16,7 +16,7 @@ export async function postRagAsk(req: Request, res: Response): Promise<void> {
   const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
 
   if (!grade || !query || !allowedSubjects.includes(subject as SubjectName)) {
-    res.status(400).json({ error: "grade, subject(tamil|maths|science), and query are required" });
+    res.status(400).json({ error: "grade, subject(english), and query are required" });
     return;
   }
 

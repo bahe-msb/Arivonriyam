@@ -37,7 +37,7 @@ export async function transcribeAudio(
   audioPath: string,
   options: TranscribeOptions = {},
 ): Promise<string> {
-  const sourceLanguage = options.sourceLanguage ?? "ta";
+  const sourceLanguage = options.sourceLanguage ?? env.whisperLanguage;
   const translateToEnglish = options.translateToEnglish ?? false;
   const beamSize = options.beamSize ?? 5;
   const bestOf = options.bestOf ?? 5;
@@ -63,9 +63,9 @@ export async function transcribeAudio(
     "-nt",
   ];
 
-  if (translateToEnglish) {
-    args.push("-tr");
-  }
+  // if (translateToEnglish) {
+  //   args.push("-tr");
+  // }
 
   const { stdout } = await execFileAsync(WHISPER_EXEC, args);
   return stdout.trim();

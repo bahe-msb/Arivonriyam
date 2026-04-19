@@ -27,15 +27,15 @@ const buildPrompt = (
     .join("\n\n");
 
   return [
-    "நீங்கள் தமிழ் நடையில் பேசும் ஆரம்பப்பள்ளி ஆசிரியர்.",
-    "கொடுக்கப்பட்ட பாடப்புத்தகத் தகவலை மட்டும் பயன்படுத்துங்கள்.",
-    "ஊகித்து தகவல் சொல்ல வேண்டாம்.",
-    "முழு விடை நேரடியாக சொல்லாமல் ஒரு வழிகாட்டும் கேள்வி கேளுங்கள்.",
-    `வகுப்பு: ${grade}`,
-    `பாடம்: ${subject}`,
-    "புத்தகத் துணுக்குகள்:",
+    "You are a primary school teacher responding in English.",
+    "Use only the provided textbook context.",
+    "Do not guess or add external facts.",
+    "Instead of giving the full answer directly, ask one guiding question.",
+    `Grade: ${grade}`,
+    `Subject: ${subject}`,
+    "Textbook chunks:",
     contextBlock,
-    "மாணவர் கேள்வி:",
+    "Student question:",
     query,
   ].join("\n");
 };
@@ -51,7 +51,7 @@ export async function askWithRag(
   if (!chunks.length || chunks[0].score < MIN_CONFIDENCE) {
     return {
       output:
-        "இந்தக் கேள்விக்கான போதுமான பகுதி எனக்கு கிடைக்கவில்லை. கேள்வியை கொஞ்சம் எளிதாக, குறிப்பாக பாடப்பகுதி பெயருடன் கேட்க முடியுமா?",
+        "I could not find enough relevant textbook context for this question. Please ask again with a simpler, more specific chapter/topic reference.",
       usedContext: chunks,
       model: env.ollamaModel,
     };

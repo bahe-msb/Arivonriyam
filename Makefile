@@ -5,7 +5,7 @@ PY := $(VENV)/bin/python
 
 DATA_ROOT ?= ./packages/server/data
 COLLECTION ?= arivonriyam_textbooks_v1
-EMBEDDING_MODEL ?= sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+EMBEDDING_MODEL ?= BAAI/bge-small-en-v1.5
 
 .PHONY: rag-venv rag-install rag-ingest
 

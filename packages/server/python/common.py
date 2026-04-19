@@ -6,70 +6,44 @@ import unicodedata
 from pathlib import Path
 from typing import Iterable
 
-DIGIT_MAP = str.maketrans(
-    {
-        "௦": "0",
-        "௧": "1",
-        "௨": "2",
-        "௩": "3",
-        "௪": "4",
-        "௫": "5",
-        "௬": "6",
-        "௭": "7",
-        "௮": "8",
-        "௯": "9",
-        "०": "0",
-        "१": "1",
-        "२": "2",
-        "३": "3",
-        "४": "4",
-        "५": "5",
-        "६": "6",
-        "७": "7",
-        "८": "8",
-        "९": "9",
-    }
-)
+import tiktoken
 
 
 def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    normalized = normalized.translate(DIGIT_MAP)
     normalized = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip()
 
 
-# Chunking strategy: split into 500 character chunks with 100 character overlap, trying to split at natural boundaries like newlines or punctuation.
+# Chunking strategy: split into token chunks with overlap for better retrieval consistency.
 def split_chunks(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
-    if len(text) <= chunk_size:
-        return [text] if text else []
+    text = text.strip()
+    if not text:
+        return []
 
-    separators = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " "]
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+    encoding = tiktoken.get_encoding("cl100k_base")
+    token_ids = encoding.encode(text)
+    if len(token_ids) <= chunk_size:
+        return [text]
+
+    stride = chunk_size - chunk_overlap
     chunks: list[str] = []
     cursor = 0
+    while cursor < len(token_ids):
+        hard_end = min(cursor + chunk_size, len(token_ids))
+        chunk = encoding.decode(token_ids[cursor:hard_end]).strip()
+        if chunk:
+            chunks.append(chunk)
 
-    while cursor < len(text):
-        hard_end = min(cursor + chunk_size, len(text))
-        if hard_end == len(text):
-            chunks.append(text[cursor:].strip())
+        if hard_end == len(token_ids):
             break
+        cursor += stride
 
-        cut = -1
-        window = text[cursor:hard_end]
-        for sep in separators:
-            idx = window.rfind(sep)
-            if idx > 0:
-                cut = cursor + idx + len(sep)
-                break
-
-        if cut <= cursor:
-            cut = hard_end
-
-        chunks.append(text[cursor:cut].strip())
-        cursor = max(cut - chunk_overlap, cursor + 1)
-
-    return [chunk for chunk in chunks if chunk]
+    return chunks
 
 
 def discover_jobs(raw_root: Path) -> Iterable[tuple[str, str, Path]]:

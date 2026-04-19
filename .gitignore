@@ -56,3 +56,9 @@ venv/
 
 # Rag data
 /packages/server/data/raw/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

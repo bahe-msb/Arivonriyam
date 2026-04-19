@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from chromadb import PersistentClient
+from chromadb.errors import NotFoundError
 from fastembed import TextEmbedding
 
 from common import normalize_text
@@ -21,7 +22,17 @@ def retrieve(
 ) -> dict[str, object]:
     chroma_root = data_root / "chroma"
     client = PersistentClient(path=str(chroma_root))
-    collection = client.get_collection(collection_name)
+    try:
+        collection = client.get_collection(collection_name)
+    except NotFoundError as exc:
+        existing_collections = [item.name for item in client.list_collections()]
+        raise RuntimeError(
+            "Collection not found. "
+            f"Requested='{collection_name}', existing={existing_collections}, "
+            f"chroma_path='{chroma_root}'. "
+            "Run ingest with the same --collection value used by retriever/env."
+        ) from exc
+
     model = TextEmbedding(model_name=embedding_model_name)
 
     normalized_query = normalize_text(query)
@@ -72,10 +83,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", required=True)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--data-root", default="../data")
-    parser.add_argument("--collection", default="arivondum_textbooks_v1")
+    parser.add_argument("--collection", default="arivonriyam_textbooks_v1")
     parser.add_argument(
         "--embedding-model",
-        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        default="BAAI/bge-small-en-v1.5",
     )
     return parser.parse_args()
 

@@ -7,6 +7,13 @@ interface OllamaResponse {
 
 /** Sends a prompt to Ollama and returns trimmed model output. */
 export async function generateLlmResponse(prompt: string): Promise<string> {
+  const englishOnlyPrompt = [
+    "Respond only in English.",
+    "Keep the response clear and concise for a primary-school student.",
+    "",
+    prompt,
+  ].join("\n");
+
   let response: Response;
 
   try {
@@ -15,7 +22,7 @@ export async function generateLlmResponse(prompt: string): Promise<string> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: env.ollamaModel,
-        prompt,
+        prompt: englishOnlyPrompt,
         stream: false,
       }),
     });

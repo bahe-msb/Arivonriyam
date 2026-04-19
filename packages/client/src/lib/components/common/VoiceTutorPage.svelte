@@ -75,7 +75,7 @@
     }
 
     speechRecognition = new SpeechRecognitionCtor();
-    speechRecognition.lang = "ta-IN";
+    speechRecognition.lang = "en-IN";
     speechRecognition.interimResults = true;
     speechRecognition.continuous = true;
 

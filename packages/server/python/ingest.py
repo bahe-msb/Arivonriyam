@@ -59,10 +59,11 @@ def ingest(data_root: Path, collection_name: str, model_name: str) -> None:
                 totals["characters"] += len(normalized)
                 file_characters += len(normalized)
 
-                chunks = split_chunks(normalized, chunk_size=500, chunk_overlap=100)
+                chunks = split_chunks(normalized, chunk_size=400, chunk_overlap=50)
                 if not chunks:
                     continue
 
+                print(f"[chunks] {json.dumps(chunks, indent=2, default=str)}")
                 embeddings = list(embedding_model.embed(chunks))
                 ids = [build_chunk_id(pdf_path, page_no, idx, chunk) for idx, chunk in enumerate(chunks)]
                 metadatas = [
@@ -71,7 +72,7 @@ def ingest(data_root: Path, collection_name: str, model_name: str) -> None:
                         "subject": subject,
                         "chapter": "unknown",
                         "page": page_no,
-                        "language": "ta",
+                        "language": "en",
                         "source_file": pdf_path.name,
                         "textbook_board": "official_textbook",
                     }
@@ -86,6 +87,8 @@ def ingest(data_root: Path, collection_name: str, model_name: str) -> None:
                 )
                 file_chunk_count += len(chunks)
                 totals["chunks"] += len(chunks)
+
+                print(f"  [metadata] {json.dumps(metadatas, indent=2, ensure_ascii=False)} ")
 
             doc.close()
             print(
@@ -110,10 +113,10 @@ def ingest(data_root: Path, collection_name: str, model_name: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline textbook ingestion into ChromaDB")
     parser.add_argument("--data-root", default="../data", help="Path to data folder containing raw/chroma")
-    parser.add_argument("--collection", default="arivondum_textbooks_v1", help="Collection name")
+    parser.add_argument("--collection", default="arivonriyam_textbooks_v1", help="Collection name")
     parser.add_argument(
         "--embedding-model",
-        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        default="BAAI/bge-small-en-v1.5",
         help="FastEmbed model name",
     )
     return parser.parse_args()

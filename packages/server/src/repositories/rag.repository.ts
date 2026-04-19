@@ -13,7 +13,7 @@ const RETRIEVER_SCRIPT = path.join(PYTHON_DIR, "retriever.py");
 const DATA_ROOT = path.resolve(__dirname, "../../data");
 const PROJECT_VENV_PYTHON = path.resolve(__dirname, "../../../../.venv/bin/python");
 
-export type SubjectName = "tamil" | "maths" | "science";
+export type SubjectName = "english";
 
 export interface RetrieverChunk {
   text: string;

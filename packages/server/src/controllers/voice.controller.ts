@@ -4,14 +4,14 @@ import { type SubjectName } from "../repositories";
 import { processVoiceFile } from "../services";
 import { createRequestId } from "../utils";
 
-const allowedSubjects: ReadonlyArray<SubjectName> = ["tamil", "maths", "science"];
+const allowedSubjects: ReadonlyArray<SubjectName> = ["english"];
 
 /** Handles voice upload endpoint and returns transcription plus AI output. */
 export async function postVoiceFile(req: Request, res: Response): Promise<void> {
   const requestId = createRequestId();
-  const grade = typeof req.body?.grade === "string" ? req.body.grade.trim() : "3";
+  const grade = typeof req.body?.grade === "string" ? req.body.grade.trim() : "1";
   const subject =
-    typeof req.body?.subject === "string" ? req.body.subject.trim().toLowerCase() : "tamil";
+    typeof req.body?.subject === "string" ? req.body.subject.trim().toLowerCase() : "english";
 
   if (!req.file) {
     res.status(400).json({ error: "Please upload an audio file using field name 'audio'." });
@@ -19,7 +19,7 @@ export async function postVoiceFile(req: Request, res: Response): Promise<void> 
   }
 
   if (!allowedSubjects.includes(subject as SubjectName)) {
-    res.status(400).json({ error: "subject must be one of tamil|maths|science" });
+    res.status(400).json({ error: "subject must be english" });
     return;
   }
 
