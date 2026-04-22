@@ -5,11 +5,12 @@
     "baseColor": "neutral"
   },
   "aliases": {
-    "components": "$lib/components",
-    "utils": "$lib/utils",
-    "ui": "$lib/components/ui",
-    "lib": "$lib",
-    "hooks": "$lib/hooks"
+    "components": "@components",
+    "utils": "@utils",
+    "ui": "@shadcn",
+    "lib": "@lib",
+    "hooks": "@lib/hooks"
   },
+  "typescript": true,
   "iconLibrary": "lucide"
 }

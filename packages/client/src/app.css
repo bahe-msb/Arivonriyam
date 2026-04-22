@@ -2,135 +2,400 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* ============================================================
+   FONTS 
+   ============================================================ */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url("/fonts/inter.woff2") format("woff2");
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url("/fonts/inter-latin-ext.woff2") format("woff2");
+  unicode-range:
+    U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F,
+    U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/fonts/dm-sans.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "DM Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/dm-mono.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-sans.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Noto Sans Tamil";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/noto-sans-tamil.woff2") format("woff2");
+  unicode-range: U+0964-0965, U+0B82-0BFA, U+200C-200D, U+20B9, U+25CC;
+}
+
+@font-face {
+  font-family: "Noto Sans Tamil";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/noto-sans-tamil-latin.woff2") format("woff2");
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ============================================================
+   Arivonriyam warm accents
+   ============================================================ */
+:root {
+  /* Cobalt (Primary) */
+  --cobalt-25: #eaf0fc;
+  --cobalt-50: #d5e0f8;
+  --cobalt-100: #c4d0f3;
+  --cobalt-150: #abc2f1;
+  --cobalt-200: #96b3ee;
+  --cobalt-250: #80a3eb;
+  --cobalt-300: #6b94e7;
+  --cobalt-350: #5685e4;
+  --cobalt-400: #4276e0;
+  --cobalt-450: #376edf;
+  --cobalt-500: #2c66dd;
+  --cobalt-550: #2560d2;
+  --cobalt-600: #1e52bb;
+  --cobalt-650: #1b49a6;
+  --cobalt-700: #184091;
+  --cobalt-750: #14377c;
+  --cobalt-800: #112e68;
+  --cobalt-850: #0e2553;
+  --cobalt-900: #0a1b3e;
+  --cobalt-950: #071229;
+  --cobalt-1000: #030915;
+
+  /* Grey */
+  --grey-25: #f5f5f5;
+  --grey-50: #f2f2f3;
+  --grey-100: #e9e9e9;
+  --grey-150: #dcdcdc;
+  --grey-200: #e7e7e7;
+  --grey-250: #cdcece;
+  --grey-300: #c4c4c4;
+  --grey-350: #b5b5b6;
+  --grey-400: #9c9c9d;
+  --grey-450: #ababab;
+  --grey-500: #939393;
+  --grey-550: #626262;
+  --grey-600: #626262;
+  --grey-650: #7a7a7a;
+  --grey-700: #6a6b6c;
+  --grey-800: #494949;
+  --grey-850: #39393b;
+  --grey-900: #313131;
+  --grey-950: #202123;
+  --grey-1000: #181818;
+  --grey-1050: #0c0c0c;
+
+  /* Warm Arivonriyam accents */
+  --saffron-50: #fbf1e0;
+  --saffron-100: #f5dfb3;
+  --saffron-300: #e6b267;
+  --saffron-500: #c77700;
+  --saffron-600: #a66200;
+  --saffron-700: #7a4800;
+
+  --clay-50: #fbf6ef;
+  --clay-100: #f4ecdf;
+  --ivory: #fbf9f4;
+  --ink: #14161f;
+
+  /* Success / warn / danger */
+  --success-50: #e8f5ec;
+  --success-500: #2f8a4f;
+  --success-600: #236c3d;
+  --warn-50: #fff3e0;
+  --warn-500: #d97706;
+  --danger-50: #fdecec;
+  --danger-500: #dd1616;
+
+  /* Semantic */
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #f3f4f7;
+  --bg-top-bar: #27293d;
+  --bg-nav-bar: #343b52;
+  --bg-lhs-sidebar: #363d52;
+  --bg-header-band: #e3e4e9;
+
+  --text-primary: #17181c;
+  --text-secondary: #626262;
+  --text-tertiary: #939393;
+  --text-disabled: #b5b5b6;
+  --text-on-dark: #ffffff;
+  --text-body: #202123;
+  --text-error: var(--danger-500);
+
+  --border-subtle: #e5e7eb;
+  --border-default: #e9e9e9;
+  --border-medium: #d1d7e1;
+  --border-strong: #dcdcdc;
+
+  --shadow-dropdown: 0px 1px 4px 0px rgba(23, 23, 26, 0.12);
+  --shadow-card: 0px 1px 4px 0px rgba(13, 17, 29, 0.12);
+  --shadow-card-hover: 0px 4px 7px 0px rgba(0, 0, 0, 0.16);
+
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  --font-primary: "Inter", "IBM Plex Sans", sans-serif;
+  --font-mono: "DM Mono", monospace;
+  --font-dm-sans: "DM Sans", sans-serif;
+  --font-tamil: "Noto Sans Tamil", "Inter", sans-serif;
+}
+
+/* Expose tokens to Tailwind v4's utility engine */
 @theme {
-  /* === Unified Intelligence Design System: Kollam & Clay Refined === */
+  --color-cobalt-25: #eaf0fc;
+  --color-cobalt-50: #d5e0f8;
+  --color-cobalt-100: #c4d0f3;
+  --color-cobalt-200: #96b3ee;
+  --color-cobalt-300: #6b94e7;
+  --color-cobalt-400: #4276e0;
+  --color-cobalt-500: #2c66dd;
+  --color-cobalt-600: #1e52bb;
+  --color-cobalt-700: #184091;
+  --color-cobalt-800: #112e68;
 
-  /* Surfaces */
-  --color-surface: #fcf9f3;
-  --color-surface-bright: #fcf9f3;
-  --color-surface-dim: #dcdad4;
-  --color-surface-variant: #e5e2dc;
-  --color-surface-container-lowest: #ffffff;
-  --color-surface-container-low: #f6f3ed;
-  --color-surface-container: #f0eee8;
-  --color-surface-container-high: #ebe8e2;
-  --color-surface-container-highest: #e5e2dc;
+  --color-saffron-50: #fbf1e0;
+  --color-saffron-100: #f5dfb3;
+  --color-saffron-300: #e6b267;
+  --color-saffron-500: #c77700;
+  --color-saffron-600: #a66200;
+  --color-saffron-700: #7a4800;
 
-  /* On-Surface */
-  --color-on-surface: #1c1c18;
-  --color-on-surface-variant: #454654;
-  --color-on-background: #1c1c18;
-  --color-inverse-surface: #31312d;
-  --color-inverse-on-surface: #f3f0ea;
+  --color-clay-50: #fbf6ef;
+  --color-clay-100: #f4ecdf;
+  --color-ivory: #fbf9f4;
+  --color-ink: #14161f;
 
-  /* Background */
-  --color-background: #fcf9f3;
+  --color-success-50: #e8f5ec;
+  --color-success-500: #2f8a4f;
+  --color-success-600: #236c3d;
+  --color-warn-50: #fff3e0;
+  --color-warn-500: #d97706;
+  --color-danger-50: #fdecec;
+  --color-danger-500: #dd1616;
 
-  /* Primary — Deep Indigo */
-  --color-primary: #1c33c0;
-  --color-primary-container: #3b4fd8;
-  --color-on-primary: #ffffff;
-  --color-on-primary-container: #d4d7ff;
-  --color-primary-fixed: #dfe0ff;
-  --color-primary-fixed-dim: #bcc2ff;
-  --color-inverse-primary: #bcc2ff;
-  --color-on-primary-fixed: #000c61;
-  --color-on-primary-fixed-variant: #1b32bf;
-  --color-surface-tint: #3a4ed7;
+  --color-bg-primary: #ffffff;
+  --color-bg-secondary: #f5f5f5;
+  --color-bg-tertiary: #f3f4f7;
+  --color-bg-top-bar: #27293d;
+  --color-bg-sidebar: #363d52;
 
-  /* Secondary — Temple Gold */
-  --color-secondary: #735c00;
-  --color-secondary-container: #fed65b;
-  --color-on-secondary: #ffffff;
-  --color-on-secondary-container: #745c00;
-  --color-secondary-fixed: #ffe088;
-  --color-secondary-fixed-dim: #e9c349;
-  --color-on-secondary-fixed: #241a00;
-  --color-on-secondary-fixed-variant: #574500;
+  --color-text-primary: #17181c;
+  --color-text-secondary: #626262;
+  --color-text-tertiary: #939393;
+  --color-text-body: #202123;
 
-  /* Tertiary — Terracotta / Clay */
-  --color-tertiary: #8a1f0b;
-  --color-tertiary-container: #ab3721;
-  --color-on-tertiary: #ffffff;
-  --color-on-tertiary-container: #ffcfc5;
-  --color-tertiary-fixed: #ffdad3;
-  --color-tertiary-fixed-dim: #ffb4a5;
-  --color-on-tertiary-fixed: #3e0500;
-  --color-on-tertiary-fixed-variant: #881e0a;
+  --color-border-default: #e9e9e9;
+  --color-border-subtle: #e5e7eb;
+  --color-border-medium: #d1d7e1;
+  --color-border-strong: #dcdcdc;
 
-  /* Error */
-  --color-error: #ba1a1a;
-  --color-error-container: #ffdad6;
-  --color-on-error: #ffffff;
-  --color-on-error-container: #93000a;
+  --font-sans: "Inter", "IBM Plex Sans", sans-serif;
+  --font-mono: "DM Mono", monospace;
+  --font-tamil: "Noto Sans Tamil", "Inter", sans-serif;
 
-  /* Outlines */
-  --color-outline: #757686;
-  --color-outline-variant: #c5c5d7;
-
-  /* Typography */
-  --font-headline: "Plus Jakarta Sans", sans-serif;
-  --font-body: "Public Sans", sans-serif;
-  --font-label: "Public Sans", sans-serif;
-
-  /* Border radius — no pill shapes */
-  --radius-sm: 0.125rem;
-  --radius-md: 0.25rem;
-  --radius-lg: 0.5rem;
-  --radius-xl: 0.75rem;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
 }
 
-@layer utilities {
-  .bg-gradient-primary {
-    background-image: linear-gradient(135deg, #1c33c0, #3b4fd8);
-  }
-
-  /* Notebook ruled-line pattern for lesson canvas */
-  .bg-notebook-lines {
-    background-image: repeating-linear-gradient(
-      transparent,
-      transparent 31px,
-      #c5c5d7 31px,
-      #c5c5d7 32px
-    );
-  }
-
-  /* Kolam geometry dot grid — Mission Control sidebar accent */
-  .bg-kolam-dots {
-    background-image: radial-gradient(circle, rgba(255, 224, 136, 0.07) 1px, transparent 1px);
-    background-size: 18px 18px;
-  }
-}
-
+/* ============================================================
+   BASE
+   ============================================================ */
 @layer base {
-  html {
-    font-size: 90%;
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
   }
 
   body {
-    font-family: "Public Sans", sans-serif;
-    background-color: #fcf9f3;
-    color: #1c1c18;
-    /* Fine Grain Texture — archival paper feel */
-    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.02'/%3E%3C/svg%3E");
+    font-family: var(--font-primary);
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
-  h1,
-  h2,
-  h3,
-  h4,
-  h5,
-  h6 {
-    font-family: "Plus Jakarta Sans", sans-serif;
+  button {
+    font-family: inherit;
   }
 
-  /* Material Symbols icon alignment */
-  .material-symbols-outlined {
-    font-style: normal;
-    line-height: 1;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    user-select: none;
+  input,
+  textarea,
+  select {
+    font-family: inherit;
+    color: inherit;
+  }
+
+  h1 {
+    font-family: var(--font-primary);
+    font-weight: 700;
+    font-size: 36px;
+    line-height: 44px;
+  }
+
+  h2 {
+    font-family: var(--font-primary);
+    font-weight: 600;
+    font-size: 32px;
+    line-height: 34px;
+  }
+
+  h3 {
+    font-family: var(--font-primary);
+    font-weight: 500;
+    font-size: 24px;
+    line-height: 40px;
+  }
+
+  h4 {
+    font-family: var(--font-primary);
+    font-weight: 500;
+    font-size: 20px;
+    line-height: 30px;
+  }
+}
+
+/* ============================================================
+   UTILITIES (shortcut classes used inside features)
+   ============================================================ */
+@layer utilities {
+  .ta {
+    font-family: var(--font-tamil);
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+  }
+
+  .tiny {
+    font-size: 11px;
+  }
+
+  .small {
+    font-size: 12px;
+  }
+
+  .muted {
+    color: var(--text-secondary);
+  }
+
+  .label-eyebrow {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-tertiary);
+  }
+
+  .page-title {
+    font-size: 26px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.015em;
+    line-height: 1.2;
+  }
+
+  .page-subtitle {
+    font-size: 13.5px;
+    color: var(--text-secondary);
+    margin-top: 6px;
+  }
+
+  /* Card primitive — used by feature screens */
+  .card-elegant {
+    background: #fff;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-card);
+  }
+
+  .card-hover:hover {
+    box-shadow: var(--shadow-card-hover);
+    transform: translateY(-1px);
+    transition: all 160ms;
+  }
+
+  /* Tablet frame */
+  .tablet-frame {
+    background: #0b0d14;
+    border-radius: 28px;
+    padding: 14px;
+    box-shadow:
+      0 40px 80px -30px rgba(13, 17, 29, 0.45),
+      0 0 0 1px #1b1d28 inset;
+  }
+
+  .tablet-screen {
+    background: var(--ivory);
+    height: 100%;
+    border-radius: 16px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* Offline chip pulse */
+  @keyframes pulse-dot {
+    0%,
+    100% {
+      opacity: 1;
+    }
+
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  .animate-pulse-dot {
+    animation: pulse-dot 2.4s ease-in-out infinite;
   }
 }

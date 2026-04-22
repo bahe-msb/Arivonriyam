@@ -5,7 +5,6 @@ import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 const config = {
   preprocess: vitePreprocess(),
   compilerOptions: {
-    // Force runes mode for the project, except for libraries. Can be removed in svelte 6.
     runes: ({ filename }) => (filename.split(/[/\\]/).includes("node_modules") ? undefined : true),
   },
   kit: {
@@ -16,9 +15,18 @@ const config = {
       precompress: false,
       strict: true,
     }),
+    // Barrel-only aliases. Each alias resolves to a folder whose `index.ts`
+    // is the single public surface. Subpath imports (e.g. "@shadcn/button")
+    // are intentionally not configured — everything flows through the barrel.
     alias: {
-      "@components/*": "./src/components/*",
-      "@lib/*": "./src/lib/*",
+      "@components": "./src/lib/components",
+      "@mocks": "./src/lib/mocks",
+      "@lib": "./src/lib",
+      "@features": "./src/features",
+      "@stores": "./src/stores",
+      "@utils": "./src/utils",
+      "@shadcn": "./src/shadcn",
+      "@assets": "./src/assets",
     },
   },
 };
