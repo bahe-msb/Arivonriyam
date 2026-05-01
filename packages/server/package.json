@@ -5,9 +5,6 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "rag:install": "python3 -m pip install -r python/requirements.txt",
-    "rag:ingest": "python3 python/ingest.py --data-root ./data",
-    "rag:retrieve": "python3 python/retriever.py --data-root ./data --grade 3 --subject maths --query \"What is addition?\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
