@@ -3,39 +3,55 @@
   import { cn } from "@utils";
 
   type Props = {
-    n: number;
+    phase?: string;
     title: string;
+    durationMin?: number;
     tone?: "cobalt" | "saffron";
-    icon?: Snippet;
     children?: Snippet;
   };
-  let { n, title, tone = "cobalt", icon, children }: Props = $props();
+  let { phase, title, durationMin = 0, tone = "cobalt", children }: Props = $props();
 
-  const circleBg = $derived(tone === "cobalt" ? "bg-cobalt-500" : "bg-saffron-500");
-  const iconColor = $derived(tone === "cobalt" ? "text-cobalt-500" : "text-saffron-500");
+  const phaseLabels: Record<string, string> = {
+    objective: "Objective",
+    warm_up: "Warm-Up",
+    teach: "Teach",
+    practice: "Practice",
+    check: "Check",
+    wrap_up: "Wrap-Up",
+  };
+
+  const label = $derived(phase ? (phaseLabels[phase] ?? phase) : "");
+
+  const accentBar = $derived(tone === "cobalt" ? "bg-cobalt-400" : "bg-saffron-400");
+  const chipCls = $derived(
+    tone === "cobalt"
+      ? "bg-cobalt-50 text-cobalt-600 border-cobalt-100"
+      : "bg-saffron-50 text-saffron-700 border-saffron-100",
+  );
 </script>
 
-<div class="mb-5 grid grid-cols-[44px_1fr] gap-3.5">
-  <div>
-    <div
-      class={cn(
-        "grid size-7 place-items-center rounded-full text-xs font-semibold text-white",
-        circleBg,
-      )}
-    >
-      {n}
-    </div>
-  </div>
-  <div class="border-border-default rounded-xl border bg-white px-4.5 py-3.5">
+<div class="mb-3.5 flex gap-3">
+  <div class={cn("w-0.5 shrink-0 rounded-full", accentBar)}></div>
+  <div class="flex-1 overflow-hidden rounded-xl border border-border-default bg-white px-4 pt-3 pb-3.5">
     <div class="mb-1.5 flex items-center gap-2">
-      {#if icon}
-        <span class={cn("inline-flex items-center", iconColor)}>
-          {@render icon()}
+      {#if label}
+        <span
+          class={cn(
+            "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.07em]",
+            chipCls,
+          )}
+        >
+          {label}
         </span>
       {/if}
-      <div class="text-sm font-semibold">{title}</div>
+      {#if durationMin > 0}
+        <span class="text-text-secondary ml-auto shrink-0 text-[11px] font-medium tabular-nums">
+          {durationMin}m
+        </span>
+      {/if}
     </div>
-    <div class="text-text-body text-[13.5px] leading-[1.55]">
+    <div class="text-sm font-semibold text-ink">{title}</div>
+    <div class="text-text-body mt-1 text-[13.5px] leading-[1.55]">
       {@render children?.()}
     </div>
   </div>

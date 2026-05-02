@@ -14,7 +14,7 @@
     <div class="flex min-h-0 flex-1 overflow-hidden">
       <AppSidebar />
       <Sidebar.Inset>
-        <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div class="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain">
           {@render children?.()}
         </div>
       </Sidebar.Inset>

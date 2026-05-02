@@ -5,6 +5,7 @@
     Home,
     Sparkles,
     BookOpen,
+    CalendarCheck,
     Tablet as TabletIcon,
     AlertTriangle,
     FileText,
@@ -24,6 +25,7 @@
   const teaching: NavEntry[] = [
     { label: "Today", href: "/", icon: Home },
     { label: "Lesson Plan", href: "/lesson", icon: Sparkles },
+    { label: "Saved Plans", href: "/plans", icon: CalendarCheck },
     { label: "Reteach", href: "/reteach", icon: BookOpen },
     { label: "Handoff", href: "/handoff", icon: TabletIcon },
   ];

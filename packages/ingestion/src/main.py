@@ -50,6 +50,11 @@ PDF_DIR = "./data/pdfs/"
 CHROMA_PATH = "./chroma_db"
 COLLECTION_NAME = "mm_rag_pipeline"
 
+# Sidecar manifest read by the Node server to populate the
+# subject + chapter pickers in the lesson-plan UI without needing a
+# direct Chroma client. Structure: ``{class: {subject: [chapters]}}``.
+MANIFEST_PATH = "./data/manifest.json"
+
 # Local Ollama model identifiers. ``gemma4`` is the chat model used
 # for both summarization and final answer generation; the embedding
 # model is the standard local Nomic embedding.
@@ -138,6 +143,7 @@ def separate_content_types(chunk):
         "tables": [],
         "images": [],
         "types": ["text"],
+        "chapter": "",
     }
 
     # The original elements live on ``orig_elements``; we only need
@@ -146,6 +152,14 @@ def separate_content_types(chunk):
     if hasattr(chunk, "metadata") and hasattr(chunk.metadata, "orig_elements"):
         for element in chunk.metadata.orig_elements:
             element_type = type(element).__name__
+
+            # First Title element wins as the chunk's chapter heading.
+            # ``chunk_by_title`` bounds chunks at titles, so this is
+            # almost always the section/chapter the chunk belongs to.
+            if element_type == "Title" and not content_data["chapter"]:
+                title_text = (element.text or "").strip()
+                if title_text:
+                    content_data["chapter"] = title_text
 
             # Tables: prefer the HTML rendering Unstructured produces
             # because it preserves row/column structure, which is
@@ -407,6 +421,7 @@ def summarise_chunks(chunks, class_name: str, subject: str, source_file: str):
                 "class": class_name,
                 "subject": subject,
                 "source_file": source_file,
+                "chapter": content_data["chapter"],
                 "original_content": json.dumps(
                     {
                         "raw_text": content_data["text"],
@@ -547,17 +562,60 @@ def generate_final_answer(retrieved_chunks: List[Document], query: str) -> str:
         return "Sorry, I encountered an error while generating the answer."
 
 
+def _extract_chapters(documents: List[Document]) -> List[str]:
+    """Return distinct, order-preserving chapter titles from documents."""
+    seen = set()
+    chapters: List[str] = []
+    for doc in documents:
+        title = (doc.metadata.get("chapter") or "").strip()
+        if not title or title in seen:
+            continue
+        # Drop very short or noisy titles (page numbers, single chars).
+        if len(title) < 3:
+            continue
+        seen.add(title)
+        chapters.append(title)
+    return chapters
+
+
+def update_manifest(class_name: str, subject: str, chapters: List[str]) -> None:
+    """Merge ``chapters`` for one (class, subject) into the sidecar manifest.
+
+    Read-modify-write so re-ingesting one PDF does not wipe entries
+    for other classes/subjects already on disk. The Node server reads
+    this file to populate the lesson-plan UI dropdowns and chips.
+    """
+    manifest_path = Path(MANIFEST_PATH)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            manifest = {}
+    else:
+        manifest = {}
+
+    manifest.setdefault(class_name, {})[subject] = chapters
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"📝 Manifest updated: {class_name}/{subject} → {len(chapters)} chapters")
+
+
 def run_ingestion() -> None:
     """Ingest every PDF under ``./data/pdfs/<class>/<subject>.pdf``.
 
     Folder layout: each PDF lives in a class folder (e.g. ``class_1``)
     and the filename stem is treated as the subject (``maths.pdf`` →
-    subject ``maths``). Class and subject are stored on every chunk's
-    metadata so queries can later filter by them.
+    subject ``maths``). Class, subject, and detected chapter are stored
+    on every chunk's metadata, and a sidecar ``data/manifest.json``
+    records the distinct chapters per (class, subject) for the UI.
 
     Pipeline per file: partition → chunk → summarise (with HyDE
-    questions prepended) → upsert into Chroma. Errors on any single
-    PDF are caught so one bad file doesn't kill the whole batch.
+    questions prepended) → upsert into Chroma → update manifest.
+    Errors on any single PDF are caught so one bad file doesn't kill
+    the whole batch.
     """
     print("🚀 Starting RAG Ingestion Pipeline")
     print("=" * 50)
@@ -591,6 +649,7 @@ def run_ingestion() -> None:
                 source_file=pdf_path.name,
             )
             create_vector_store(summarised)
+            update_manifest(class_name, subject, _extract_chapters(summarised))
         except Exception as e:
             # Keep going — failing one file should not block others.
             print(f"❌ Failed to ingest {pdf_path.name}: {e}")
@@ -631,17 +690,88 @@ def run_query(question: str) -> None:
 
 
 # ============================================================
+#  Retrieval-only endpoint (called by the Node.js server)
+# ============================================================
+def run_retrieve(class_name: str, subject: str, chapter: str, top_k: int = 5) -> None:
+    """Query ChromaDB for chunks matching a chapter and print JSON to stdout.
+
+    The Node.js server calls this via child_process to ground blueprint
+    generation in real textbook content rather than the LLM's priors.
+    Output is a JSON array written to stdout; all diagnostic prints go
+    to stderr so the caller can parse stdout cleanly.
+    """
+    import sys as _sys
+
+    vectorstore = get_vectorstore()
+
+    # Semantic query: chapter name + subject is a good retrieval signal.
+    query = f"{chapter} {subject}"
+
+    # HyDE: expand the chapter name into a plausible paragraph so the
+    # embedding lands closer to actual chunk summaries.
+    hypothetical = generate_hypothetical_answer(query)
+
+    try:
+        # Metadata filter keeps results scoped to the requested class/subject.
+        # ChromaDB requires $and when combining multiple field conditions.
+        results = vectorstore.similarity_search_with_score(
+            hypothetical,
+            k=top_k,
+            filter={"$and": [{"class": {"$eq": class_name}}, {"subject": {"$eq": subject}}]},
+        )
+    except Exception as exc:
+        print(f"⚠️  ChromaDB query failed: {exc}", file=_sys.stderr)
+        print("[]")
+        return
+
+    chunks = []
+    for doc, score in results:
+        try:
+            original = json.loads(doc.metadata.get("original_content", "{}"))
+        except json.JSONDecodeError:
+            original = {}
+
+        chunks.append({
+            "text": original.get("raw_text") or doc.page_content[:800],
+            "score": float(score),
+            "grade": doc.metadata.get("class", class_name),
+            "subject": doc.metadata.get("subject", subject),
+            "chapter": doc.metadata.get("chapter", chapter),
+            "page": int(doc.metadata.get("page_number", 0)),
+            "language": "en",
+            "source_file": doc.metadata.get("source_file", ""),
+        })
+
+    print(json.dumps(chunks, ensure_ascii=False))
+
+
+# ============================================================
 #  CLI Entry Point
 # ============================================================
 if __name__ == "__main__":
-    # Two subcommands: ``ingest`` runs the full pipeline over every
-    # PDF in ``./data/pdfs/``; ``query`` takes the rest of argv as
-    # the question and runs retrieval + answer generation.
-    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="main.py")
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("ingest", help="Ingest all PDFs into ChromaDB")
+
+    q_parser = sub.add_parser("query", help="Interactive RAG query")
+    q_parser.add_argument("question", nargs="+")
+
+    r_parser = sub.add_parser("retrieve", help="Return JSON chunks for a chapter (used by Node server)")
+    r_parser.add_argument("--class", dest="class_name", required=True)
+    r_parser.add_argument("--subject", required=True)
+    r_parser.add_argument("--chapter", required=True)
+    r_parser.add_argument("--top-k", type=int, default=5)
+
+    args = parser.parse_args()
+
+    if args.cmd == "ingest":
         run_ingestion()
-    elif len(sys.argv) > 2 and sys.argv[1] == "query":
-        run_query(" ".join(sys.argv[2:]))
+    elif args.cmd == "query":
+        run_query(" ".join(args.question))
+    elif args.cmd == "retrieve":
+        run_retrieve(args.class_name, args.subject, args.chapter, args.top_k)
     else:
-        print("Usage:")
-        print("  python src/main.py ingest")
-        print('  python src/main.py query "your question here"')
+        parser.print_help()

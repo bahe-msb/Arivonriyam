@@ -1,0 +1,29 @@
+{
+  "2026-05-02": {
+    "class_5": {
+      "className": "class_5",
+      "subject": "Science",
+      "subjectLabel": "Science",
+      "chapter": "1.6 FORCES BETWEEN MULTIPLE CHARGES",
+      "durationMin": 45,
+      "blueprint": {
+        "title": "1.6 FORCES BETWEEN MULTIPLE CHARGES",
+        "blocks": [
+          {
+            "phase": "objective",
+            "title": "Understanding Force in Multi-Charge Systems",
+            "durationMin": 0,
+            "body": "Students will learn how to calculate the force on a charge due to multiple other charges using the principle of superposition."
+          },
+          {
+            "phase": "warm_up",
+            "title": "Reviewing Basic Principles",
+            "durationMin": 7,
+            "body": "How do forces of mechanical action combine? The problem requires knowledge of how forces combine, specifically referencing the need to apply concepts taught about combining forces, like the parallelogram law."
+          }
+        ]
+      },
+      "savedAt": "2026-05-02T19:28:25.926Z"
+    }
+  }
+}
