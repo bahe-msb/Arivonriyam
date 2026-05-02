@@ -54,3 +54,5 @@ vite.config.ts.timestamp-*
 
 # Rag data
 /packages/server/data/raw/
+
+*.ipynb

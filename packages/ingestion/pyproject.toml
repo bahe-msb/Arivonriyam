@@ -1,0 +1,16 @@
+[project]
+name = "ingestion"
+version = "0.1.0"
+description = "Multi-modal RAG ingestion pipeline (PDF -> Chroma, local Ollama)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "unstructured[all-docs]>=0.22.26",
+    "langchain>=1.2.17",
+    "langchain-community>=0.4.1",
+    "langchain-ollama>=0.2.0",
+    "langchain-chroma>=0.1.4",
+    "langchain-experimental>=0.3.0",
+    "chromadb>=1.5.8",
+    "pillow>=12.2.0",
+]
