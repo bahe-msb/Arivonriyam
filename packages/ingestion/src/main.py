@@ -326,7 +326,7 @@ def generate_hypothetical_answer(question: str) -> str:
         return question
 
 
-def summarise_chunks(chunks):
+def summarise_chunks(chunks, class_name: str, subject: str, source_file: str):
     """Turn each chunk into a LangChain ``Document`` ready for embedding.
 
     For every chunk we:
@@ -343,6 +343,9 @@ def summarise_chunks(chunks):
 
     Args:
         chunks: List of composite chunks.
+        class_name: Class folder name (e.g. ``class_1``).
+        subject: Subject derived from the PDF filename stem.
+        source_file: Original PDF filename, for traceability.
 
     Returns:
         A list of ``Document`` objects, one per chunk, in chunk order.
@@ -401,13 +404,16 @@ def summarise_chunks(chunks):
         doc = Document(
             page_content=embedded_text,
             metadata={
+                "class": class_name,
+                "subject": subject,
+                "source_file": source_file,
                 "original_content": json.dumps(
                     {
                         "raw_text": content_data["text"],
                         "tables_html": content_data["tables"],
                         "images_base64": content_data["images"],
                     }
-                )
+                ),
             },
         )
 
@@ -542,7 +548,12 @@ def generate_final_answer(retrieved_chunks: List[Document], query: str) -> str:
 
 
 def run_ingestion() -> None:
-    """Ingest every PDF in ``./data/pdfs/`` into the vector store.
+    """Ingest every PDF under ``./data/pdfs/<class>/<subject>.pdf``.
+
+    Folder layout: each PDF lives in a class folder (e.g. ``class_1``)
+    and the filename stem is treated as the subject (``maths.pdf`` →
+    subject ``maths``). Class and subject are stored on every chunk's
+    metadata so queries can later filter by them.
 
     Pipeline per file: partition → chunk → summarise (with HyDE
     questions prepended) → upsert into Chroma. Errors on any single
@@ -551,21 +562,34 @@ def run_ingestion() -> None:
     print("🚀 Starting RAG Ingestion Pipeline")
     print("=" * 50)
 
-    # list all PDFs in the directory and sorted them to ensure consistent processing order 
-    pdf_files = sorted(Path(PDF_DIR).glob("*.pdf"))
-    # print(f" PDF_files", pdf_files) 
- 
+    base = Path(PDF_DIR)
+    pdf_files = sorted(base.rglob("*.pdf"))
+
     if not pdf_files:
         print(f"⚠️  No PDFs found in {PDF_DIR}.")
         return
 
     for pdf_path in pdf_files:
-        print(f"\n📚 Ingesting: {pdf_path.name}")
+        rel = pdf_path.relative_to(base)
+        if len(rel.parts) < 2:
+            print(
+                f"⚠️  Skipping {pdf_path.name}: expected "
+                f"{PDF_DIR}<class>/<subject>.pdf"
+            )
+            continue
+
+        class_name = pdf_path.parent.name
+        subject = pdf_path.stem
+        print(f"\n📚 Ingesting: {class_name}/{pdf_path.name}")
         try:
-            # Partition the document and save the elements to a JSON file
             elements = partition_document(str(pdf_path))
             chunks = create_chunks_by_title(elements)
-            summarised = summarise_chunks(chunks)
+            summarised = summarise_chunks(
+                chunks,
+                class_name=class_name,
+                subject=subject,
+                source_file=pdf_path.name,
+            )
             create_vector_store(summarised)
         except Exception as e:
             # Keep going — failing one file should not block others.

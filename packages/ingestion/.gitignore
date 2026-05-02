@@ -6,7 +6,7 @@ __pycache__/
 *.egg-info/
 
 # Data — PDFs are heavy, do not commit
-data/pdfs/*.pdf
+data/pdfs/**/*.pdf
 data/extracted_images/*
 
 # Vector store — regenerated on every ingestion run
