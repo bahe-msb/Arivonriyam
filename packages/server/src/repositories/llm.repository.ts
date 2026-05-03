@@ -34,6 +34,11 @@ async function callOllama(body: Record<string, unknown>): Promise<string> {
   return data.response?.trim() || "";
 }
 
+/** Sends a prompt to Ollama and returns trimmed model output in Tamil (no language override). */
+export async function generateTamilResponse(prompt: string): Promise<string> {
+  return callOllama({ prompt });
+}
+
 /** Sends a prompt to Ollama and returns trimmed model output. */
 export async function generateLlmResponse(prompt: string): Promise<string> {
   const englishOnlyPrompt = [

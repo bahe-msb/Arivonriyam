@@ -7,6 +7,7 @@ import {
   getTestStt,
   postLessonBlueprint,
   postSavePlan,
+  postSocraticSummarize,
   postTestAsk,
   postVoiceFile,
 } from "../controllers";
@@ -19,6 +20,7 @@ export function createApiRouter(): Router {
   // Project Specific endpoints
   router.get("/health", getHealth);
   router.post("/api/student/conservation", upload.single("audio"), postVoiceFile);
+  router.post("/api/socratic/summarize", postSocraticSummarize);
 
   // Lesson plan endpoints
   router.get("/api/lesson/subjects", getLessonSubjects);

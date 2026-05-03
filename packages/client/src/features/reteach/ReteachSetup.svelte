@@ -1,163 +1,269 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { ArrowLeft, ArrowRight, Plus, X } from "lucide-svelte";
+  import { ArrowLeft, ArrowRight, Plus, X, Send, BookOpen, Pencil } from "lucide-svelte";
   import { Button, Card, Input } from "@shadcn";
-
-  import { ModeToggle, Page, PageHeader, Pill } from "@components";
+  import { Page, PageHeader, Pill } from "@components";
   import { CLASSES } from "@mocks";
+  import { reteachTopics } from "@stores";
 
-  interface Topic {
-    t: string;
-    mode: string;
+  type SubjectOption = { id: string; label: string };
+
+  let activeClass = $state<number | null>(null);
+  let activeSubject = $state<string | null>(null);
+
+  let subjects = $state<SubjectOption[]>([]);
+  let subjectsLoading = $state(false);
+
+  let standardDraft = $state("");
+  let customDraft = $state("");
+
+  function uid(): string {
+    return Math.random().toString(36).slice(2);
   }
 
-  let active = $state(3);
-  let draft = $state("");
+  const activeCls = $derived(CLASSES.find((c) => c.id === activeClass));
+  const classTopics = $derived(reteachTopics.get(activeClass ?? -1));
+  const subjectTopics = $derived(classTopics.filter((t) => t.subject === activeSubject));
+  const totalCount = $derived(classTopics.length);
+  const canAdd = $derived(totalCount < 3);
+  const canSend = $derived(CLASSES.some((c) => reteachTopics.hasTopics(c.id)));
 
-  let topics = $state<Record<number, Topic[]>>({
-    1: [{ t: "Vowels அ to ஈ", mode: "summary+qa" }],
-    2: [
-      { t: "Counting 1–20", mode: "qa" },
-      { t: "Addition with fingers", mode: "summary" },
-    ],
-    3: [
-      { t: "Plants around us", mode: "summary+qa" },
-      { t: "Parts of a plant", mode: "qa" },
-    ],
-    4: [{ t: "Simple present tense", mode: "qa" }],
-    5: [{ t: "Indian freedom struggle — Intro", mode: "summary+qa" }],
-  });
-
-  function add(): void {
-    if (!draft.trim()) return;
-    topics[active] = [...(topics[active] ?? []), { t: draft.trim(), mode: "summary+qa" }];
-    draft = "";
+  async function loadSubjects(classId: number): Promise<void> {
+    subjectsLoading = true;
+    subjects = [];
+    try {
+      const className = `class_${classId}`;
+      const res = await fetch(`/api/lesson/subjects?class=${encodeURIComponent(className)}`);
+      const data = await res.json();
+      subjects = Array.isArray(data.subjects) ? data.subjects : [];
+    } catch {
+      subjects = [];
+    } finally {
+      subjectsLoading = false;
+    }
   }
 
-  function remove(idx: number): void {
-    topics[active] = (topics[active] ?? []).filter((_, i) => i !== idx);
+  function selectClass(id: number): void {
+    if (activeClass !== id) {
+      activeClass = id;
+      activeSubject = null;
+      standardDraft = "";
+      customDraft = "";
+      void loadSubjects(id);
+    }
   }
 
-  function setMode(idx: number, m: string): void {
-    topics[active] = (topics[active] ?? []).map((x, i) => (i === idx ? { ...x, mode: m } : x));
+  function selectSubject(s: string): void {
+    activeSubject = s;
+    standardDraft = "";
+    customDraft = "";
   }
 
-  const activeCls = $derived(CLASSES.find((c) => c.id === active)!);
+  function addTopic(topic: string, source: "standard" | "custom"): void {
+    if (!topic.trim() || !activeClass || !activeSubject || !canAdd) return;
+    reteachTopics.add(activeClass, {
+      id: uid(),
+      subject: activeSubject,
+      topic: topic.trim(),
+      source,
+    });
+    if (source === "standard") standardDraft = "";
+    else customDraft = "";
+  }
 </script>
 
 <Page>
   <PageHeader
     eyebrow="Morning ritual · Step 2 of 2"
     title="What should AI reteach today?"
-    subtitle="Pick topics you've already taught. AI will summarise, then ask Socratic questions — one child at a time."
+    subtitle="Select a class, pick a subject, then add up to 3 topics per class."
   >
     {#snippet actions()}
       <Button variant="secondary" onclick={() => goto("/lesson")}>
-        <ArrowLeft class="size-[14px]" /> Back to plan
+        <ArrowLeft class="size-3.5" /> Back to plan
       </Button>
-      <Button variant="primary" onclick={() => goto("/handoff")}>
-        Continue to handoff <ArrowRight class="size-[14px]" />
+      <Button variant="primary" disabled={!canSend} onclick={() => goto("/handoff")}>
+        Send to handoff <Send class="size-3.5" />
       </Button>
     {/snippet}
   </PageHeader>
 
-  <div class="grid grid-cols-1 gap-5 md:grid-cols-[260px_1fr]">
-    <!-- Class rail -->
-    <Card class="h-fit p-2.5">
+  <div class="grid grid-cols-[160px_200px_1fr] items-start gap-4">
+    <!-- Col 1: Classes -->
+    <Card class="p-2">
+      <div class="mb-1.5 px-2 text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
+        Classes
+      </div>
       {#each CLASSES as c (c.id)}
-        {@const count = (topics[c.id] ?? []).length}
-        {@const sel = c.id === active}
+        {@const count = reteachTopics.get(c.id).length}
+        {@const sel = c.id === activeClass}
         <button
           type="button"
-          onclick={() => (active = c.id)}
-          class="mb-1 flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-3 py-3 text-left transition-colors
+          onclick={() => selectClass(c.id)}
+          class="mb-1 flex w-full cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2.5 text-left transition-colors
                  {sel
             ? 'bg-cobalt-25 border-cobalt-50 border'
-            : 'border border-transparent bg-transparent hover:bg-gray-50'}"
+            : 'border border-transparent hover:bg-gray-50'}"
         >
           <span
-            class="grid size-7.5 place-items-center rounded-lg text-[13px] font-bold"
+            class="grid size-7 shrink-0 place-items-center rounded-lg text-[12px] font-bold"
             style="background: {c.color}22; color: {c.color};"
           >
             {c.id}
           </span>
           <div class="min-w-0 flex-1">
-            <div class="text-[13px] font-medium">{c.name}</div>
-            <div class="text-text-secondary text-[11px]">
-              {count}
-              {count === 1 ? "topic" : "topics"}
-            </div>
+            <div class="truncate text-[12px] font-medium">{c.name}</div>
+            {#if count > 0}
+              <div class="text-[10px] text-text-secondary">{count}/3</div>
+            {/if}
           </div>
-          {#if count > 0}
-            <span
-              class="bg-saffron-500 rounded-full px-1.5 py-0.5 text-[10px] font-semibold text-white"
-            >
-              {count}
-            </span>
-          {/if}
         </button>
       {/each}
     </Card>
 
-    <!-- Topic list -->
-    <div>
-      <Card class="mb-4 p-5">
-        <div class="mb-3.5 flex flex-wrap items-center justify-between gap-2">
+    <!-- Col 2: Subjects from PDF folder -->
+    <Card class="p-2 {!activeClass ? 'opacity-40 pointer-events-none' : ''}">
+      <div class="mb-1.5 px-2 text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
+        Subjects
+      </div>
+      {#if !activeClass}
+        <div class="py-5 text-center text-[11px] text-text-tertiary">Select a class first</div>
+      {:else if subjectsLoading}
+        <div class="py-5 text-center text-[11px] text-text-secondary">Loading…</div>
+      {:else if subjects.length === 0}
+        <div class="py-5 text-center text-[11px] text-text-tertiary">No subjects found</div>
+      {:else}
+        {#each subjects as s (s.id)}
+          {@const subCount = reteachTopics.get(activeClass).filter((t) => t.subject === s.id).length}
+          {@const sel = s.id === activeSubject}
+          <button
+            type="button"
+            onclick={() => selectSubject(s.id)}
+            class="mb-1 flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2.5 py-2.5 text-left transition-colors
+                   {sel
+              ? 'bg-cobalt-25 border-cobalt-50 border'
+              : 'border border-transparent hover:bg-gray-50'}"
+          >
+            <span class="truncate text-[12px] font-medium">{s.label}</span>
+            {#if subCount > 0}
+              <span
+                class="grid size-4.5 shrink-0 place-items-center rounded-full bg-saffron-500 text-[9px] font-bold text-white"
+              >
+                {subCount}
+              </span>
+            {/if}
+          </button>
+        {/each}
+      {/if}
+    </Card>
+
+    <!-- Col 3: Topic input — vertical split (two columns side by side) -->
+    {#if activeClass && activeSubject}
+      {@const subjectLabel = subjects.find((s) => s.id === activeSubject)?.label ?? activeSubject}
+      <div class="flex flex-col gap-3">
+        <div class="flex items-center justify-between">
           <div>
-            <div class="text-[17px] font-semibold">
-              {activeCls.name} reteach list
-            </div>
-            <div class="text-text-secondary ta text-[11px]">
-              {activeCls.ta} · {activeCls.students} learners
+            <div class="text-[15px] font-semibold">{activeCls?.name} · {subjectLabel}</div>
+            <div class="text-[11px] text-text-secondary">
+              {totalCount}/3 topics for {activeCls?.name}
             </div>
           </div>
+          {#if !canAdd}
+            <Pill tone="cobalt">3/3 limit reached</Pill>
+          {/if}
         </div>
-        <div class="flex flex-wrap gap-2 sm:flex-nowrap">
-          <Input
-            bind:value={draft}
-            placeholder="e.g. Parts of a plant, counting in tens…"
-            onkeydown={(e: KeyboardEvent) => e.key === "Enter" && add()}
-          />
-          <Button variant="primary" onclick={add}>
-            <Plus class="size-[14px]" /> Add
-          </Button>
-        </div>
-        <div class="text-text-secondary mt-2.5 text-[11px]">
-          Tip: add the exact phrasing you used at the board. The AI retrieves from the NCERT
-          textbooks on your laptop (RAG).
-        </div>
-      </Card>
 
-      <div class="flex flex-col gap-2.5">
-        {#each topics[active] ?? [] as top, i (top.t + i)}
-          <Card class="p-4">
-            <div class="grid grid-cols-1 items-center gap-4 md:grid-cols-[1fr_auto]">
-              <div>
-                <div class="text-[14px] font-medium">{top.t}</div>
-                <div class="mt-2 flex gap-1.5">
-                  <ModeToggle value={top.mode} onChange={(m) => setMode(i, m)} />
-                </div>
-              </div>
-              <div class="flex items-center gap-1.5">
-                <Pill tone="cobalt">Retrieved from Ch 7, p 42</Pill>
+        <!-- Two vertical halves -->
+        <div class="grid grid-cols-2 gap-3">
+          <!-- Left: Standard topic (from what was taught in class) -->
+          <Card class="flex flex-col gap-3 p-4">
+            <div class="flex items-center gap-1.5">
+              <BookOpen class="size-3.5 text-text-secondary" />
+              <div class="text-[13px] font-semibold">Topic from class</div>
+            </div>
+            <div class="text-[11px] text-text-secondary">
+              Type the exact topic you taught. AI retrieves from NCERT PDFs to reteach it.
+            </div>
+            <div class="flex gap-2">
+              <Input
+                bind:value={standardDraft}
+                placeholder="e.g. Parts of a plant"
+                disabled={!canAdd}
+                onkeydown={(e: KeyboardEvent) => e.key === "Enter" && addTopic(standardDraft, "standard")}
+              />
+              <Button
+                variant="primary"
+                onclick={() => addTopic(standardDraft, "standard")}
+                disabled={!canAdd || !standardDraft.trim()}
+              >
+                <Plus class="size-3.5" />
+              </Button>
+            </div>
+
+            <!-- Topics added from standard -->
+            {#each subjectTopics.filter((t) => t.source === "standard") as t (t.id)}
+              <div class="flex items-center gap-2 rounded-lg border border-border-default bg-gray-50 px-3 py-2">
+                <div class="min-w-0 flex-1 text-[12px] font-medium">{t.topic}</div>
                 <Button
                   variant="ghost"
                   size="icon"
-                  onclick={() => remove(i)}
-                  aria-label="Remove topic"
+                  onclick={() => reteachTopics.remove(activeClass!, t.id)}
+                  aria-label="Remove"
                 >
-                  <X class="size-[14px]" />
+                  <X class="size-3.25" />
                 </Button>
               </div>
+            {/each}
+          </Card>
+
+          <!-- Right: Custom topic (teacher's own instruction) -->
+          <Card class="flex flex-col gap-3 p-4">
+            <div class="flex items-center gap-1.5">
+              <Pencil class="size-3.5 text-text-secondary" />
+              <div class="text-[13px] font-semibold">Custom topic</div>
             </div>
+            <div class="text-[11px] text-text-secondary">
+              Add a topic beyond the textbook — e.g. "Narrate a story about electromagnetic waves".
+            </div>
+            <div class="flex gap-2">
+              <Input
+                bind:value={customDraft}
+                placeholder="e.g. Narrate a story about…"
+                disabled={!canAdd}
+                onkeydown={(e: KeyboardEvent) => e.key === "Enter" && addTopic(customDraft, "custom")}
+              />
+              <Button
+                variant="primary"
+                onclick={() => addTopic(customDraft, "custom")}
+                disabled={!canAdd || !customDraft.trim()}
+              >
+                <Plus class="size-3.5" />
+              </Button>
+            </div>
+
+            <!-- Topics added as custom -->
+            {#each subjectTopics.filter((t) => t.source === "custom") as t (t.id)}
+              <div class="flex items-center gap-2 rounded-lg border border-cobalt-100 bg-cobalt-25 px-3 py-2">
+                <div class="min-w-0 flex-1 text-[12px] font-medium">{t.topic}</div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onclick={() => reteachTopics.remove(activeClass!, t.id)}
+                  aria-label="Remove"
+                >
+                  <X class="size-3.25" />
+                </Button>
+              </div>
+            {/each}
           </Card>
-        {:else}
-          <Card class="p-9 text-center text-text-tertiary">
-            No reteach topics yet. Add what you'd like AI to cover for
-            {activeCls.name}.
-          </Card>
-        {/each}
+        </div>
       </div>
-    </div>
+    {:else}
+      <Card class="flex h-36 items-center justify-center text-center">
+        <div class="text-[13px] text-text-tertiary">
+          {activeClass ? "Select a subject to add topics" : "Select a class to start"}
+        </div>
+      </Card>
+    {/if}
   </div>
 </Page>

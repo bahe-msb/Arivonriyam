@@ -56,3 +56,5 @@ vite.config.ts.timestamp-*
 /packages/server/data/raw/
 
 *.ipynb
+
+whisper.cpp/

@@ -1,27 +1,16 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { Wifi, Lock, Users, Tablet as TabletIcon, Check, ArrowRight, Heart } from "lucide-svelte";
+  import { Wifi, Lock, Users, Tablet as TabletIcon, ArrowRight, Heart, AlertCircle } from "lucide-svelte";
   import { Button, Card } from "@shadcn";
 
   import { Page, PageHeader, Pill } from "@components";
   import { CLASSES, type ClassInfo } from "@mocks";
-  import { activeClass } from "@stores";
-
-  let handedOff = $state<number | null>(null);
+  import { activeClass, reteachTopics } from "@stores";
 
   function doHandoff(cls: ClassInfo): void {
-    handedOff = cls.id;
     activeClass.set(cls.id);
-    setTimeout(() => goto("/student/topic"), 1200);
+    goto("/student/topic");
   }
-
-  const topicsPreview: Record<number, string[]> = {
-    1: ["Plants around us"],
-    2: ["Plants around us"],
-    3: ["Plants around us", "Parts of a plant"],
-    4: ["Plants around us"],
-    5: ["Plants around us"],
-  };
 </script>
 
 <Page>
@@ -38,8 +27,9 @@
 
   <div class="grid grid-cols-1 gap-4.5 sm:grid-cols-2 lg:grid-cols-3">
     {#each CLASSES as cls (cls.id)}
-      {@const active = handedOff === cls.id}
-      <Card hover class="overflow-hidden p-0 {active ? 'ring-cobalt-500 ring-2' : ''}">
+      {@const topics = reteachTopics.get(cls.id)}
+      {@const hasTopics = topics.length > 0}
+      <Card hover class="overflow-hidden p-0">
         <div
           class="border-border-default border-b px-5 pt-5 pb-4"
           style="background: {cls.color}18;"
@@ -59,14 +49,23 @@
         </div>
         <div class="p-5">
           <div class="label-eyebrow mb-2">Today's reteach</div>
-          <div class="mb-3.5 flex flex-col gap-1.5">
-            {#each topicsPreview[cls.id] ?? [] as t (t)}
-              <div class="flex items-center gap-2">
-                <span class="size-1 rounded-full" style="background: {cls.color};"></span>
-                <span class="text-[13px]">{t}</span>
-              </div>
-            {/each}
-          </div>
+          {#if hasTopics}
+            <div class="mb-3.5 flex flex-col gap-1.5">
+              {#each topics as t (t.id)}
+                <div class="flex items-start gap-2">
+                  <span class="mt-1.5 size-1.5 shrink-0 rounded-full" style="background: {cls.color};"></span>
+                  <span class="text-[13px]">{t.topic}</span>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <div class="mb-3.5 flex items-start gap-2 rounded-lg bg-gray-50 px-3 py-2.5">
+              <AlertCircle class="mt-0.5 size-3.5 shrink-0 text-text-tertiary" />
+              <span class="text-[12px] text-text-secondary">
+                Teacher has not yet added reteach topics for {cls.name}.
+              </span>
+            </div>
+          {/if}
           <div class="flex items-center justify-between gap-2.5">
             <span class="text-text-secondary inline-flex items-center gap-1 text-[11px]">
               <Users class="size-[11px]" />
@@ -77,16 +76,13 @@
             </span>
           </div>
           <Button
-            variant={active ? "warm" : "primary"}
+            variant="primary"
             class="mt-3.5 w-full"
+            disabled={!hasTopics}
             onclick={() => doHandoff(cls)}
           >
-            {#if active}
-              <Check class="size-[14px]" /> Handed to {cls.name}…
-            {:else}
-              Hand tablet to {cls.name}
-              <ArrowRight class="size-[14px]" />
-            {/if}
+            Hand tablet to {cls.name}
+            <ArrowRight class="size-3.5" />
           </Button>
         </div>
       </Card>
