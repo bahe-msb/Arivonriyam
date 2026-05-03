@@ -1,168 +1,909 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { ArrowRight, Mic, RotateCcw, BookOpen, Pencil, Phone } from "lucide-svelte";
+  import { resolve } from "$app/paths";
+  import { onDestroy, tick } from "svelte";
+  import {
+    ArrowRight,
+    Clock3,
+    RotateCcw,
+    BookOpen,
+    Image as ImageIcon,
+    Lightbulb,
+    Pencil,
+    Phone,
+    CheckCircle2,
+    Shapes,
+    Sparkles,
+    Volume2,
+    XCircle,
+  } from "lucide-svelte";
   import { Button } from "@shadcn";
   import { Pill } from "@components";
-  import { SOCRATIC_QUESTIONS, STUDENTS_BY_CLASS, CLASSES } from "@mocks";
+  import { STUDENTS_BY_CLASS, CLASSES } from "@mocks";
   import { activeClass, reteachTopics } from "@stores";
 
-  const cls = $derived(CLASSES.find((c) => c.id === activeClass.id));
-  const students = $derived(STUDENTS_BY_CLASS[activeClass.id] ?? STUDENTS_BY_CLASS[3]);
-  const topic = $derived(reteachTopics.selectedTopic);
+  type SessionQuestion = {
+    q: string;
+    options: string[];
+    answerIndex: number;
+    explain: string;
+  };
+
+  type SessionTurn = SessionQuestion & { student: number };
+  type SummarizeResponse = {
+    lines?: string[];
+    questions?: SessionQuestion[];
+    error?: string;
+  };
+
+  type PreviewCard = {
+    title: string;
+    caption: string;
+    badge: string;
+    imageDataUrl?: string;
+  };
+
+  type PreviewResponse = {
+    cards?: PreviewCard[];
+    error?: string;
+  };
+
+  type VisualTone = {
+    label: string;
+    icon: typeof Sparkles;
+    cardBackground: string;
+    cardBorder: string;
+    chipBackground: string;
+    chipColor: string;
+    trailColor: string;
+  };
 
   type Phase = "start" | "summarizing" | "session";
+
+  const QUESTIONS_PER_STUDENT = 3;
+  const PROGRESS_SEGMENTS = 6;
+  const AUTO_ADVANCE_MS = 1800;
+  const QUESTION_TIME_LIMIT_SEC = 12;
+  const QUESTION_PROMPT_MAX_MS = 14000;
+  const SUMMARY_WORDS_PER_MINUTE = 130;
+  const MIN_SUMMARY_STEP_MS = 1200;
+  const MAX_SUMMARY_STEP_MS = 7000;
+  const FALLBACK_EMOJIS = ["🦁", "🌻", "🦚", "🌙"];
+  const OPTION_LABELS = ["A", "B", "C", "D"] as const;
+
+  const cls = $derived(CLASSES.find((c) => c.id === activeClass.id));
+  const students = $derived(
+    STUDENTS_BY_CLASS[activeClass.id] ??
+      Array.from({ length: 4 }, (_, idx) => ({
+        id: `student-${activeClass.id}-${idx + 1}`,
+        name: `Student ${idx + 1}`,
+        emoji: FALLBACK_EMOJIS[idx % FALLBACK_EMOJIS.length],
+        streak: 0,
+        status: "ok" as const,
+      })),
+  );
+  const topic = $derived(reteachTopics.selectedTopic);
+
   let phase = $state<Phase>("start");
 
   let qIdx = $state(0);
   let answered = $state<{ studentIdx: number; correct: boolean }[]>([]);
   let answerPhase = $state<"ask" | "feedback">("ask");
+  let submittedOption = $state<number | null>(null);
   let lastCorrect = $state(true);
-  let selectedCard = $state<number | null>(null);
-  let showHint = $state(false);
+  let feedbackTitle = $state("");
+  let feedbackDetail = $state("");
 
   let summaryLines = $state<string[]>([]);
   let summaryIdx = $state(0);
   let summaryLoading = $state(false);
+  let summaryError = $state("");
+  let summaryPreviewCards = $state<PreviewCard[]>([]);
+  let summaryPreviewLoading = $state(false);
 
-  const currentQ = $derived(SOCRATIC_QUESTIONS[qIdx % SOCRATIC_QUESTIONS.length]);
+  let questionPlan = $state<SessionTurn[]>([]);
+  let autoAdvanceTimer: ReturnType<typeof setTimeout> | null = null;
+  let summaryFlowTimer: ReturnType<typeof setTimeout> | null = null;
+  let activeSummaryUtterance: SpeechSynthesisUtterance | null = null;
+  let activeQuestionUtterance: SpeechSynthesisUtterance | null = null;
+  let questionSpeechTimer: ReturnType<typeof setTimeout> | null = null;
+  let questionCountdownTimer: ReturnType<typeof setInterval> | null = null;
+  let questionSecondsLeft = $state(QUESTION_TIME_LIMIT_SEC);
+  let questionPromptStatus = $state<"idle" | "reading" | "timed">("idle");
+  let summaryRunId = 0;
+
+  let desktopSummaryStageEl = $state<HTMLDivElement | null>(null);
+  let desktopSummarySidebarEl = $state<HTMLDivElement | null>(null);
+  let mobileSummaryStageEl = $state<HTMLDivElement | null>(null);
+
+  const totalQuestionCount = $derived(
+    questionPlan.length > 0
+      ? questionPlan.length
+      : Math.max(1, students.length) * QUESTIONS_PER_STUDENT,
+  );
+  const currentQ = $derived(
+    questionPlan.length > 0 ? questionPlan[qIdx % questionPlan.length] : null,
+  );
   const activeStudent = $derived(students[currentQ?.student ?? 0]);
-  const nextStudent = $derived(students[((currentQ?.student ?? 0) + 1) % students.length]);
+  const nextQ = $derived(
+    questionPlan.length > 0 ? questionPlan[(qIdx + 1) % questionPlan.length] : null,
+  );
+  const nextStudent = $derived(students[nextQ?.student ?? 0]);
   const correctCount = $derived(answered.filter((a) => a.correct).length);
-  const roundNum = $derived(Math.floor(qIdx / students.length) + 1);
-  const progressStep = $derived((qIdx % 4) + 1);
-
+  const roundNum = $derived(
+    Math.floor((qIdx % totalQuestionCount) / Math.max(1, students.length)) + 1,
+  );
+  const cycleNum = $derived(Math.floor(qIdx / totalQuestionCount) + 1);
+  const progressStep = $derived((qIdx % totalQuestionCount) + 1);
+  const progressFilled = $derived(
+    Math.max(1, Math.round((progressStep / totalQuestionCount) * PROGRESS_SEGMENTS)),
+  );
   const failCounts = $derived(
     students.map((_, si) => answered.filter((a) => a.studentIdx === si && !a.correct).length),
   );
-
-  function getBestVoice(): SpeechSynthesisVoice | null {
-    if (typeof speechSynthesis === "undefined") return null;
-    const voices = speechSynthesis.getVoices();
-    // Prefer natural-sounding voices; order matters
-    const preferred = ["Samantha", "Google US English", "Karen", "Moira", "Allison", "Alex"];
-    for (const name of preferred) {
-      const v = voices.find((v) => v.name.includes(name) && v.lang.startsWith("en"));
-      if (v) return v;
-    }
-    return (
-      voices.find((v) => v.lang === "en-US" && !v.name.toLowerCase().includes("google")) ??
-      voices.find((v) => v.lang === "en-US") ??
-      voices.find((v) => v.lang.startsWith("en")) ??
-      null
-    );
-  }
-
-  function speak(text: string, onEnd?: () => void): void {
-    if (typeof speechSynthesis === "undefined") {
-      onEnd?.();
-      return;
-    }
-    speechSynthesis.cancel();
-    // Small delay lets voices initialise on first load
-    setTimeout(() => {
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = "en-US";
-      utter.rate = 0.85;
-      utter.pitch = 1.0;
-      utter.volume = 1.0;
-      const voice = getBestVoice();
-      if (voice) utter.voice = voice;
-      if (onEnd) utter.onend = () => onEnd();
-      speechSynthesis.speak(utter);
-    }, 80);
-  }
-
-  function cancelSpeech(): void {
-    if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
-  }
-
-  function revealLine(idx: number): void {
-    if (idx >= summaryLines.length) {
-      setTimeout(() => {
-        phase = "session";
-        if (activeStudent) speak(`${activeStudent.name}, it's your turn.`);
-      }, 900);
-      return;
-    }
-    summaryIdx = idx;
-    speak(summaryLines[idx], () => setTimeout(() => revealLine(idx + 1), 450));
-  }
+  const visibleSummaryLines = $derived(
+    phase === "summarizing"
+      ? summaryLines.slice(0, Math.max(1, summaryIdx + 1))
+      : summaryLines,
+  );
+  const blockedBySource = $derived(phase === "session" && questionPlan.length === 0);
+  const accent = $derived(cls?.color ?? "#6B94E7");
+  const questionCountdownPercent = $derived(
+    Math.max(0, Math.min(100, (questionSecondsLeft / QUESTION_TIME_LIMIT_SEC) * 100)),
+  );
+  const questionPromptText = $derived(
+    questionPromptStatus === "reading"
+      ? `${activeStudent?.name ?? "Student"} is hearing the question`
+      : questionPromptStatus === "timed"
+        ? `${questionSecondsLeft}s to tap one option`
+        : "Still thinking? Tap when ready.",
+  );
 
   function fallbackLines(): string[] {
     return [
-      `Today we are revisiting "${topic?.topic ?? "this topic"}".`,
-      `This is part of your ${topic?.subject ?? "Science"} subject — key ideas you learned earlier.`,
-      "Listen carefully. I will ask each of you one question.",
+      `Today we are starting ${topic?.topic ?? "this topic"} in simple ${topic?.subject ?? "Science"} words.`,
+      "This short summary follows the lesson points and keeps the explanation easy to follow.",
+      "After the summary, each student answers only by tapping one of four options.",
+      "Each student gets three MCQ turns, one question at a time.",
     ];
+  }
+
+  function fallbackQuestions(count: number): SessionQuestion[] {
+    const topicName = topic?.topic ?? "this topic";
+    const subjectName = topic?.subject ?? "Science";
+    const facts = [
+      `${topicName} is explained in simple ${subjectName} language.`,
+      `${topicName} is learned through examples from daily life.`,
+      `${topicName} questions are answered by choosing one correct option.`,
+      `${topicName} understanding improves when we match answers with lesson facts.`,
+      `${topicName} is revised step by step for young learners.`,
+      `Students should read all options before choosing the answer in ${topicName}.`,
+    ];
+
+    const questionStems = [
+      `Which option matches today's summary about ${topicName}?`,
+      `According to the lesson, what is true about ${topicName}?`,
+      `Pick the correct fact from this ${subjectName} session.`,
+      `Which statement about ${topicName} is correct?`,
+    ] as const;
+
+    return Array.from({ length: count }, (_, idx) => {
+      const correct = facts[idx % facts.length];
+      const wrong = [
+        `${topicName} is not part of ${subjectName}.`,
+        `Students should skip ${topicName} questions in class.`,
+        `${topicName} can be answered without reading options.`,
+      ];
+      const { options, answerIndex } = buildOptions(correct, wrong, idx);
+      return {
+        q: questionStems[idx % questionStems.length],
+        options,
+        answerIndex,
+        explain: "This option matches today's summary.",
+      };
+    });
+  }
+
+  function summaryLineDelayMs(line: string, maxMs = MAX_SUMMARY_STEP_MS): number {
+    const words = line
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean).length;
+    const perWordMs = Math.round(60000 / SUMMARY_WORDS_PER_MINUTE);
+    const estimated = words * perWordMs;
+    return Math.max(MIN_SUMMARY_STEP_MS, Math.min(maxMs, estimated));
+  }
+
+  function buildSessionRequestBody(): Record<string, unknown> {
+    return {
+      topic: topic?.topic ?? "this topic",
+      subject: topic?.subject ?? "Science",
+      className: `class_${activeClass.id}`,
+      source: topic?.source === "custom" ? "custom" : "curriculum",
+      studentCount: students.length,
+    };
+  }
+
+  function buildFallbackPreviewCards(): PreviewCard[] {
+    return [
+      {
+        title: "Topic start",
+        badge: topic?.source === "custom" ? "Web notes" : "Textbook cue",
+        caption: `We are preparing ${topic?.topic ?? "this topic"} in simple ${topic?.subject ?? "Science"} words.`,
+      },
+      {
+        title: "Tiny example",
+        badge: "Real-life link",
+        caption: "Small examples from home and school help children understand quickly.",
+      },
+      {
+        title: "Tap and answer",
+        badge: "MCQ round",
+        caption: "After the summary, each student hears the question and taps one option.",
+      },
+    ];
+  }
+
+  function normalizePreviewCards(raw: unknown): PreviewCard[] {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+      .map((item): PreviewCard | null => {
+        if (!item || typeof item !== "object") return null;
+
+        const record = item as Partial<PreviewCard>;
+        const title = typeof record.title === "string" ? record.title.trim() : "";
+        const caption = typeof record.caption === "string" ? record.caption.trim() : "";
+        const badge = typeof record.badge === "string" ? record.badge.trim() : "";
+        const imageDataUrl =
+          typeof record.imageDataUrl === "string" && record.imageDataUrl.trim().length > 0
+            ? record.imageDataUrl.trim()
+            : undefined;
+
+        if (!title || !caption) return null;
+
+        return { title, caption, badge: badge || "Lesson cue", imageDataUrl };
+      })
+      .filter((card): card is PreviewCard => card !== null)
+      .slice(0, 3);
+  }
+
+  function getPreviewCardTone(card: PreviewCard, index: number): VisualTone {
+    if (card.imageDataUrl) {
+      return {
+        label: "Picture cue",
+        icon: ImageIcon,
+        cardBackground: "#fff9ed",
+        cardBorder: "#f3d49a",
+        chipBackground: "#ffe6b5",
+        chipColor: "#ba7300",
+        trailColor: "#efc05c",
+      };
+    }
+
+    const toneIndex = index % 3;
+    if (toneIndex === 1) {
+      return {
+        label: "Example",
+        icon: Shapes,
+        cardBackground: "#eff7ff",
+        cardBorder: "#cfe1ff",
+        chipBackground: "#dce9ff",
+        chipColor: "#3c67c8",
+        trailColor: "#8ab2ff",
+      };
+    }
+
+    if (toneIndex === 2) {
+      return {
+        label: "Ready",
+        icon: Volume2,
+        cardBackground: "#eefcf2",
+        cardBorder: "#c9eed6",
+        chipBackground: "#d7f6e0",
+        chipColor: "#1a8143",
+        trailColor: "#6dd28b",
+      };
+    }
+
+    return {
+      label: "Topic",
+      icon: Sparkles,
+      cardBackground: `${accent}14`,
+      cardBorder: `${accent}35`,
+      chipBackground: `${accent}1f`,
+      chipColor: accent,
+      trailColor: `${accent}66`,
+    };
+  }
+
+  function getSummaryLineTone(line: string, index: number): VisualTone {
+    const lower = line.toLowerCase();
+
+    if (index === 0) {
+      return {
+        label: "Topic start",
+        icon: Sparkles,
+        cardBackground: `${accent}14`,
+        cardBorder: `${accent}35`,
+        chipBackground: `${accent}1f`,
+        chipColor: accent,
+        trailColor: `${accent}66`,
+      };
+    }
+
+    if (/example|for example|like|such as|home|school|daily/i.test(lower)) {
+      return {
+        label: "Example",
+        icon: Shapes,
+        cardBackground: "#fff8ea",
+        cardBorder: "#f2d7a5",
+        chipBackground: "#ffe8ba",
+        chipColor: "#b87907",
+        trailColor: "#efc05c",
+      };
+    }
+
+    if (/remember|key|important|rule|point|fact/i.test(lower)) {
+      return {
+        label: "Remember",
+        icon: Lightbulb,
+        cardBackground: "#eef8ff",
+        cardBorder: "#cce5ff",
+        chipBackground: "#dbedff",
+        chipColor: "#2569c7",
+        trailColor: "#8ab2ff",
+      };
+    }
+
+    if (/question|mcq|option|tap|round/i.test(lower)) {
+      return {
+        label: "Next step",
+        icon: ArrowRight,
+        cardBackground: "#eefcf2",
+        cardBorder: "#c7ebd2",
+        chipBackground: "#d7f5df",
+        chipColor: "#1a8143",
+        trailColor: "#6dd28b",
+      };
+    }
+
+    return {
+      label: "Idea",
+      icon: BookOpen,
+      cardBackground: "#fffdf5",
+      cardBorder: "#e9dfc3",
+      chipBackground: "#f4ead2",
+      chipColor: "#7d6222",
+      trailColor: "#d6c086",
+    };
+  }
+
+  function buildQuestionPrompt(turn: SessionTurn, studentName: string): string {
+    const options = turn.options
+      .map((option, idx) => `Option ${OPTION_LABELS[idx] ?? idx + 1}, ${option}.`)
+      .join(" ");
+
+    return `${studentName}, listen carefully. ${turn.q} ${options} You have ${QUESTION_TIME_LIMIT_SEC} seconds. Tap the correct answer now.`;
+  }
+
+  function buildOptions(
+    correct: string,
+    wrong: readonly string[],
+    seed: number,
+  ): { options: string[]; answerIndex: number } {
+    const options = wrong.slice(0, 3).map((item) => item.trim());
+    while (options.length < 3) options.push("Not enough context available.");
+
+    const answerIndex = seed % 4;
+    options.splice(answerIndex, 0, correct.trim());
+    return { options, answerIndex };
+  }
+
+  function normalizeQuestions(raw: unknown, expectedCount: number): SessionQuestion[] {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+      .map((item): SessionQuestion | null => {
+        if (!item || typeof item !== "object") return null;
+
+        const q = item as Partial<SessionQuestion>;
+        const question = typeof q.q === "string" ? q.q.trim() : "";
+        const optionValues = Array.isArray(q.options) ? q.options : [];
+        const options = optionValues
+          .map((opt) => (typeof opt === "string" ? opt.trim() : ""))
+          .filter(Boolean)
+          .filter((opt, idx, arr) => arr.findIndex((v) => v.toLowerCase() === opt.toLowerCase()) === idx)
+          .slice(0, 4);
+
+        if (!question || options.length !== 4) return null;
+
+        let answerIndex =
+          typeof q.answerIndex === "number" && Number.isInteger(q.answerIndex)
+            ? q.answerIndex
+            : -1;
+
+        if (answerIndex < 0 || answerIndex > 3) {
+          const alt = (item as { answer?: unknown }).answer;
+          if (typeof alt === "string" && alt.trim()) {
+            const answer = alt.trim();
+            const byText = options.findIndex((opt) => opt.toLowerCase() === answer.toLowerCase());
+            if (byText >= 0) answerIndex = byText;
+            else if (answer.length === 1 && "ABCD".includes(answer.toUpperCase())) {
+              answerIndex = answer.toUpperCase().charCodeAt(0) - 65;
+            }
+          }
+        }
+
+        if (answerIndex < 0 || answerIndex > 3) return null;
+
+        const explain =
+          typeof q.explain === "string" && q.explain.trim()
+            ? q.explain.trim()
+            : `Correct answer: ${options[answerIndex]}.`;
+
+        return { q: question, options, answerIndex, explain };
+      })
+      .filter((question): question is SessionQuestion => question !== null)
+      .slice(0, expectedCount);
+  }
+
+  function buildQuestionPlan(questionBank: SessionQuestion[]): SessionTurn[] {
+    const safeStudents = Math.max(1, students.length);
+    const totalTurns = safeStudents * QUESTIONS_PER_STUDENT;
+
+    const uniqueBank = questionBank.filter(
+      (question, idx, arr) =>
+        arr.findIndex((value) => value.q.trim().toLowerCase() === question.q.trim().toLowerCase()) === idx,
+    );
+
+    const mergedBank = [...uniqueBank];
+    for (const fallback of fallbackQuestions(totalTurns + 4)) {
+      const exists = mergedBank.some(
+        (question) => question.q.trim().toLowerCase() === fallback.q.trim().toLowerCase(),
+      );
+      if (!exists) mergedBank.push(fallback);
+      if (mergedBank.length >= totalTurns) break;
+    }
+
+    if (mergedBank.length === 0) return [];
+
+    const turns: SessionTurn[] = [];
+    for (let turn = 0; turn < totalTurns; turn += 1) {
+      turns.push({
+        ...mergedBank[turn % mergedBank.length],
+        student: turn % safeStudents,
+      });
+    }
+
+    return turns;
+  }
+
+  function clearAutoAdvanceTimer(): void {
+    if (autoAdvanceTimer !== null) {
+      clearTimeout(autoAdvanceTimer);
+      autoAdvanceTimer = null;
+    }
+  }
+
+  function clearSummaryFlowTimer(): void {
+    if (summaryFlowTimer !== null) {
+      clearTimeout(summaryFlowTimer);
+      summaryFlowTimer = null;
+    }
+  }
+
+  function clearQuestionSpeechTimer(): void {
+    if (questionSpeechTimer !== null) {
+      clearTimeout(questionSpeechTimer);
+      questionSpeechTimer = null;
+    }
+  }
+
+  function clearQuestionCountdownTimer(): void {
+    if (questionCountdownTimer !== null) {
+      clearInterval(questionCountdownTimer);
+      questionCountdownTimer = null;
+    }
+  }
+
+  function getSpeechApi(): SpeechSynthesis | null {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return null;
+    return window.speechSynthesis;
+  }
+
+  function pickSummaryVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
+    return (
+      voices.find(
+        (voice) => /^en(-|_)/i.test(voice.lang) && /samantha|karen|zira|serena|moira|siri/i.test(voice.name),
+      )
+      ?? voices.find((voice) => /^en(-|_)/i.test(voice.lang))
+      ?? voices[0]
+      ?? null
+    );
+  }
+
+  function primeSummarySpeech(): void {
+    const synth = getSpeechApi();
+    if (!synth) return;
+
+    synth.getVoices();
+    synth.resume();
+  }
+
+  function stopSummarySpeech(): void {
+    const synth = getSpeechApi();
+    if (!synth) return;
+
+    synth.cancel();
+    activeSummaryUtterance = null;
+  }
+
+  function stopQuestionSpeech(): void {
+    const synth = getSpeechApi();
+    if (!synth) return;
+
+    synth.cancel();
+    activeQuestionUtterance = null;
+  }
+
+  function stopQuestionPrompt(): void {
+    clearQuestionSpeechTimer();
+    clearQuestionCountdownTimer();
+    stopQuestionSpeech();
+    questionPromptStatus = "idle";
+    questionSecondsLeft = QUESTION_TIME_LIMIT_SEC;
+  }
+
+  function stopSummaryPlayback(): void {
+    summaryRunId += 1;
+    clearSummaryFlowTimer();
+    stopSummarySpeech();
+  }
+
+  async function scrollSummaryToLine(idx: number): Promise<void> {
+    await tick();
+
+    for (const host of [desktopSummaryStageEl, desktopSummarySidebarEl, mobileSummaryStageEl]) {
+      const line = host?.querySelector<HTMLElement>(`[data-summary-line="${idx}"]`);
+      line?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
+  function speakSummaryLine(line: string, runId: number, onDone: () => void): void {
+    clearSummaryFlowTimer();
+
+    const fallbackDelay = summaryLineDelayMs(line) + 500;
+    let finished = false;
+
+    const finish = (): void => {
+      if (finished || runId !== summaryRunId) return;
+      finished = true;
+      clearSummaryFlowTimer();
+      activeSummaryUtterance = null;
+      onDone();
+    };
+
+    const synth = getSpeechApi();
+    if (!synth || line.trim().length === 0) {
+      summaryFlowTimer = setTimeout(finish, summaryLineDelayMs(line));
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(line);
+    const voice = pickSummaryVoice(synth.getVoices());
+    if (voice) utterance.voice = voice;
+
+    utterance.lang = voice?.lang || "en-US";
+    utterance.rate = 0.96;
+    utterance.pitch = 1;
+    utterance.onend = finish;
+    utterance.onerror = finish;
+
+    activeSummaryUtterance = utterance;
+    synth.cancel();
+    synth.resume();
+    synth.speak(utterance);
+
+    summaryFlowTimer = setTimeout(finish, fallbackDelay);
+  }
+
+  function startQuestionCountdown(): void {
+    clearQuestionCountdownTimer();
+    questionPromptStatus = "timed";
+    questionSecondsLeft = QUESTION_TIME_LIMIT_SEC;
+
+    questionCountdownTimer = setInterval(() => {
+      if (questionSecondsLeft <= 1) {
+        questionSecondsLeft = 0;
+        clearQuestionCountdownTimer();
+        questionPromptStatus = "idle";
+        return;
+      }
+
+      questionSecondsLeft -= 1;
+    }, 1000);
+  }
+
+  function speakQuestionTurn(turn: SessionTurn, studentName: string): void {
+    stopQuestionPrompt();
+    questionPromptStatus = "reading";
+
+    const script = buildQuestionPrompt(turn, studentName);
+
+    const finish = (): void => {
+      clearQuestionSpeechTimer();
+      activeQuestionUtterance = null;
+
+      if (
+        phase !== "session"
+        || answerPhase !== "ask"
+        || currentQ?.q !== turn.q
+        || activeStudent?.name !== studentName
+      ) {
+        return;
+      }
+
+      startQuestionCountdown();
+    };
+
+    const synth = getSpeechApi();
+    if (!synth) {
+      finish();
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(script);
+    const voice = pickSummaryVoice(synth.getVoices());
+    if (voice) utterance.voice = voice;
+
+    utterance.lang = voice?.lang || "en-US";
+    utterance.rate = 0.98;
+    utterance.pitch = 1.02;
+    utterance.onend = finish;
+    utterance.onerror = finish;
+
+    activeQuestionUtterance = utterance;
+    synth.cancel();
+    synth.resume();
+    synth.speak(utterance);
+
+    questionSpeechTimer = setTimeout(
+      finish,
+      summaryLineDelayMs(script, QUESTION_PROMPT_MAX_MS) + 900,
+    );
+  }
+
+  function repeatQuestion(): void {
+    if (!currentQ || !activeStudent || phase !== "session" || answerPhase !== "ask") return;
+    speakQuestionTurn(currentQ, activeStudent.name ?? "Student");
+  }
+
+  function resetTurnState(): void {
+    submittedOption = null;
+    feedbackTitle = "";
+    feedbackDetail = "";
+    answerPhase = "ask";
+  }
+
+  function revealSummaryLine(idx: number, runId = summaryRunId): void {
+    if (runId !== summaryRunId) return;
+
+    if (summaryLines.length === 0) {
+      phase = "session";
+      return;
+    }
+
+    const nextIdx = Math.min(idx, summaryLines.length - 1);
+    summaryIdx = nextIdx;
+    void scrollSummaryToLine(nextIdx);
+
+    const isLastLine = nextIdx >= summaryLines.length - 1;
+    const line = summaryLines[nextIdx] ?? "";
+
+    speakSummaryLine(line, runId, () => {
+      if (runId !== summaryRunId || phase !== "summarizing") return;
+      if (isLastLine) {
+        phase = "session";
+        return;
+      }
+
+      revealSummaryLine(nextIdx + 1, runId);
+    });
+  }
+
+  function skipSummary(): void {
+    stopSummaryPlayback();
+    if (summaryLines.length > 0) summaryIdx = summaryLines.length - 1;
+    phase = "session";
   }
 
   async function fetchSummary(): Promise<void> {
     summaryLoading = true;
+    summaryError = "";
+
+    const expectedTurns = Math.max(1, students.length) * QUESTIONS_PER_STUDENT;
+    const requestBody = buildSessionRequestBody();
+
     try {
-      const res = await fetch("/api/socratic/summarize", {
+      const response = await fetch("/api/socratic/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: topic?.topic ?? "this topic",
-          subject: topic?.subject ?? "Science",
-          source: topic?.source ?? "standard",
-        }),
+        body: JSON.stringify(requestBody),
       });
-      if (res.ok) {
-        const data = (await res.json()) as { lines: string[] };
-        summaryLines = data.lines?.length > 0 ? data.lines : fallbackLines();
+
+      if (response.ok) {
+        const data = (await response.json()) as SummarizeResponse;
+        const lines = Array.isArray(data.lines)
+          ? data.lines.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
+          : [];
+
+        summaryLines = lines.length > 0 ? lines : fallbackLines();
+        questionPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
+        if (questionPlan.length === 0) {
+          questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+        }
       } else {
-        summaryLines = fallbackLines();
+        const data = (await response.json().catch(() => ({}))) as SummarizeResponse;
+        const apiError = typeof data.error === "string" ? data.error : "Could not load textbook summary.";
+        summaryError = apiError;
+
+        if (topic?.source === "custom") {
+          summaryLines = fallbackLines();
+          questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+        } else {
+          summaryLines = [
+            apiError,
+            "Choose an exact textbook topic from the class section and try again.",
+          ];
+          questionPlan = [];
+        }
       }
     } catch {
-      summaryLines = fallbackLines();
+      summaryError = "Network issue while loading summary.";
+      if (topic?.source === "custom") {
+        summaryLines = fallbackLines();
+        questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+      } else {
+        summaryLines = [
+          "Could not load textbook chunks for this class topic.",
+          "Select the exact chapter topic name and retry.",
+        ];
+        questionPlan = [];
+      }
     }
+
     summaryLoading = false;
   }
 
+  async function fetchSummaryPreview(): Promise<void> {
+    summaryPreviewLoading = true;
+    summaryPreviewCards = buildFallbackPreviewCards();
+
+    try {
+      const response = await fetch("/api/socratic/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildSessionRequestBody()),
+      });
+
+      if (response.ok) {
+        const data = (await response.json()) as PreviewResponse;
+        const cards = normalizePreviewCards(data.cards);
+        if (cards.length > 0) {
+          summaryPreviewCards = cards;
+        }
+      }
+    } catch {
+      // Keep local fallback previews.
+    }
+
+    summaryPreviewLoading = false;
+  }
+
   async function startSession(): Promise<void> {
+    clearAutoAdvanceTimer();
+    stopSummaryPlayback();
+    stopQuestionPrompt();
+    primeSummarySpeech();
+
     phase = "summarizing";
+    qIdx = 0;
+    answered = [];
     summaryIdx = 0;
-    cancelSpeech();
+    summaryLines = [];
+    summaryError = "";
+    summaryPreviewCards = buildFallbackPreviewCards();
+    questionPlan = [];
+    resetTurnState();
+
+    void fetchSummaryPreview();
     await fetchSummary();
-    revealLine(0);
+    const runId = summaryRunId + 1;
+    summaryRunId = runId;
+    revealSummaryLine(0, runId);
   }
 
   function startOver(): void {
-    cancelSpeech();
+    clearAutoAdvanceTimer();
+    stopSummaryPlayback();
+    stopQuestionPrompt();
+
     phase = "start";
     qIdx = 0;
     answered = [];
-    answerPhase = "ask";
     summaryIdx = 0;
     summaryLines = [];
-    selectedCard = null;
-    showHint = false;
+    summaryError = "";
+    summaryPreviewCards = [];
+    questionPlan = [];
+    resetTurnState();
   }
 
-  function submit(correct: boolean): void {
+  function selectOption(optionIndex: number): void {
+    if (!currentQ || phase !== "session" || answerPhase !== "ask") return;
+
+    submit(optionIndex === currentQ.answerIndex, optionIndex);
+  }
+
+  function submit(correct: boolean, optionIndex: number): void {
+    if (!currentQ) return;
+
+    clearAutoAdvanceTimer();
+    stopQuestionPrompt();
+
+    submittedOption = optionIndex;
     lastCorrect = correct;
     answered = [...answered, { studentIdx: currentQ.student, correct }];
     answerPhase = "feedback";
-    if (correct) speak(`Beautifully put, ${activeStudent?.name}. That is exactly right!`);
-    else speak(`Good thinking, ${activeStudent?.name}. Let us explore this a little more.`);
+
+    feedbackTitle = correct ? "Right" : "Wrong";
+    feedbackDetail = correct
+      ? currentQ.explain
+      : `Correct option: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`;
+
+    autoAdvanceTimer = setTimeout(() => {
+      if (phase === "session" && answerPhase === "feedback") next();
+    }, AUTO_ADVANCE_MS);
   }
 
   function next(): void {
-    cancelSpeech();
-    answerPhase = "ask";
-    selectedCard = null;
-    showHint = false;
+    clearAutoAdvanceTimer();
+    stopQuestionPrompt();
+    if (questionPlan.length === 0) return;
+
+    const previousQuestion = currentQ?.q ?? "";
     qIdx += 1;
-    const ns = students[SOCRATIC_QUESTIONS[qIdx % SOCRATIC_QUESTIONS.length]?.student ?? 0];
-    if (ns) setTimeout(() => speak(`${ns.name}, it's your turn.`), 300);
+
+    let guard = 0;
+    while (
+      guard < questionPlan.length - 1 &&
+      questionPlan[qIdx % questionPlan.length]?.q === previousQuestion
+    ) {
+      qIdx += 1;
+      guard += 1;
+    }
+
+    resetTurnState();
   }
 
-  function repeatQuestion(): void {
-    if (phase === "session" && currentQ) speak(currentQ.q);
-  }
+  $effect(() => {
+    if (phase !== "session" || answerPhase !== "ask" || !currentQ || !activeStudent) return;
 
-  const accent = $derived(cls?.color ?? "#6B94E7");
+    const turn = currentQ;
+    const studentName = activeStudent.name ?? "Student";
+    speakQuestionTurn(turn, studentName);
+
+    return () => {
+      stopQuestionPrompt();
+    };
+  });
+
+  onDestroy(() => {
+    clearAutoAdvanceTimer();
+    stopSummaryPlayback();
+    stopQuestionPrompt();
+  });
 </script>
 
 <!-- ═══════════════════════════════════════════════════
@@ -170,35 +911,31 @@
      ═══════════════════════════════════════════════════ -->
 <div class="hidden md:flex h-full flex-col overflow-hidden px-8 py-5 gap-4">
 
-  <!-- Teacher header above tablet -->
   <div class="mb-2 flex shrink-0 flex-col gap-4 md:flex-row md:items-end md:justify-between">
     <div>
       <div class="label-eyebrow text-saffron-600">
-        Student view · Socratic mode · {cls?.name ?? "Class"}
+        Student view · MCQ reteach · {cls?.name ?? "Class"}
       </div>
-      <div class="page-title mt-1">Turn by turn, one voice at a time</div>
+      <div class="page-title mt-1">Choose one option for every question</div>
     </div>
     <div class="flex flex-wrap items-center gap-2">
-      <Pill tone="cobalt">Question {progressStep} of 4</Pill>
-      <Button variant="secondary" onclick={() => goto("/alert")}>
+      <Pill tone="cobalt">Question {progressStep} of {totalQuestionCount}</Pill>
+      <Button variant="secondary" onclick={() => goto(resolve("/alert"))}>
         See teacher alert <ArrowRight class="size-3.5" />
       </Button>
     </div>
   </div>
 
-  <!-- Tablet shell -->
   <div
     class="min-h-0 flex-1 rounded-[28px] p-3.5"
     style="background:#0b0d14; box-shadow:0 40px 80px -30px rgba(13,17,29,0.45),0 0 0 1px #1b1d28 inset;"
   >
     <div class="flex h-full w-full flex-col overflow-hidden rounded-2xl" style="background:var(--ivory);">
 
-      <!-- ── Tablet header bar ── -->
       <div
         class="flex shrink-0 items-center gap-3 border-b px-5 py-3"
         style="border-color:var(--border-default);"
       >
-        <!-- Class badge -->
         <div
           class="grid size-8 shrink-0 place-items-center rounded-lg text-[13px] font-bold text-white"
           style="background:{accent};"
@@ -210,39 +947,38 @@
             {topic?.topic ?? "Today's session"}
           </div>
           <div class="text-[11px]" style="color:var(--text-tertiary);">
-            Lesson {roundNum} · {topic?.subject ?? "Science"} · {cls?.name ?? "Class 3"}
+            Lesson {roundNum} · {topic?.subject ?? "Science"} · {cls?.name ?? "Class"}
           </div>
         </div>
-        <!-- Progress pills -->
         <div class="flex shrink-0 items-center gap-2">
           <div class="flex items-center gap-1">
-            {#each [0, 1, 2, 3] as i (i)}
+            {#each [0, 1, 2, 3, 4, 5] as i (i)}
               <div
                 class="rounded-full transition-all duration-300"
-                style="height:8px; width:{i < progressStep ? '20px' : '8px'}; background:{i < progressStep ? accent : '#e5e1d8'};"
+                style="height:8px; width:{i < progressFilled ? '20px' : '8px'}; background:{i < progressFilled ? accent : '#e5e1d8'};"
               ></div>
             {/each}
           </div>
           <span class="text-[12px] font-medium tabular-nums" style="color:var(--text-secondary);">
-            {progressStep} / 4
+            {progressStep} / {totalQuestionCount}
           </span>
         </div>
       </div>
 
-      <!-- ── Main 3-column area ── -->
-      <div class="grid min-h-0 flex-1 grid-cols-[1fr_262px_188px]">
+      <div class="grid min-h-0 flex-1 grid-cols-[1fr_292px_188px]">
 
-        <!-- ── Left: question / start / summary ── -->
         <div class="flex flex-col overflow-hidden">
-
           {#if phase === "start"}
-            <!-- Start state: topic info + begin button -->
             <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
               <div
                 class="flex items-center gap-2 rounded-full px-4 py-1.5 text-[12px] font-medium"
                 style="background:{accent}18; color:{accent};"
               >
-                {#if topic?.source === "custom"}<Pencil class="size-3" />{:else}<BookOpen class="size-3" />{/if}
+                {#if topic?.source === "custom"}
+                  <Pencil class="size-3" />
+                {:else}
+                  <BookOpen class="size-3" />
+                {/if}
                 {topic?.subject ?? "Science"}
               </div>
               <div
@@ -252,7 +988,7 @@
                 {topic?.topic ?? "Today's reteach"}
               </div>
               <div class="text-[14px]" style="color:var(--text-secondary);">
-                AI reads a short summary first, then asks each student one question.
+                Short summary first (about 2-3 mins), then four-option MCQ questions.
               </div>
               <button
                 type="button"
@@ -264,7 +1000,7 @@
               </button>
               <button
                 type="button"
-                onclick={() => goto("/student/topic")}
+                onclick={() => goto(resolve("/student/topic"))}
                 class="cursor-pointer text-[11px] underline underline-offset-2"
                 style="color:var(--text-tertiary);"
               >
@@ -273,8 +1009,7 @@
             </div>
 
           {:else if phase === "summarizing"}
-            <!-- Summary streaming -->
-            <div class="flex flex-1 flex-col justify-center gap-5 px-10 py-8">
+            <div class="flex min-h-0 flex-1 flex-col gap-5 px-10 py-8">
               <div
                 class="inline-flex w-fit items-center gap-2.5 rounded-full px-4 py-2 text-[12px] font-medium"
                 style="background:{accent}18; color:{accent};"
@@ -286,31 +1021,151 @@
                   ></span>
                   <span class="relative inline-flex size-2 rounded-full" style="background:{accent};"></span>
                 </span>
-                {summaryLoading ? "AI is thinking…" : "AI is reading the summary…"}
+                {summaryLoading ? "AI is preparing a short summary..." : "Speaking short summary..."}
               </div>
-              <div class="max-w-145">
+              <div bind:this={desktopSummaryStageEl} class="max-w-145 flex-1 overflow-y-auto pr-2">
                 {#if summaryLoading}
-                  <div class="text-[16px]" style="color:var(--text-secondary);">
-                    <span class="animate-pulse">…</span>
+                  <div class="space-y-4 pb-3">
+                    <div class="flex flex-wrap items-center gap-2 text-[12px]" style="color:var(--text-secondary);">
+                      <span class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5" style="background:#fff7e8; color:#b87907;">
+                        <ImageIcon class="size-3.5" /> picture clues
+                      </span>
+                      <span class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5" style="background:#eef8ff; color:#2569c7;">
+                        <Sparkles class="size-3.5" /> child-friendly summary
+                      </span>
+                    </div>
+                    <div class="flex items-center gap-2 overflow-x-auto pb-1">
+                      {#each summaryPreviewCards as card, i (`flow-${card.title}-${i}`)}
+                        {@const tone = getPreviewCardTone(card, i)}
+                        <div
+                          class="shrink-0 rounded-full border px-3 py-1.5 text-[11px] font-semibold"
+                          style="background:{tone.chipBackground}; color:{tone.chipColor}; border-color:{tone.cardBorder};"
+                        >
+                          {card.title}
+                        </div>
+                        {#if i < summaryPreviewCards.length - 1}
+                          <ArrowRight class="size-4 shrink-0" style="color:{tone.trailColor};" />
+                        {/if}
+                      {/each}
+                    </div>
+                    <div class="grid gap-3 md:grid-cols-3">
+                      {#each summaryPreviewCards as card, i (`preview-${card.title}-${i}`)}
+                        {@const tone = getPreviewCardTone(card, i)}
+                        <div
+                          class="rounded-3xl border p-3.5"
+                          style="background:{tone.cardBackground}; border-color:{tone.cardBorder};"
+                        >
+                          <div class="mb-3 flex items-start gap-2.5">
+                            <div
+                              class="grid size-10 shrink-0 place-items-center rounded-2xl"
+                              style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                            >
+                              <tone.icon class="size-4.5" />
+                            </div>
+                            <div class="min-w-0">
+                              <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
+                                {card.badge}
+                              </div>
+                              <div class="mt-1 text-[15px] font-semibold" style="color:var(--ink);">
+                                {card.title}
+                              </div>
+                            </div>
+                          </div>
+
+                          {#if card.imageDataUrl}
+                            <img
+                              src={card.imageDataUrl}
+                              alt={card.title}
+                              class="h-28 w-full rounded-2xl object-cover"
+                            />
+                          {:else}
+                            <div
+                              class="flex items-center justify-between rounded-2xl border border-dashed px-3 py-3 text-[11px]"
+                              style="border-color:{tone.cardBorder}; color:{tone.chipColor}; background:white;"
+                            >
+                              <span>idea</span>
+                              <ArrowRight class="size-3.5" />
+                              <span>example</span>
+                              <ArrowRight class="size-3.5" />
+                              <span>answer</span>
+                            </div>
+                          {/if}
+
+                          <div class="mt-3 text-[13px] leading-[1.55]" style="color:var(--text-body);">
+                            {card.caption}
+                          </div>
+                        </div>
+                      {/each}
+                    </div>
+                    <div class="text-[12px]" style="color:var(--text-tertiary);">
+                      {summaryPreviewLoading ? "Refreshing textbook cues..." : "Textbook cues are ready while the summary is being prepared."}
+                    </div>
                   </div>
                 {:else}
-                  {#each summaryLines.slice(0, summaryIdx + 1) as line, i (i)}
+                  {#each visibleSummaryLines as line, i (i)}
+                    {@const tone = getSummaryLineTone(line, i)}
                     <div
-                      class="mb-3 text-[20px] font-medium leading-relaxed transition-opacity duration-500"
-                      style="color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.38 : 1};"
+                      class="relative mb-4 pl-1"
                     >
-                      {line}
+                      {#if i < visibleSummaryLines.length - 1}
+                        <div
+                          class="absolute -bottom-4.5 left-5 top-[calc(100%-6px)] w-px"
+                          style="background:{tone.trailColor}; opacity:0.45;"
+                        ></div>
+                      {/if}
+                      <div
+                        data-summary-line={i}
+                        class="rounded-3xl border p-4 text-[20px] font-medium leading-relaxed transition-opacity duration-500"
+                        style="background:{tone.cardBackground}; border-color:{tone.cardBorder}; color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
+                      >
+                        <div class="mb-2 flex items-center gap-2">
+                          <div
+                            class="grid size-8 shrink-0 place-items-center rounded-2xl"
+                            style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                          >
+                            <tone.icon class="size-4" />
+                          </div>
+                          <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
+                            {tone.label}
+                          </div>
+                        </div>
+                        {line}
+                      </div>
                     </div>
                   {/each}
+                  <button
+                    type="button"
+                    onclick={skipSummary}
+                    class="mt-2 cursor-pointer rounded-xl px-4 py-2 text-[12px] font-semibold"
+                    style="color:{accent}; background:{accent}12;"
+                  >
+                    Skip to MCQ
+                  </button>
                 {/if}
               </div>
             </div>
 
-          {:else}
-            <!-- Session: student turn + question + answer -->
-            <div class="flex flex-1 flex-col overflow-y-auto p-7 pb-5">
+          {:else if blockedBySource}
+            <div class="flex flex-1 flex-col items-center justify-center gap-4 px-8 text-center">
+              <div class="text-[24px]">📚</div>
+              <div class="text-[20px] font-semibold" style="color:var(--ink);">
+                Textbook content required
+              </div>
+              <div class="max-w-120 text-[13px] leading-relaxed" style="color:var(--text-secondary);">
+                {summaryError || "No vectorized textbook chunks were found for this class topic."}
+              </div>
+              <button
+                type="button"
+                onclick={() => goto(resolve("/student/topic"))}
+                class="cursor-pointer rounded-xl px-5 py-2 text-[13px] font-semibold text-white"
+                style="background:{accent};"
+              >
+                Pick textbook topic
+              </button>
+            </div>
 
-              <!-- Student chip -->
+          {:else}
+            <div class="flex flex-1 flex-col overflow-y-auto p-7 pb-5">
               <div
                 class="bg-saffron-50 border-saffron-100 mb-6 inline-flex shrink-0 items-center gap-2.5 self-start rounded-full border px-3.5 py-2"
               >
@@ -318,102 +1173,118 @@
                 <span class="text-saffron-700 text-[13.5px] font-semibold">
                   {activeStudent?.name ?? "Student"}, it's your turn.
                 </span>
-                <span class="text-saffron-600 text-[11px]">· உங்கள் முறை</span>
+                <span class="text-saffron-600 text-[11px]">· Tap one option</span>
               </div>
 
-              <!-- Question text -->
               <div
-                class="text-ink max-w-155 flex-1 text-[22px] font-medium leading-[1.42] tracking-[-0.01em] md:text-[25px]"
+                class="text-ink max-w-155 text-[22px] font-medium leading-[1.42] tracking-[-0.01em] md:text-[25px]"
                 style="text-wrap:pretty;"
               >
                 {currentQ?.q}
               </div>
 
-              <!-- Hint toggle -->
-              {#if !showHint}
+              <div class="mt-4 flex flex-wrap items-center gap-2">
+                <div
+                  class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold"
+                  style="background:#eef8ff; color:#2569c7;"
+                >
+                  <Volume2 class="size-3.5" /> {questionPromptStatus === "reading" ? "Reading aloud" : "Voice ready"}
+                </div>
+                <div
+                  class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold"
+                  style="background:#fff8ea; color:#b87907;"
+                >
+                  <Clock3 class="size-3.5" /> {questionPromptText}
+                </div>
                 <button
                   type="button"
-                  onclick={() => (showHint = true)}
-                  class="mt-4 flex cursor-pointer items-center gap-1.5 self-start text-[12px] transition-opacity hover:opacity-70"
-                  style="color:var(--text-tertiary);"
+                  onclick={repeatQuestion}
+                  class="inline-flex cursor-pointer items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold"
+                  style="background:{accent}12; color:{accent};"
                 >
-                  <span class="text-[13px]">✨</span> Need a hint?
+                  <Volume2 class="size-3.5" /> Read again
                 </button>
-              {:else}
+              </div>
+
+              <div class="mt-3 h-2 w-full max-w-120 overflow-hidden rounded-full" style="background:#e8e2d6;">
                 <div
-                  class="mt-4 rounded-xl px-4 py-3 text-[13px]"
-                  style="background:{accent}10; color:{accent}; border:1px solid {accent}30;"
-                >
-                  💡 {currentQ?.expect ?? "Think about what plants use sunlight for."}
-                </div>
-              {/if}
+                  class="h-full rounded-full transition-all duration-500"
+                  style="width:{questionPromptStatus === 'timed' ? questionCountdownPercent : questionPromptStatus === 'reading' ? 100 : 0}%; background:{questionPromptStatus === 'reading' ? accent : '#efc05c'};"
+                ></div>
+              </div>
 
               {#if answerPhase === "ask"}
-                <!-- Mic area -->
-                <div
-                  class="mt-5 flex shrink-0 items-center gap-4 rounded-2xl p-4"
-                  style="border:2px dashed #5bc5b8; background:#f0fdfc;"
-                >
-                  <button
-                    type="button"
-                    class="relative grid size-[72px] shrink-0 cursor-pointer place-items-center rounded-full transition-all hover:scale-105 active:scale-95"
-                    style="background:linear-gradient(135deg,#2dd4bf,#0891b2); box-shadow:0 10px 30px -8px #2dd4bf88;"
-                  >
-                    <Mic class="size-7 text-white" />
-                  </button>
-                  <div class="flex-1">
-                    <div class="text-[14.5px] font-semibold" style="color:var(--ink);">
-                      Tap and speak your answer
-                    </div>
-                    <div class="mt-0.5 text-[12.5px]" style="color:var(--text-secondary);">
-                      Say it in Tamil or English — in your own words, {activeStudent?.name ?? "friend"}.
-                    </div>
-                  </div>
-                  <div class="flex shrink-0 flex-col items-end gap-1.5">
+                <div class="mt-6 grid shrink-0 grid-cols-2 gap-3">
+                  {#each currentQ?.options ?? [] as option, i (`${option}-${i}`)}
                     <button
                       type="button"
-                      onclick={() => submit(false)}
-                      class="cursor-pointer rounded-lg px-3 py-1.5 text-[11px] font-medium transition-colors hover:bg-black/5"
-                      style="color:var(--text-tertiary);"
+                      onclick={() => selectOption(i)}
+                      class="cursor-pointer rounded-2xl border px-4 py-4 text-left transition-all hover:-translate-y-0.5"
+                      style="background:white; border-color:var(--border-default); box-shadow:0 4px 14px -8px rgba(0,0,0,0.18);"
                     >
-                      Demo: wrong
+                      <div class="flex items-start gap-3">
+                        <div
+                          class="grid size-8 shrink-0 place-items-center rounded-full text-[12px] font-semibold"
+                          style="background:{accent}12; color:{accent};"
+                        >
+                          {OPTION_LABELS[i]}
+                        </div>
+                        <div class="pt-1 text-[15px] font-semibold leading-snug" style="color:var(--ink);">
+                          {option}
+                        </div>
+                      </div>
                     </button>
-                    <button
-                      type="button"
-                      onclick={() => submit(true)}
-                      class="cursor-pointer rounded-lg px-3 py-1.5 text-[11px] font-medium transition-colors hover:bg-black/5"
-                      style="color:{accent};"
+                  {/each}
+                </div>
+                <div class="mt-3 text-[12px]" style="color:var(--text-tertiary);">
+                  No typing needed. Just tap one option.
+                </div>
+              {:else}
+                <div class="mt-6 grid shrink-0 grid-cols-2 gap-3">
+                  {#each currentQ?.options ?? [] as option, i (`review-${option}-${i}`)}
+                    {@const isCorrectOption = i === currentQ?.answerIndex}
+                    {@const isPicked = i === submittedOption}
+                    <div
+                      class="rounded-2xl border px-4 py-4"
+                      style="{isCorrectOption
+                        ? 'background:#ecfdf3;border-color:#86efac;'
+                        : isPicked
+                          ? 'background:#fff1f2;border-color:#fda4af;'
+                          : 'background:white;border-color:var(--border-default);'}"
                     >
-                      Demo: correct
-                    </button>
-                  </div>
+                      <div class="text-[14px] font-semibold" style="color:var(--ink);">
+                        {option}
+                      </div>
+                    </div>
+                  {/each}
                 </div>
 
-              {:else}
-                <!-- Feedback -->
                 <div
                   class="mt-5 shrink-0 rounded-2xl border p-5"
                   style="{lastCorrect
                     ? 'background:#f0fdf4;border-color:#bbf7d0;'
-                    : 'background:#fffbeb;border-color:#fde68a;'}"
+                    : 'background:#fff7ed;border-color:#fed7aa;'}"
                 >
-                  <div class="mb-2 flex items-center gap-2.5">
-                    <span class="text-[22px]">{lastCorrect ? "🌼" : "🌿"}</span>
+                  <div class="mb-1.5 flex items-center gap-2.5">
+                    {#if lastCorrect}
+                      <CheckCircle2 class="size-5" style="color:#15803d;" />
+                    {:else}
+                      <XCircle class="size-5" style="color:#b45309;" />
+                    {/if}
                     <div
-                      class="text-[14px] font-semibold"
-                      style="color:{lastCorrect ? '#166534' : '#92400e'};"
+                      class="text-[15px] font-semibold"
+                      style="color:{lastCorrect ? '#166534' : '#9a3412'};"
                     >
-                      {lastCorrect
-                        ? `Beautifully put, ${activeStudent?.name}.`
-                        : `Close, ${activeStudent?.name} — let's think again.`}
+                      {feedbackTitle}
                     </div>
                   </div>
-                  <div class="pl-9 text-[13.5px] leading-[1.6]" style="color:var(--text-body);">
-                    {lastCorrect
-                      ? "Yes — without sunlight the plant can't make food. Leaves turn pale and it slowly wilts."
-                      : "Think about what plants do with sunlight. Is a dark cupboard giving them enough?"}
+                  <div class="pl-7 text-[13.5px] leading-[1.6]" style="color:var(--text-body);">
+                    {feedbackDetail}
                   </div>
-                  <div class="mt-3.5 pl-9">
+                  <div class="mt-1 pl-7 text-[11px]" style="color:var(--text-tertiary);">
+                    Moving to {nextStudent?.name ?? "next student"}...
+                  </div>
+                  <div class="mt-3.5 pl-7">
                     <button
                       type="button"
                       onclick={next}
@@ -426,85 +1297,94 @@
                   </div>
                 </div>
               {/if}
-
             </div>
           {/if}
         </div>
 
-        <!-- ── Middle: Remember panel ── -->
         <div
           class="flex flex-col overflow-hidden border-l"
           style="border-color:var(--border-default); background:#fdfcf8;"
         >
-          {#if phase === "session"}
-            <div class="flex h-full flex-col overflow-hidden p-4">
-              <div
-                class="mb-1 shrink-0 text-[9.5px] font-semibold uppercase tracking-widest"
-                style="color:#6B94E7;"
-              >
-                Remember — From This Morning
+          <div class="flex h-full flex-col overflow-hidden p-4">
+            <div
+              class="mb-1 shrink-0 text-[9.5px] font-semibold uppercase tracking-widest"
+              style="color:#6B94E7;"
+            >
+              Summary
+            </div>
+            <div class="shrink-0 text-[13px] font-semibold" style="color:var(--ink);">
+              {topic?.source === "custom" ? "Custom topic (web + class-level)" : "Class topic (textbook)"}
+            </div>
+            <div class="mt-1 shrink-0 text-[11px]" style="color:var(--text-secondary);">
+              This summary stays visible while answering MCQs.
+            </div>
+
+            {#if summaryLoading && summaryLines.length === 0}
+              <div class="mt-3 text-[12px]" style="color:var(--text-secondary);">
+                <span class="animate-pulse">Loading summary...</span>
               </div>
-              <div class="mb-3 shrink-0 text-[13px] font-semibold" style="color:var(--ink);">
-                {currentQ?.rememberTitle ?? "Key concepts"}
+            {:else if summaryLines.length === 0}
+              <div class="flex flex-1 items-center justify-center text-center text-[12px]" style="color:var(--text-tertiary);">
+                Summary appears here when session starts
               </div>
-              <!-- Concept cards -->
-              <div class="flex flex-1 flex-col gap-2 overflow-y-auto">
-                {#each currentQ?.remember ?? [] as card, i (i)}
-                  <button
-                    type="button"
-                    onclick={() => (selectedCard = selectedCard === i ? null : i)}
-                    class="flex cursor-pointer items-start gap-2.5 rounded-xl p-3 text-left transition-all"
-                    style="{selectedCard === i
-                      ? `background:white; border:1.5px solid ${accent}; box-shadow:0 2px 10px -4px ${accent}44;`
-                      : 'background:white; border:1px solid var(--border-default);'}"
-                  >
+            {:else}
+              {#if summaryPreviewCards.length > 0}
+                <div class="mt-3 flex gap-2 overflow-x-auto pb-1">
+                  {#each summaryPreviewCards as card, i (`side-preview-${card.title}-${i}`)}
+                    {@const tone = getPreviewCardTone(card, i)}
                     <div
-                      class="grid size-8 shrink-0 place-items-center rounded-lg text-[16px]"
-                      style="background:{accent}14;"
+                      class="min-w-32 shrink-0 rounded-2xl border p-2.5"
+                      style="background:{tone.cardBackground}; border-color:{tone.cardBorder};"
                     >
-                      {card.emoji}
+                      <div class="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em]" style="color:{tone.chipColor};">
+                        {card.badge}
+                      </div>
+                      {#if card.imageDataUrl}
+                        <img src={card.imageDataUrl} alt={card.title} class="mb-2 h-14 w-full rounded-xl object-cover" />
+                      {/if}
+                      <div class="text-[11px] font-semibold" style="color:var(--ink);">{card.title}</div>
                     </div>
-                    <div class="min-w-0">
-                      <div class="text-[12.5px] font-semibold" style="color:var(--ink);">{card.title}</div>
-                      <div class="text-[11px] leading-[1.5]" style="color:var(--text-secondary);">
-                        {card.detail}
+                  {/each}
+                </div>
+              {/if}
+              <div bind:this={desktopSummarySidebarEl} class="mt-3 flex-1 space-y-2 overflow-y-auto pr-1">
+                {#each visibleSummaryLines as line, i (i)}
+                  {@const tone = getSummaryLineTone(line, i)}
+                  <div
+                    data-summary-line={i}
+                    class="rounded-2xl border px-3 py-2.5 text-[12px] leading-relaxed"
+                    style="border-color:{tone.cardBorder}; background:{tone.cardBackground}; color:var(--ink); opacity:{phase === 'summarizing' && summaryIdx - i > 0 ? 0.6 : 1};"
+                  >
+                    <div class="mb-1.5 flex items-center gap-2">
+                      <div
+                        class="grid size-6 shrink-0 place-items-center rounded-xl"
+                        style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                      >
+                        <tone.icon class="size-3.5" />
+                      </div>
+                      <div class="text-[9.5px] font-semibold uppercase tracking-[0.16em]" style="color:{tone.chipColor};">
+                        {tone.label}
                       </div>
                     </div>
-                  </button>
+                    {line}
+                  </div>
                 {/each}
               </div>
-              <!-- Listen again -->
-              <div
-                class="mt-3 shrink-0 rounded-xl p-3"
-                style="background:#eff6ff; border:1px solid #bfdbfe;"
+            {/if}
+
+            {#if phase === "summarizing" && !summaryLoading}
+              <button
+                type="button"
+                onclick={skipSummary}
+                class="mt-3 shrink-0 cursor-pointer rounded-xl px-3 py-2 text-[11px] font-semibold"
+                style="background:{accent}12; color:{accent};"
               >
-                <div class="mb-2 text-[11px] font-semibold" style="color:#1e40af;">Listen again</div>
-                <div class="flex items-center gap-2">
-                  <Mic class="size-3.5 shrink-0" style="color:#3b82f6;" />
-                  <div class="flex flex-1 items-end gap-[2px]">
-                    {#each [5, 9, 14, 8, 12, 6, 15, 10, 7, 13, 9, 11] as h, i (i)}
-                      <div
-                        class="rounded-sm"
-                        style="width:3px; height:{h}px; background:#3b82f6; opacity:0.6;"
-                      ></div>
-                    {/each}
-                  </div>
-                  <span class="tabular-nums text-[10px]" style="color:#3b82f6;">0:42</span>
-                </div>
-              </div>
-            </div>
-          {:else}
-            <!-- Placeholder when not in session -->
-            <div class="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-              <div class="text-[28px]">📖</div>
-              <div class="text-[12px]" style="color:var(--text-tertiary);">
-                Concept cards appear here when the session starts
-              </div>
-            </div>
-          {/if}
+                Skip summary
+              </button>
+            {/if}
+          </div>
         </div>
 
-        <!-- ── Right: THE CIRCLE ── -->
         <div
           class="flex flex-col overflow-hidden border-l"
           style="background:#f5f3ee; border-color:var(--border-default);"
@@ -571,33 +1451,30 @@
             {/each}
           </div>
 
-          <!-- Next student indicator -->
           <div
             class="shrink-0 border-t p-3"
             style="border-color:var(--border-default); background:rgba(255,255,255,0.5);"
           >
-            {#if phase === "session"}
+            {#if phase === "session" && currentQ}
               <div class="mb-1 text-[9px] uppercase tracking-widest" style="color:var(--text-tertiary);">
                 Next
               </div>
               <div class="flex items-center gap-2">
                 <span class="text-[16px]">{nextStudent?.emoji ?? "👤"}</span>
                 <span class="text-[12px] font-semibold" style="color:var(--ink);">
-                  {nextStudent?.name ?? "—"}
+                  {nextStudent?.name ?? "-"}
                 </span>
               </div>
             {:else}
               <div class="text-center text-[10px]" style="color:var(--text-secondary);">
-                After all {students.length}, we cycle again.
+                3 questions each for {students.length} students.
               </div>
             {/if}
           </div>
         </div>
 
       </div>
-      <!-- end 3-col grid -->
 
-      <!-- ── Bottom bar ── -->
       <div
         class="flex shrink-0 items-center gap-4 border-t px-5 py-2.5"
         style="border-color:var(--border-default); background:#faf9f6;"
@@ -611,21 +1488,21 @@
         <div class="flex items-center gap-1.5 text-[12px]" style="color:var(--text-secondary);">
           <RotateCcw class="size-3 opacity-60" />
           <span>
-            Round <strong style="color:var(--ink);">{roundNum}</strong> of Socratic turns
+            Round <strong style="color:var(--ink);">{roundNum}</strong> of 3 · Cycle <strong style="color:var(--ink);">{cycleNum}</strong>
           </span>
         </div>
         <div class="flex-1"></div>
         <button
           type="button"
-          onclick={repeatQuestion}
+          onclick={startOver}
           class="flex cursor-pointer items-center gap-1.5 text-[12px] transition-opacity hover:opacity-60"
           style="color:var(--text-secondary);"
         >
-          <RotateCcw class="size-3" /> Repeat question
+          <RotateCcw class="size-3" /> Restart
         </button>
         <button
           type="button"
-          onclick={() => goto("/alert")}
+          onclick={() => goto(resolve("/alert"))}
           class="flex cursor-pointer items-center gap-1.5 text-[12px] font-medium transition-opacity hover:opacity-70"
           style="color:#ef4444;"
         >
@@ -634,12 +1511,8 @@
       </div>
 
     </div>
-    <!-- end inner tablet -->
   </div>
-  <!-- end tablet shell -->
-
 </div>
-
 
 <!-- ═══════════════════════════════════════════════════
      MOBILE / TABLET (below md): full-screen student view
@@ -652,7 +1525,11 @@
         class="flex items-center gap-2 rounded-full px-4 py-2 text-[13px] font-medium"
         style="background:{accent}22; color:{accent};"
       >
-        {#if topic?.source === "custom"}<Pencil class="size-3.5" />{:else}<BookOpen class="size-3.5" />{/if}
+        {#if topic?.source === "custom"}
+          <Pencil class="size-3.5" />
+        {:else}
+          <BookOpen class="size-3.5" />
+        {/if}
         {topic?.subject ?? "Science"}
       </div>
       <div
@@ -661,8 +1538,8 @@
       >
         {topic?.topic ?? "Today's reteach"}
       </div>
-      <div class="text-[16px]" style="color:rgba(255,255,255,0.4);">
-        AI reads a summary, then one question per child.
+      <div class="text-[16px]" style="color:rgba(255,255,255,0.45);">
+        Short summary first, then four-option MCQs. Tap one option to answer.
       </div>
       <button
         type="button"
@@ -687,22 +1564,108 @@
           ></span>
           <span class="relative inline-flex size-2 rounded-full" style="background:{accent};"></span>
         </span>
-        {summaryLoading ? "AI is thinking…" : "AI is reading the summary…"}
+        {summaryLoading ? "Loading short summary..." : "Showing short summary..."}
       </div>
-      <div class="w-full max-w-sm text-center">
+      <div bind:this={mobileSummaryStageEl} class="w-full max-w-sm flex-1 overflow-y-auto text-center">
         {#if summaryLoading}
-          <div class="text-[16px] text-white" style="opacity:0.5;">
-            <span class="animate-pulse">…</span>
+          <div class="space-y-4 pb-6 text-left">
+            <div class="flex items-center gap-2 overflow-x-auto pb-1">
+              {#each summaryPreviewCards as card, i (`mobile-flow-${card.title}-${i}`)}
+                {@const tone = getPreviewCardTone(card, i)}
+                <div
+                  class="shrink-0 rounded-full border px-3 py-1.5 text-[11px] font-semibold"
+                  style="background:{tone.chipBackground}; color:{tone.chipColor}; border-color:{tone.cardBorder};"
+                >
+                  {card.title}
+                </div>
+                {#if i < summaryPreviewCards.length - 1}
+                  <ArrowRight class="size-4 shrink-0" style="color:{tone.trailColor};" />
+                {/if}
+              {/each}
+            </div>
+
+            {#each summaryPreviewCards as card, i (`mobile-preview-${card.title}-${i}`)}
+              {@const tone = getPreviewCardTone(card, i)}
+              <div
+                class="rounded-3xl border p-3.5"
+                style="background:{tone.cardBackground}; border-color:{tone.cardBorder};"
+              >
+                <div class="mb-3 flex items-start gap-2.5">
+                  <div
+                    class="grid size-10 shrink-0 place-items-center rounded-2xl"
+                    style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                  >
+                    <tone.icon class="size-4.5" />
+                  </div>
+                  <div>
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
+                      {card.badge}
+                    </div>
+                    <div class="mt-1 text-[15px] font-semibold" style="color:var(--ink);">
+                      {card.title}
+                    </div>
+                  </div>
+                </div>
+                {#if card.imageDataUrl}
+                  <img src={card.imageDataUrl} alt={card.title} class="h-28 w-full rounded-2xl object-cover" />
+                {:else}
+                  <div
+                    class="flex items-center justify-between rounded-2xl border border-dashed px-3 py-3 text-[11px]"
+                    style="border-color:{tone.cardBorder}; color:{tone.chipColor}; background:white;"
+                  >
+                    <span>idea</span>
+                    <ArrowRight class="size-3.5" />
+                    <span>example</span>
+                    <ArrowRight class="size-3.5" />
+                    <span>answer</span>
+                  </div>
+                {/if}
+                <div class="mt-3 text-[13px] leading-[1.55]" style="color:var(--text-body);">
+                  {card.caption}
+                </div>
+              </div>
+            {/each}
           </div>
         {:else}
-          {#each summaryLines.slice(0, summaryIdx + 1) as line, i (i)}
+          {#each visibleSummaryLines as line, i (i)}
+            {@const tone = getSummaryLineTone(line, i)}
             <div
-              class="mb-4 text-[18px] font-medium leading-relaxed text-white"
-              style="opacity:{summaryIdx - i > 0 ? 0.45 : 1};"
+              class="relative mb-4 pl-1 text-left"
             >
-              {line}
+              {#if i < visibleSummaryLines.length - 1}
+                <div
+                  class="absolute -bottom-4.5 left-5 top-[calc(100%-6px)] w-px"
+                  style="background:{tone.trailColor}; opacity:0.45;"
+                ></div>
+              {/if}
+              <div
+                data-summary-line={i}
+                class="rounded-3xl border p-4 text-[18px] font-medium leading-relaxed"
+                style="background:{tone.cardBackground}; border-color:{tone.cardBorder}; color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
+              >
+                <div class="mb-2 flex items-center gap-2">
+                  <div
+                    class="grid size-8 shrink-0 place-items-center rounded-2xl"
+                    style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                  >
+                    <tone.icon class="size-4" />
+                  </div>
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
+                    {tone.label}
+                  </div>
+                </div>
+                {line}
+              </div>
             </div>
           {/each}
+          <button
+            type="button"
+            onclick={skipSummary}
+            class="mt-2 cursor-pointer rounded-xl px-4 py-2 text-[12px] font-semibold"
+            style="color:{accent}; background:white;"
+          >
+            Skip to MCQ
+          </button>
         {/if}
       </div>
     </div>
@@ -722,101 +1685,177 @@
       style="background:var(--ivory);"
     >
       <div class="flex flex-1 flex-col overflow-y-auto p-5">
-        <!-- Student chip -->
-        <div
-          class="bg-saffron-50 border-saffron-100 mb-5 inline-flex items-center gap-2.5 self-start rounded-full border px-3.5 py-2"
-        >
-          <span class="text-[18px]">{activeStudent?.emoji}</span>
-          <span class="text-saffron-700 text-[13px] font-semibold">
-            {activeStudent?.name}, it's your turn.
-          </span>
-        </div>
-
-        <div
-          class="text-ink flex-1 text-[20px] font-medium leading-[1.45] tracking-tight"
-          style="text-wrap:pretty;"
-        >
-          {currentQ?.q}
-        </div>
-
-        {#if answerPhase === "ask"}
-          <div class="mt-5">
-            <div
-              class="flex items-center gap-3 rounded-2xl p-4"
-              style="border:2px dashed #5bc5b8; background:#f0fdfc;"
+        {#if blockedBySource}
+          <div class="flex flex-1 flex-col items-center justify-center gap-4 text-center">
+            <div class="text-[24px]">📚</div>
+            <div class="text-[18px] font-semibold" style="color:var(--ink);">Textbook topic required</div>
+            <div class="text-[13px]" style="color:var(--text-secondary);">
+              {summaryError || "No vectorized textbook chunks found for this topic."}
+            </div>
+            <button
+              type="button"
+              onclick={() => goto(resolve("/student/topic"))}
+              class="cursor-pointer rounded-xl px-4 py-2 text-[13px] font-semibold text-white"
+              style="background:{accent};"
             >
-              <button
-                type="button"
-                class="grid size-[60px] shrink-0 cursor-pointer place-items-center rounded-full transition-all hover:scale-105 active:scale-95"
-                style="background:linear-gradient(135deg,#2dd4bf,#0891b2); box-shadow:0 8px 24px -6px #2dd4bf88;"
-              >
-                <Mic class="size-6 text-white" />
-              </button>
-              <div class="flex-1">
-                <div class="text-[13px] font-semibold" style="color:var(--ink);">
-                  Tap and speak
-                </div>
-                <div class="text-[11px]" style="color:var(--text-secondary);">
-                  Tamil or English, {activeStudent?.name}.
-                </div>
-              </div>
-            </div>
-            <div class="mt-3 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onclick={() => submit(false)}
-                class="cursor-pointer rounded-xl px-3 py-2 text-[12px]"
-                style="color:var(--text-tertiary);"
-              >
-                Demo: wrong
-              </button>
-              <button
-                type="button"
-                onclick={() => submit(true)}
-                class="flex cursor-pointer items-center gap-1.5 rounded-xl px-5 py-2.5 text-[13px] font-semibold text-white"
-                style="background:{accent};"
-              >
-                Demo: correct
-              </button>
-            </div>
+              Pick class topic
+            </button>
           </div>
         {:else}
           <div
-            class="mt-5 rounded-2xl border p-4"
-            style="{lastCorrect
-              ? 'background:#f0fdf4;border-color:#bbf7d0;'
-              : 'background:#fffbeb;border-color:#fde68a;'}"
+            class="bg-saffron-50 border-saffron-100 mb-5 inline-flex items-center gap-2.5 self-start rounded-full border px-3.5 py-2"
           >
-            <div class="mb-2 flex items-center gap-2">
-              <span class="text-[20px]">{lastCorrect ? "🌼" : "🌿"}</span>
-              <div
-                class="text-[14px] font-semibold"
-                style="color:{lastCorrect ? '#166534' : '#92400e'};"
-              >
-                {lastCorrect ? `Beautifully put, ${activeStudent?.name}.` : `Close — let's think again.`}
+            <span class="text-[18px]">{activeStudent?.emoji}</span>
+            <span class="text-saffron-700 text-[13px] font-semibold">
+              {activeStudent?.name}, it's your turn.
+            </span>
+          </div>
+
+          <div
+            class="text-ink text-[20px] font-medium leading-[1.45] tracking-tight"
+            style="text-wrap:pretty;"
+          >
+            {currentQ?.q}
+          </div>
+
+          <div class="mt-4 flex flex-wrap items-center gap-2">
+            <div
+              class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold"
+              style="background:#eef8ff; color:#2569c7;"
+            >
+              <Volume2 class="size-3.5" /> {questionPromptStatus === "reading" ? "Reading aloud" : "Voice ready"}
+            </div>
+            <div
+              class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold"
+              style="background:#fff8ea; color:#b87907;"
+            >
+              <Clock3 class="size-3.5" /> {questionPromptText}
+            </div>
+            <button
+              type="button"
+              onclick={repeatQuestion}
+              class="inline-flex cursor-pointer items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold"
+              style="background:{accent}12; color:{accent};"
+            >
+              <Volume2 class="size-3.5" /> Read again
+            </button>
+          </div>
+
+          <div class="mt-3 h-2 w-full overflow-hidden rounded-full" style="background:#e8e2d6;">
+            <div
+              class="h-full rounded-full transition-all duration-500"
+              style="width:{questionPromptStatus === 'timed' ? questionCountdownPercent : questionPromptStatus === 'reading' ? 100 : 0}%; background:{questionPromptStatus === 'reading' ? accent : '#efc05c'};"
+            ></div>
+          </div>
+
+          <details class="mt-3 rounded-xl border" style="border-color:var(--border-default); background:white;">
+            <summary class="cursor-pointer px-3 py-2 text-[12px] font-semibold" style="color:var(--ink);">
+              View summary
+            </summary>
+            <div class="max-h-44 space-y-2 overflow-y-auto px-3 pb-3">
+              {#each summaryLines as line, i (i)}
+                {@const tone = getSummaryLineTone(line, i)}
+                <div
+                  class="rounded-2xl border px-2.5 py-2 text-[11px] leading-relaxed"
+                  style="border-color:{tone.cardBorder}; background:{tone.cardBackground};"
+                >
+                  <div class="mb-1 flex items-center gap-2">
+                    <div
+                      class="grid size-6 shrink-0 place-items-center rounded-xl"
+                      style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                    >
+                      <tone.icon class="size-3.5" />
+                    </div>
+                    <div class="text-[9.5px] font-semibold uppercase tracking-[0.16em]" style="color:{tone.chipColor};">
+                      {tone.label}
+                    </div>
+                  </div>
+                  {line}
+                </div>
+              {/each}
+            </div>
+          </details>
+
+          {#if answerPhase === "ask"}
+            <div class="mt-5 space-y-2.5">
+              {#each currentQ?.options ?? [] as option, i (`m-${option}-${i}`)}
+                <button
+                  type="button"
+                  onclick={() => selectOption(i)}
+                  class="w-full cursor-pointer rounded-xl border px-3.5 py-3 text-left"
+                  style="background:white; border-color:var(--border-default);"
+                >
+                  <div class="flex items-start gap-3">
+                    <div
+                      class="grid size-8 shrink-0 place-items-center rounded-full text-[12px] font-semibold"
+                      style="background:{accent}12; color:{accent};"
+                    >
+                      {OPTION_LABELS[i]}
+                    </div>
+                    <div class="pt-1 text-[14px] font-semibold" style="color:var(--ink);">{option}</div>
+                  </div>
+                </button>
+              {/each}
+            </div>
+            <div class="mt-2 text-[11px]" style="color:var(--text-tertiary);">
+              Tap one option. No typing needed.
+            </div>
+          {:else}
+            <div class="mt-5 space-y-2.5">
+              {#each currentQ?.options ?? [] as option, i (`mf-${option}-${i}`)}
+                {@const isCorrectOption = i === currentQ?.answerIndex}
+                {@const isPicked = i === submittedOption}
+                <div
+                  class="rounded-xl border px-3.5 py-3"
+                  style="{isCorrectOption
+                    ? 'background:#ecfdf3;border-color:#86efac;'
+                    : isPicked
+                      ? 'background:#fff1f2;border-color:#fda4af;'
+                      : 'background:white;border-color:var(--border-default);'}"
+                >
+                  <div class="text-[13.5px] font-semibold" style="color:var(--ink);">{option}</div>
+                </div>
+              {/each}
+            </div>
+
+            <div
+              class="mt-5 rounded-2xl border p-4"
+              style="{lastCorrect
+                ? 'background:#f0fdf4;border-color:#bbf7d0;'
+                : 'background:#fff7ed;border-color:#fed7aa;'}"
+            >
+              <div class="mb-2 flex items-center gap-2">
+                {#if lastCorrect}
+                  <CheckCircle2 class="size-5" style="color:#15803d;" />
+                {:else}
+                  <XCircle class="size-5" style="color:#b45309;" />
+                {/if}
+                <div
+                  class="text-[14px] font-semibold"
+                  style="color:{lastCorrect ? '#166534' : '#9a3412'};"
+                >
+                  {feedbackTitle}
+                </div>
+              </div>
+              <div class="pl-7 text-[13px] leading-[1.6]" style="color:var(--text-body);">
+                {feedbackDetail}
+              </div>
+              <div class="mt-3 pl-7">
+                <button
+                  type="button"
+                  onclick={next}
+                  class="flex cursor-pointer items-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-semibold text-white"
+                  style="background:{accent};"
+                >
+                  Next · {nextStudent?.name}
+                  <ArrowRight class="size-3.5" />
+                </button>
               </div>
             </div>
-            <div class="pl-8 text-[13px] leading-[1.6]" style="color:var(--text-body);">
-              {lastCorrect
-                ? "Yes — without sunlight the plant can't make food. Leaves turn pale and wilt."
-                : "Think about what plants do with sunlight. Is a dark cupboard giving them enough?"}
-            </div>
-            <div class="mt-3 pl-8">
-              <button
-                type="button"
-                onclick={next}
-                class="flex cursor-pointer items-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-semibold text-white"
-                style="background:{accent};"
-              >
-                Next · {nextStudent?.name}
-                <ArrowRight class="size-3.5" />
-              </button>
-            </div>
-          </div>
+          {/if}
         {/if}
       </div>
 
-      <!-- Mobile student strip -->
       <div
         class="shrink-0 border-t px-4 py-3"
         style="background:#f5f3ee; border-color:var(--border-default);"
@@ -851,6 +1890,10 @@
           {/each}
         </div>
       </div>
+    </div>
+
+    <div class="px-4 pb-4 text-center text-[11px]" style="color:rgba(255,255,255,0.48);">
+      Student tablet is locked to Socratic Q&amp;A on small screens.
     </div>
   {/if}
 

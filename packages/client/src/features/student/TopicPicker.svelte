@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
+  import { resolve } from "$app/paths";
   import { ArrowRight, BookOpen, Pencil } from "lucide-svelte";
   import { Button, Card } from "@shadcn";
   import { Pill } from "@components";
@@ -19,14 +20,10 @@
   function proceed(): void {
     if (!picked) return;
     reteachTopics.selectTopic(picked);
-    goto("/student/socratic");
+    goto(resolve("/student/socratic"));
   }
 </script>
 
-<!--
-  Topic Picker — desktop: h-full viewport-filling layout with tablet frame
-  On tablet/mobile, students go directly to /student/socratic.
--->
 
 <!-- Desktop: h-full fill viewport, full-width tablet frame -->
 <div class="hidden md:flex h-full flex-col overflow-hidden px-8 py-5 gap-4">
@@ -36,7 +33,7 @@
     <div>
       <div class="label-eyebrow text-saffron-600">Student view · {cls?.name ?? "Class"}</div>
       <div class="page-title mt-1">Topic Picker</div>
-      <div class="page-subtitle">Student selects which topic they want to revisit. Hand the device over after choosing.</div>
+      <div class="page-subtitle">Student selects a topic. Class topics use textbook summary; custom topics use web summary at class level.</div>
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <Pill tone="success">
@@ -49,7 +46,6 @@
     </div>
   </div>
 
-  <!-- Tablet frame fills remaining height — full width, no aspect ratio overflow -->
   <div
     class="min-h-0 flex-1 rounded-[28px] p-3.5"
     style="background:#0b0d14; box-shadow:0 40px 80px -30px rgba(13,17,29,0.45),0 0 0 1px #1b1d28 inset;"
@@ -105,7 +101,7 @@
             </div>
           </div>
 
-          <!-- Topic cards — horizontal scrollable, flex-1 fills remaining height -->
+          <!-- Topic picker -->
           <div
             class="flex min-h-0 flex-1 items-center gap-5 overflow-x-auto px-10 pb-6"
             style="scroll-snap-type:x mandatory; -webkit-overflow-scrolling:touch; scrollbar-width:none;"
@@ -149,9 +145,9 @@
                     style="background:{sel ? accent + '15' : '#f0ede8'}; color:{sel ? accent : 'var(--text-secondary)'};"
                   >
                     {#if t.source === "custom"}
-                      <Pencil class="size-2.75" /> Teacher's activity
+                      <Pencil class="size-2.75" /> Web summary · Class-level
                     {:else}
-                      <BookOpen class="size-2.75" /> {t.subject}
+                      <BookOpen class="size-2.75" /> Textbook · {t.subject}
                     {/if}
                   </div>
                 </div>

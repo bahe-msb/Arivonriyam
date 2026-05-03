@@ -1,11 +1,5 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
 import type { LessonBlueprint } from "../services/lesson.service";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = path.resolve(__dirname, "../../data/saved_plans.json");
+import { getDb } from "./db";
 
 export interface PlanEntry {
   className: string;
@@ -17,40 +11,64 @@ export interface PlanEntry {
   savedAt: string;
 }
 
-type DateKey = string;
-type ClassKey = string;
-type Store = Record<DateKey, Record<ClassKey, PlanEntry>>;
-
 const todayKey = (): string => new Date().toISOString().slice(0, 10);
 
-async function readStore(): Promise<Store> {
-  try {
-    const raw = await fs.readFile(STORE_PATH, "utf-8");
-    return JSON.parse(raw) as Store;
-  } catch {
-    return {};
+export function getPlanForToday(className: string): PlanEntry | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM plans WHERE date_key = ? AND class_name = ? LIMIT 1",
+    )
+    .get(todayKey(), className) as Record<string, unknown> | undefined;
+
+  if (!row) return null;
+  return rowToEntry(row);
+}
+
+export function savePlanForToday(className: string, entry: PlanEntry): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO plans (date_key, class_name, subject, subject_label, chapter, duration_min, blueprint, saved_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(date_key, class_name) DO UPDATE SET
+       subject       = excluded.subject,
+       subject_label = excluded.subject_label,
+       chapter       = excluded.chapter,
+       duration_min  = excluded.duration_min,
+       blueprint     = excluded.blueprint,
+       saved_at      = excluded.saved_at`,
+  ).run(
+    todayKey(),
+    className,
+    entry.subject,
+    entry.subjectLabel,
+    entry.chapter,
+    entry.durationMin,
+    JSON.stringify(entry.blueprint),
+    entry.savedAt,
+  );
+}
+
+export function getAllTodayPlans(): Record<string, PlanEntry> {
+  const rows = getDb()
+    .prepare("SELECT * FROM plans WHERE date_key = ?")
+    .all(todayKey()) as Record<string, unknown>[];
+
+  const result: Record<string, PlanEntry> = {};
+  for (const row of rows) {
+    const entry = rowToEntry(row);
+    result[entry.className] = entry;
   }
+  return result;
 }
 
-async function writeStore(store: Store): Promise<void> {
-  await fs.mkdir(path.dirname(STORE_PATH), { recursive: true });
-  await fs.writeFile(STORE_PATH, JSON.stringify(store, null, 2), "utf-8");
-}
-
-export async function getPlanForToday(className: string): Promise<PlanEntry | null> {
-  const store = await readStore();
-  return store[todayKey()]?.[className] ?? null;
-}
-
-export async function savePlanForToday(className: string, entry: PlanEntry): Promise<void> {
-  const store = await readStore();
-  const today = todayKey();
-  if (!store[today]) store[today] = {};
-  store[today][className] = entry;
-  await writeStore(store);
-}
-
-export async function getAllTodayPlans(): Promise<Record<ClassKey, PlanEntry>> {
-  const store = await readStore();
-  return store[todayKey()] ?? {};
+function rowToEntry(row: Record<string, unknown>): PlanEntry {
+  return {
+    className:    String(row.class_name),
+    subject:      String(row.subject),
+    subjectLabel: String(row.subject_label ?? ""),
+    chapter:      String(row.chapter),
+    durationMin:  Number(row.duration_min),
+    blueprint:    JSON.parse(String(row.blueprint)) as LessonBlueprint,
+    savedAt:      String(row.saved_at),
+  };
 }

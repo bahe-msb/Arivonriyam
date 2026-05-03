@@ -26,7 +26,7 @@ export async function getLessonSubjects(req: Request, res: Response): Promise<vo
   }
 
   try {
-    const subjects = await listSubjects(className);
+    const subjects = listSubjects(className);
     res.json({ subjects });
   } catch (error) {
     handleError(res, error, "Failed to list subjects.", "lesson");
@@ -43,7 +43,7 @@ export async function getLessonChapters(req: Request, res: Response): Promise<vo
   }
 
   try {
-    const chapters = await listChapters(className, subject);
+    const chapters = listChapters(className, subject);
     res.json({ chapters });
   } catch (error) {
     handleError(res, error, "Failed to list chapters.", "lesson");

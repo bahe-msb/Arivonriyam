@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { ArrowLeft, ArrowRight, Plus, X, Send, BookOpen, Pencil } from "lucide-svelte";
+  import { resolve } from "$app/paths";
+  import { ArrowLeft, Plus, X, Send, BookOpen, Pencil } from "lucide-svelte";
   import { Button, Card, Input } from "@shadcn";
   import { Page, PageHeader, Pill } from "@components";
   import { CLASSES } from "@mocks";
@@ -76,13 +77,13 @@
   <PageHeader
     eyebrow="Morning ritual · Step 2 of 2"
     title="What should AI reteach today?"
-    subtitle="Select a class, pick a subject, then add up to 3 topics per class."
+    subtitle="Select a class, pick a subject, then add up to 3 topics per class (textbook topic or custom web topic)."
   >
     {#snippet actions()}
-      <Button variant="secondary" onclick={() => goto("/lesson")}>
+      <Button variant="secondary" onclick={() => goto(resolve("/lesson"))}>
         <ArrowLeft class="size-3.5" /> Back to plan
       </Button>
-      <Button variant="primary" disabled={!canSend} onclick={() => goto("/handoff")}>
+      <Button variant="primary" disabled={!canSend} onclick={() => goto(resolve("/handoff"))}>
         Send to handoff <Send class="size-3.5" />
       </Button>
     {/snippet}
@@ -179,10 +180,10 @@
           <Card class="flex flex-col gap-3 p-4">
             <div class="flex items-center gap-1.5">
               <BookOpen class="size-3.5 text-text-secondary" />
-              <div class="text-[13px] font-semibold">Topic from class</div>
+              <div class="text-[13px] font-semibold">Topic from class (textbook)</div>
             </div>
             <div class="text-[11px] text-text-secondary">
-              Type the exact topic you taught. AI retrieves from NCERT PDFs to reteach it.
+              Type the exact topic you taught. AI retrieves from class textbook chunks (RAG), gives a short summary, then MCQ questions.
             </div>
             <div class="flex gap-2">
               <Input
@@ -220,10 +221,10 @@
           <Card class="flex flex-col gap-3 p-4">
             <div class="flex items-center gap-1.5">
               <Pencil class="size-3.5 text-text-secondary" />
-              <div class="text-[13px] font-semibold">Custom topic</div>
+              <div class="text-[13px] font-semibold">Custom topic (web + class-level)</div>
             </div>
             <div class="text-[11px] text-text-secondary">
-              Add a topic beyond the textbook — e.g. "Narrate a story about electromagnetic waves".
+              Add a topic beyond the textbook. AI uses web notes and explains only at the selected class level (up to Class 5), then asks MCQs.
             </div>
             <div class="flex gap-2">
               <Input

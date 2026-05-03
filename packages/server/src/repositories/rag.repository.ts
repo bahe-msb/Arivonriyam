@@ -1,3 +1,9 @@
+/**
+ * RAG repository — all retrieval goes through Python subprocesses.
+ *
+ * retrieveTextbookChunks  chapter-scoped retrieval  → lesson blueprint
+ * summarizeTopic          topic-wide 3-5 min intro  → Socratic session
+ */
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,59 +22,130 @@ export interface RetrieverChunk {
   page: number;
   language: string;
   source_file: string;
+  tables_html?: string[];
+  images_base64?: string[];
 }
 
+export interface TopicSummary {
+  intro: string;
+  content: string;
+  key_points: string[];
+  bridge: string;
+  word_count: number;
+  chunks_used: number;
+}
+
+// ── shared subprocess helper ──────────────────────────────────────────────────
+function runPython(args: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    const proc = spawn("uv", ["run", "python", "src/main.py", ...args], {
+      cwd: INGESTION_DIR,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on("close", () => resolve(stdout));
+    proc.on("error", () => resolve(""));
+  });
+}
+
+/** Parse the last JSON line from subprocess stdout (diagnostic lines come first). */
+function parseJsonLine<T>(stdout: string): T | null {
+  const line = stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("[") || l.startsWith("{"))
+    .at(-1);
+  if (!line) return null;
+  try {
+    return JSON.parse(line) as T;
+  } catch {
+    return null;
+  }
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
+
 /**
- * Query the ChromaDB vector store (via the ingestion Python package) for
- * chunks relevant to a given chapter. Falls back to [] if ChromaDB is
- * unavailable or the chapter has not been ingested yet.
+ * Chapter-scoped semantic retrieval — used by lesson-plan blueprint.
+ * Falls back to [] if ChromaDB or Python is unavailable.
  */
 export async function retrieveTextbookChunks(
   grade: string,
   subject: SubjectName,
   chapter: string,
-  topK = 5,
+  topK = 8,
 ): Promise<RetrieverChunk[]> {
-  return new Promise((resolve) => {
-    const proc = spawn(
-      "uv",
-      [
-        "run",
-        "python",
-        "src/main.py",
-        "retrieve",
-        "--class",
-        grade,
-        "--subject",
-        subject,
-        "--chapter",
-        chapter,
-        "--top-k",
-        String(topK),
-      ],
-      { cwd: INGESTION_DIR },
-    );
+  const stdout = await runPython([
+    "retrieve",
+    "--class",
+    grade,
+    "--subject",
+    subject,
+    "--chapter",
+    chapter,
+    "--top-k",
+    String(topK),
+  ]);
 
-    let stdout = "";
-    proc.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
+  return parseJsonLine<RetrieverChunk[]>(stdout) ?? [];
+}
 
-    proc.on("close", () => {
-      // stdout may have diagnostic lines before the JSON array; find the
-      // last line that looks like a JSON array.
-      const jsonLine = stdout
-        .split("\n")
-        .reverse()
-        .find((l) => l.trim().startsWith("["));
+export async function retrieveTopicChunks(
+  grade: string,
+  subject: SubjectName,
+  topic: string,
+  topK = 6,
+): Promise<RetrieverChunk[]> {
+  const stdout = await runPython([
+    "retrieve-topic",
+    "--class",
+    grade,
+    "--subject",
+    subject,
+    "--topic",
+    topic,
+    "--top-k",
+    String(topK),
+  ]);
 
-      try {
-        resolve(jsonLine ? (JSON.parse(jsonLine) as RetrieverChunk[]) : []);
-      } catch {
-        resolve([]);
-      }
-    });
+  return parseJsonLine<RetrieverChunk[]>(stdout) ?? [];
+}
 
-    proc.on("error", () => resolve([]));
-  });
+/**
+ * Topic-wide summarization (~3–5 min teacher intro).
+ * Returns null if the Python subprocess fails or returns nothing.
+ */
+export async function summarizeTopic(
+  grade: string,
+  subject: SubjectName,
+  topic: string,
+  source = "curriculum",
+  lang = "ta",
+  topK = 12,
+): Promise<TopicSummary | null> {
+  const stdout = await runPython([
+    "summarize",
+    "--class",
+    grade,
+    "--subject",
+    subject,
+    "--topic",
+    topic,
+    "--source",
+    source,
+    "--lang",
+    lang,
+    "--top-k",
+    String(topK),
+  ]);
+
+  return parseJsonLine<TopicSummary>(stdout);
 }

@@ -1,18 +1,13 @@
-import fs from "node:fs/promises";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-
 import { AppError } from "../lib/errors";
+import { getDb } from "../lib/db";
 import { generateLlmJson, retrieveTextbookChunks, type RetrieverChunk } from "../repositories";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Server reads from the ingestion package's data dir so the UI stays
-// in sync with whatever main.py last ingested. Resolved at module
-// load so the path is stable regardless of CWD.
-const INGESTION_DATA_DIR = path.resolve(__dirname, "../../../ingestion/data");
-const PDFS_DIR = path.join(INGESTION_DATA_DIR, "pdfs");
-const MANIFEST_PATH = path.join(INGESTION_DATA_DIR, "manifest.json");
+// packages/server/src/services/ → ../../../  =  packages/
+const PDF_DIR = path.resolve(__dirname, "../../..", "ingestion/data/pdfs");
 
 export interface SubjectOption {
   id: string;
@@ -31,61 +26,74 @@ export interface LessonBlueprint {
   blocks: BlueprintBlock[];
 }
 
-interface Manifest {
-  [className: string]: { [subject: string]: string[] };
-}
-
 const titleCase = (slug: string): string =>
   slug
     .replace(/[-_]+/g, " ")
     .split(" ")
-    .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : ""))
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ""))
     .join(" ")
     .trim();
 
-const isSafeClassName = (value: string): boolean => /^[a-z0-9_-]+$/i.test(value);
+const isSafe = (v: string): boolean => /^[a-z0-9_-]+$/i.test(v);
 
-/** List subjects available for a class by reading the PDF folder. */
-export async function listSubjects(className: string): Promise<SubjectOption[]> {
-  if (!isSafeClassName(className)) {
-    throw new AppError("Invalid class name.", 400, "lesson");
+// ── manifest queries (SQLite, synchronous) ────────────────────────────────────
+
+/**
+ * Subjects available for a class.
+ * Primary source: SQLite manifest (populated after ingestion).
+ * Fallback: PDF folder scan (so subjects show immediately when PDFs are placed,
+ *           even before ingestion has been run).
+ */
+export function listSubjects(className: string): SubjectOption[] {
+  if (!isSafe(className)) throw new AppError("Invalid class name.", 400, "lesson");
+
+  // Try SQLite manifest first (has richer data post-ingestion).
+  // If SQLite is unavailable (for example native bindings mismatch),
+  // continue to PDF fallback instead of failing the subjects endpoint.
+  try {
+    const rows = getDb()
+      .prepare("SELECT DISTINCT subject FROM manifest WHERE class_name = ? ORDER BY subject")
+      .all(className) as { subject: string }[];
+
+    if (rows.length > 0) {
+      return rows.map((r) => ({ id: r.subject, label: titleCase(r.subject) }));
+    }
+  } catch {
+    // Intentionally ignore manifest errors so class subjects can still be listed from PDFs.
   }
 
-  const classDir = path.join(PDFS_DIR, className);
-  let entries: string[];
+  // Fallback: scan the PDF folder so subjects appear before ingestion runs.
+  const classDir = path.join(PDF_DIR, className);
   try {
-    entries = await fs.readdir(classDir);
+    return fs
+      .readdirSync(classDir)
+      .filter((f) => f.toLowerCase().endsWith(".pdf"))
+      .map((f) => {
+        const id = path.basename(f, path.extname(f));
+        return { id, label: titleCase(id) };
+      })
+      .sort((a, b) => a.label.localeCompare(b.label));
   } catch {
     return [];
   }
-
-  return entries
-    .filter((name) => name.toLowerCase().endsWith(".pdf"))
-    .map((name) => {
-      const id = path.basename(name, path.extname(name));
-      return { id, label: titleCase(id) };
-    })
-    .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-async function readManifest(): Promise<Manifest> {
-  try {
-    const raw = await fs.readFile(MANIFEST_PATH, "utf-8");
-    return JSON.parse(raw) as Manifest;
-  } catch {
-    return {};
-  }
-}
-
-/** Distinct chapter titles for a (class, subject) from the manifest. */
-export async function listChapters(className: string, subject: string): Promise<string[]> {
-  if (!isSafeClassName(className) || !isSafeClassName(subject)) {
+/** Chapter titles for (class, subject) — read directly from the shared SQLite manifest. */
+export function listChapters(className: string, subject: string): string[] {
+  if (!isSafe(className) || !isSafe(subject)) {
     throw new AppError("Invalid class or subject.", 400, "lesson");
   }
 
-  const manifest = await readManifest();
-  return manifest[className]?.[subject] ?? [];
+  const rows = getDb()
+    .prepare(
+      "SELECT chapter FROM manifest WHERE class_name = ? AND subject = ? ORDER BY chapter_order",
+    )
+    .all(className, subject) as { chapter: string }[];
+
+  return rows.map((r) => r.chapter);
 }
+
+// ── blueprint generation ──────────────────────────────────────────────────────
 
 const buildBlueprintPrompt = (
   className: string,
@@ -99,54 +107,43 @@ const buildBlueprintPrompt = (
     .join("\n\n");
 
   return [
-    "You are a lesson plan formatter. Your only job is to structure the textbook",
-    "excerpts below into 6 teaching phases. You have no knowledge of your own.",
+    "You are a lesson plan formatter. Structure the excerpts into 6 teaching phases.",
+    "You have no knowledge of your own — use ONLY the excerpts below.",
     "",
-    "STRICT RULES — violating any rule makes the output useless:",
-    "1. Every sentence in every body field MUST come from the excerpts below.",
-    "2. Do NOT add any fact, example, word, or context not present in the excerpts.",
-    "3. Do NOT use your own training knowledge. Ignore everything you know about the topic.",
-    "4. If an excerpt is too thin to fill a phase, quote it directly and keep the body short.",
-    "5. Questions in the 'check' phase must only ask about content stated in the excerpts.",
+    "RULES:",
+    "1. Every sentence in every body MUST come from the excerpts.",
+    "2. Do NOT add facts, examples, or context not present in the excerpts.",
+    "3. Questions in 'check' must only ask about content in the excerpts.",
     "",
-    `Class: ${titleCase(className)}`,
-    `Subject: ${titleCase(subject)}`,
-    `Chapter: ${chapter}`,
+    `Class: ${titleCase(className)}  |  Subject: ${titleCase(subject)}  |  Chapter: ${chapter}`,
     `Total duration: ${durationMin} minutes`,
     "",
-    "TEXTBOOK EXCERPTS (your only allowed source):",
-    "==============================================",
+    "TEXTBOOK EXCERPTS:",
+    "==================",
     excerpts,
-    "==============================================",
+    "==================",
     "",
-    "Produce exactly these 6 blocks in order.",
-    "The sum of durationMin values must equal the total duration exactly.",
+    "Produce exactly 6 blocks. Sum of durationMin must equal total duration.",
     "",
-    '1. phase "objective" — durationMin: 0    — one sentence stating what students will learn, derived from the excerpts.',
-    '2. phase "warm_up"   — 5–8 min           — a recall question about something mentioned in the excerpts.',
-    '3. phase "teach"     — 8–12 min          — explain the core content using only words and ideas from the excerpts.',
-    '4. phase "practice"  — 8–12 min          — a task or exercise directly about the excerpt content.',
-    '5. phase "check"     — 3–5 min           — 2–3 oral questions whose answers are found in the excerpts.',
-    '6. phase "wrap_up"   — 2–4 min           — a one-sentence summary of what the excerpts teach.',
-    "",
-    "Each body: 2–4 short sentences a teacher can read at a glance.",
+    '1. "objective"  durationMin:0    one sentence — what students will learn',
+    '2. "warm_up"    5–8 min          recall question from excerpts',
+    '3. "teach"      8–12 min         core content using only excerpt wording',
+    '4. "practice"   8–12 min         task directly about excerpt content',
+    '5. "check"      3–5 min          2–3 oral questions answered in excerpts',
+    '6. "wrap_up"    2–4 min          one-sentence summary from excerpts',
     "",
     "Return ONLY this JSON (no prose, no markdown fences):",
-    "{",
-    '  "title": "<chapter title from excerpts>",',
-    '  "blocks": [',
-    '    { "phase": "objective", "title": "...", "durationMin": 0,    "body": "..." },',
-    '    { "phase": "warm_up",   "title": "...", "durationMin": <int>, "body": "..." },',
-    '    { "phase": "teach",     "title": "...", "durationMin": <int>, "body": "..." },',
-    '    { "phase": "practice",  "title": "...", "durationMin": <int>, "body": "..." },',
-    '    { "phase": "check",     "title": "...", "durationMin": <int>, "body": "..." },',
-    '    { "phase": "wrap_up",   "title": "...", "durationMin": <int>, "body": "..." }',
-    "  ]",
-    "}",
+    `{"title":"...","blocks":[`,
+    `  {"phase":"objective","title":"...","durationMin":0,"body":"..."},`,
+    `  {"phase":"warm_up","title":"...","durationMin":0,"body":"..."},`,
+    `  {"phase":"teach","title":"...","durationMin":0,"body":"..."},`,
+    `  {"phase":"practice","title":"...","durationMin":0,"body":"..."},`,
+    `  {"phase":"check","title":"...","durationMin":0,"body":"..."},`,
+    `  {"phase":"wrap_up","title":"...","durationMin":0,"body":"..."}`,
+    "]}",
   ].join("\n");
 };
 
-/** Generate a lesson blueprint for the given class/subject/chapter. */
 export async function buildBlueprint(input: {
   className: string;
   subject: string;
@@ -155,9 +152,7 @@ export async function buildBlueprint(input: {
 }): Promise<LessonBlueprint> {
   const { className, subject, chapter, durationMin } = input;
 
-  if (!chapter.trim()) {
-    throw new AppError("Chapter is required.", 400, "lesson");
-  }
+  if (!chapter.trim()) throw new AppError("Chapter is required.", 400, "lesson");
   if (!Number.isFinite(durationMin) || durationMin < 10 || durationMin > 120) {
     throw new AppError("Duration must be between 10 and 120 minutes.", 400, "lesson");
   }
@@ -165,8 +160,7 @@ export async function buildBlueprint(input: {
   const chunks = await retrieveTextbookChunks(className, subject, chapter, 8);
   if (chunks.length === 0) {
     throw new AppError(
-      "No textbook content found for this chapter in the vector store. " +
-        "Run the ingestion pipeline first, then try again.",
+      "No textbook content found for this chapter. Run ingestion first.",
       422,
       "lesson",
     );
@@ -182,12 +176,12 @@ export async function buildBlueprint(input: {
   return {
     title: typeof result.title === "string" && result.title.trim() ? result.title : chapter,
     blocks: result.blocks
-      .filter((block) => block && typeof block.body === "string")
-      .map((block) => ({
-        phase: typeof block.phase === "string" ? block.phase : "teach",
-        title: typeof block.title === "string" ? block.title : "Activity",
-        durationMin: Number.isFinite(block.durationMin) ? Number(block.durationMin) : 0,
-        body: block.body,
+      .filter((b) => b && typeof b.body === "string")
+      .map((b) => ({
+        phase: typeof b.phase === "string" ? b.phase : "teach",
+        title: typeof b.title === "string" ? b.title : "Activity",
+        durationMin: Number.isFinite(b.durationMin) ? Number(b.durationMin) : 0,
+        body: b.body,
       })),
   };
 }

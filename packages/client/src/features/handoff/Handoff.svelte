@@ -9,7 +9,13 @@
 
   function doHandoff(cls: ClassInfo): void {
     activeClass.set(cls.id);
-    goto("/student/topic");
+    const topics = reteachTopics.get(cls.id);
+    const selected = topics[0];
+    if (selected) {
+      reteachTopics.selectTopic(selected);
+    }
+
+    goto("/student/socratic");
   }
 </script>
 
@@ -68,11 +74,11 @@
           {/if}
           <div class="flex items-center justify-between gap-2.5">
             <span class="text-text-secondary inline-flex items-center gap-1 text-[11px]">
-              <Users class="size-[11px]" />
+              <Users class="size-2.75" />
               {cls.students} learners
             </span>
             <span class="text-text-secondary inline-flex items-center gap-1 text-[11px]">
-              <TabletIcon class="size-[11px]" /> Tablet {cls.id}
+              <TabletIcon class="size-2.75" /> Tablet {cls.id}
             </span>
           </div>
           <Button
@@ -96,7 +102,7 @@
       </div>
       <div>
         <div class="text-[14px] font-semibold">The teacher stays free.</div>
-        <div class="text-text-secondary mt-1 max-w-[640px] text-[12px] leading-[1.55]">
+        <div class="text-text-secondary mt-1 max-w-160 text-[12px] leading-[1.55]">
           While the tablet teaches one class, you have a full window to sit beside another.
           Arivonriyam will quietly flag any child who struggles — only after they have tried — so
           your attention goes where it matters.

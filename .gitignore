@@ -55,6 +55,14 @@ vite.config.ts.timestamp-*
 # Rag data
 /packages/server/data/raw/
 
+# Local runtime databases 
+/packages/data/*.db
+/packages/data/*.db-shm
+/packages/data/*.db-wal
+
+# Ingestion vector store cache 
+/packages/ingestion/data/chroma/
+
 *.ipynb
 
 whisper.cpp/
