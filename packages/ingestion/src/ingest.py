@@ -36,6 +36,22 @@ EMBEDDING_MODEL = "nomic-embed-text"
 _llm        = ChatOllama(model=LLM_MODEL, temperature=0)
 _embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
+OCR_LANGUAGES = ["eng", "tam"]
+
+
+def _detect_language(text: str) -> str:
+    sample = (text or "").strip()
+    if not sample:
+        return "en"
+
+    tamil_chars = sum(1 for ch in sample if "\u0B80" <= ch <= "\u0BFF")
+    latin_chars = sum(1 for ch in sample if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+
+    if tamil_chars >= max(12, latin_chars // 2):
+        return "ta"
+
+    return "en"
+
 
 # ── vector store ──────────────────────────────────────────────────────────────
 def get_vectorstore() -> Chroma:
@@ -47,9 +63,14 @@ def get_vectorstore() -> Chroma:
 # ── stage 1: partition ────────────────────────────────────────────────────────
 def partition_document(file_path: str):
     print(f"📄 Partitioning: {file_path}", file=sys.stderr)
+    print(
+        f"   🌐 OCR languages: {', '.join(OCR_LANGUAGES)}",
+        file=sys.stderr,
+    )
     elements = partition_pdf(
         filename=file_path,
         strategy="hi_res",
+        languages=OCR_LANGUAGES,
         infer_table_structure=True,
         extract_image_block_types=["Image"],
         extract_image_block_to_payload=True,
@@ -72,7 +93,7 @@ def create_chunks(elements):
 
 # ── stage 3: build documents ──────────────────────────────────────────────────
 def _separate_modalities(chunk) -> dict:
-    data: dict = {"text": chunk.text, "tables": [], "images": [], "chapter": ""}
+    data: dict = {"text": chunk.text, "tables": [], "images": [], "chapter": "", "language": "en"}
     if hasattr(chunk, "metadata") and hasattr(chunk.metadata, "orig_elements"):
         for el in chunk.metadata.orig_elements:
             t = type(el).__name__
@@ -84,6 +105,7 @@ def _separate_modalities(chunk) -> dict:
                 data["tables"].append(getattr(el.metadata, "text_as_html", el.text))
             elif t == "Image" and hasattr(el, "metadata") and hasattr(el.metadata, "image_base64"):
                 data["images"].append(el.metadata.image_base64)
+    data["language"] = _detect_language(data["text"])
     return data
 
 
@@ -141,10 +163,12 @@ def build_documents(chunks, class_name: str, subject: str, source_file: str) -> 
                 "subject":  subject,
                 "source_file": source_file,
                 "chapter":  data["chapter"],
+                "language": data["language"],
                 "original_content": json.dumps({
                     "raw_text":     data["text"],
                     "tables_html":  data["tables"],
                     "images_base64": data["images"],
+                    "language": data["language"],
                 }),
             },
         ))

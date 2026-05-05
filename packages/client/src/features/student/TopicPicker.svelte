@@ -33,13 +33,14 @@
     <div>
       <div class="label-eyebrow text-saffron-600">Student view · {cls?.name ?? "Class"}</div>
       <div class="page-title mt-1">Topic Picker</div>
-      <div class="page-subtitle">Student selects a topic. Class topics use textbook summary; custom topics use web summary at class level.</div>
+      <div class="page-subtitle">Student selects a topic. Class topics use textbook summary; custom topics use web summary at class level. Summary and MCQs follow the uploaded textbook language.</div>
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <Pill tone="success">
         <span class="bg-success-500 size-1.5 rounded-full animate-pulse"></span>
         Local AI ready
       </Pill>
+      <Pill tone="cobalt">Tamil or English follows the textbook PDF</Pill>
       <Button variant="primary" disabled={!picked} onclick={proceed}>
         Start session <ArrowRight class="size-3.5" />
       </Button>

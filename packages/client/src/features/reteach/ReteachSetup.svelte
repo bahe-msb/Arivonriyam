@@ -77,7 +77,7 @@
   <PageHeader
     eyebrow="Morning ritual · Step 2 of 2"
     title="What should AI reteach today?"
-    subtitle="Select a class, pick a subject, then add up to 3 topics per class (textbook topic or custom web topic)."
+    subtitle="Select a class, pick a subject, then add up to 3 topics per class (textbook topic or custom web topic). AI summary and MCQs follow the uploaded textbook PDF language, including Tamil and English."
   >
     {#snippet actions()}
       <Button variant="secondary" onclick={() => goto(resolve("/lesson"))}>
@@ -185,6 +185,9 @@
             <div class="text-[11px] text-text-secondary">
               Type the exact topic you taught. AI retrieves from class textbook chunks (RAG), gives a short summary, then MCQ questions.
             </div>
+            <div class="rounded-2xl border border-[#d7e7ff] bg-[#eef6ff] px-3 py-2 text-[11px] leading-[1.55] text-[#2f67c8]">
+              Output language follows the textbook PDF for this subject, so Tamil PDFs stay in Tamil and English PDFs stay in English.
+            </div>
             <div class="flex gap-2">
               <Input
                 bind:value={standardDraft}
@@ -225,6 +228,9 @@
             </div>
             <div class="text-[11px] text-text-secondary">
               Add a topic beyond the textbook. AI uses web notes and explains only at the selected class level (up to Class 5), then asks MCQs.
+            </div>
+            <div class="rounded-2xl border border-[#f3d49a] bg-[#fff8ea] px-3 py-2 text-[11px] leading-[1.55] text-[#9a6708]">
+              Custom topics also follow the class textbook language preference when AI builds the summary and MCQs.
             </div>
             <div class="flex gap-2">
               <Input

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { Sidebar } from "@shadcn";
+  import { sessionAlerts } from "@stores";
   import {
     Home,
     Sparkles,
@@ -40,6 +41,8 @@
     { label: "Socratic Q&A", href: "/student/socratic", icon: Mic },
   ];
 
+  const alertCount = $derived(sessionAlerts.count());
+
   function isActive(href: string): boolean {
     const path = page.url.pathname;
     if (href === "/") return path === "/";
@@ -59,8 +62,13 @@
               isActive={isActive(item.href)}
               tooltip={item.label}
             >
-              <item.icon class="size-[17px] shrink-0 opacity-90" />
+              <item.icon class="size-4.25 shrink-0 opacity-90" />
               <span class="truncate">{item.label}</span>
+              {#if item.href === "/alert" && alertCount > 0}
+                <span class="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-[#fde7e7] px-1.5 py-0.5 text-[10px] font-semibold text-[#b42318]">
+                  {alertCount}
+                </span>
+              {/if}
             </Sidebar.MenuButton>
           </Sidebar.MenuItem>
         {/each}
@@ -77,7 +85,7 @@
               isActive={isActive(item.href)}
               tooltip={item.label}
             >
-              <item.icon class="size-[17px] shrink-0 opacity-90" />
+              <item.icon class="size-4.25 shrink-0 opacity-90" />
               <span class="truncate">{item.label}</span>
             </Sidebar.MenuButton>
           </Sidebar.MenuItem>
@@ -95,7 +103,7 @@
               isActive={isActive(item.href)}
               tooltip={item.label}
             >
-              <item.icon class="size-[17px] shrink-0 opacity-90" />
+              <item.icon class="size-4.25 shrink-0 opacity-90" />
               <span class="truncate">{item.label}</span>
             </Sidebar.MenuButton>
           </Sidebar.MenuItem>

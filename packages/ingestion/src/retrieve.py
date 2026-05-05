@@ -30,6 +30,20 @@ _llm        = ChatOllama(model=LLM_MODEL, temperature=0)
 _embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
 
+def _detect_language(text: str) -> str:
+    sample = (text or "").strip()
+    if not sample:
+        return "en"
+
+    tamil_chars = sum(1 for ch in sample if "\u0B80" <= ch <= "\u0BFF")
+    latin_chars = sum(1 for ch in sample if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+
+    if tamil_chars >= max(12, latin_chars // 2):
+        return "ta"
+
+    return "en"
+
+
 def _get_vectorstore() -> Chroma:
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_PATH))
@@ -37,11 +51,13 @@ def _get_vectorstore() -> Chroma:
 
 
 def _hyde_expand(query: str) -> str:
+    lang = _detect_language(query)
     prompt = (
-        "Write a short, plausible answer to the question below. "
-        "Invent details if needed — this is only for vector retrieval.\n\n"
-        f"QUESTION: {query}\n\nANSWER:"
+        "கீழே உள்ள கேள்விக்கான சுருக்கமான, சாத்தியமான பதிலை அதே மொழியில் எழுதுங்கள். "
+        "சில விவரங்கள் இல்லாவிட்டாலும் பரவாயில்லை — இது வெக்டர் தேடலுக்காக மட்டும்." if lang == "ta"
+        else "Write a short, plausible answer to the question below in the same language. Invent details if needed — this is only for vector retrieval."
     )
+    prompt = f"{prompt}\n\nQUESTION: {query}\n\nANSWER:"
     try:
         return _llm.invoke([HumanMessage(content=prompt)]).content.strip() or query
     except Exception as e:
@@ -54,14 +70,16 @@ def _doc_to_chunk(doc, score: float) -> Dict[str, Any]:
         original = json.loads(doc.metadata.get("original_content", "{}"))
     except json.JSONDecodeError:
         original = {}
+    raw_text = original.get("raw_text") or doc.page_content[:800]
+    language = original.get("language") or doc.metadata.get("language") or _detect_language(raw_text)
     return {
-        "text":        original.get("raw_text") or doc.page_content[:800],
+        "text":        raw_text,
         "score":       round(float(score), 4),
         "grade":       doc.metadata.get("class", ""),
         "subject":     doc.metadata.get("subject", ""),
         "chapter":     doc.metadata.get("chapter", ""),
         "page":        int(doc.metadata.get("page_number", 0)),
-        "language":    "en",
+        "language":    language,
         "source_file": doc.metadata.get("source_file", ""),
         "tables_html": original.get("tables_html", []),
         "images_base64": original.get("images_base64", []),
@@ -84,12 +102,20 @@ def _search(query: str, class_name: str, subject: str, top_k: int) -> List[Dict[
 
 
 def chapter_retrieve(class_name: str, subject: str, chapter: str, top_k: int = 8) -> List[Dict[str, Any]]:
-    expanded = _hyde_expand(f"{chapter} {subject}")
+    language = _detect_language(f"{chapter} {subject}")
+    expanded = _hyde_expand(
+        f"{chapter} {subject}" if language == "en" else f"{chapter} {subject} பற்றிய பாடப்பகுதி"
+    )
     return _search(expanded, class_name, subject, top_k)
 
 
 def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 12) -> List[Dict[str, Any]]:
-    expanded = _hyde_expand(f"Explain {topic} in detail for a primary school student.")
+    language = _detect_language(topic)
+    expanded = _hyde_expand(
+        f"{topic} பற்றி தொடக்கப்பள்ளி மாணவருக்கு எளிதாக விளக்கவும்."
+        if language == "ta"
+        else f"Explain {topic} in detail for a primary school student."
+    )
     return _search(expanded, class_name, subject, top_k)
 
 

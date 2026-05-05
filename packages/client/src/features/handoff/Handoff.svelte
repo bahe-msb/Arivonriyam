@@ -9,13 +9,7 @@
 
   function doHandoff(cls: ClassInfo): void {
     activeClass.set(cls.id);
-    const topics = reteachTopics.get(cls.id);
-    const selected = topics[0];
-    if (selected) {
-      reteachTopics.selectTopic(selected);
-    }
-
-    goto("/student/socratic");
+    goto("/student/topic");
   }
 </script>
 

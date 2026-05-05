@@ -9,3 +9,4 @@ export { Textarea } from "./textarea/index.js";
 export * as Sidebar from "./sidebar/index.js";
 export * as Tabs from "./tabs/index.js";
 export * as Select from "./select/index.js";
+export * as Sheet from "./sheet/index.js";

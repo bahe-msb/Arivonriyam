@@ -5,6 +5,7 @@ import {
   getLessonSubjects,
   getTodayPlans,
   getTestStt,
+  postSocraticAlertSuggestion,
   postSocraticPreview,
   postLessonBlueprint,
   postSavePlan,
@@ -21,6 +22,7 @@ export function createApiRouter(): Router {
   // Project Specific endpoints
   router.get("/health", getHealth);
   router.post("/api/student/conservation", upload.single("audio"), postVoiceFile);
+  router.post("/api/socratic/alerts/suggestion", postSocraticAlertSuggestion);
   router.post("/api/socratic/preview", postSocraticPreview);
   router.post("/api/socratic/summarize", postSocraticSummarize);
 

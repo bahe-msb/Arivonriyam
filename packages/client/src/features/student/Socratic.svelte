@@ -20,7 +20,12 @@
   import { Button } from "@shadcn";
   import { Pill } from "@components";
   import { STUDENTS_BY_CLASS, CLASSES } from "@mocks";
-  import { activeClass, reteachTopics } from "@stores";
+  import {
+    activeClass,
+    reteachTopics,
+    sessionAlerts,
+    type SessionAlertRecord,
+  } from "@stores";
 
   type SessionQuestion = {
     q: string;
@@ -34,6 +39,7 @@
     lines?: string[];
     questions?: SessionQuestion[];
     error?: string;
+    language?: "en" | "ta";
   };
 
   type PreviewCard = {
@@ -58,9 +64,18 @@
     trailColor: string;
   };
 
-  type Phase = "start" | "summarizing" | "session";
+  type SessionAttempt = {
+    studentIdx: number;
+    question: string;
+    selectedOption: string;
+    correctOption: string;
+    correct: boolean;
+    explain: string;
+  };
 
-  const QUESTIONS_PER_STUDENT = 3;
+  type Phase = "start" | "summarizing" | "session" | "complete";
+
+  const QUESTIONS_PER_STUDENT = 6;
   const PROGRESS_SEGMENTS = 6;
   const AUTO_ADVANCE_MS = 1800;
   const QUESTION_TIME_LIMIT_SEC = 12;
@@ -98,8 +113,11 @@
   let summaryIdx = $state(0);
   let summaryLoading = $state(false);
   let summaryError = $state("");
+  let sessionLanguage = $state<"en" | "ta">("en");
   let summaryPreviewCards = $state<PreviewCard[]>([]);
   let summaryPreviewLoading = $state(false);
+  let sessionId = $state("");
+  let sessionAttempts = $state<SessionAttempt[]>([]);
 
   let questionPlan = $state<SessionTurn[]>([]);
   let autoAdvanceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -122,19 +140,26 @@
       : Math.max(1, students.length) * QUESTIONS_PER_STUDENT,
   );
   const currentQ = $derived(
-    questionPlan.length > 0 ? questionPlan[qIdx % questionPlan.length] : null,
+    phase === "complete" ? null : questionPlan[qIdx] ?? null,
   );
   const activeStudent = $derived(students[currentQ?.student ?? 0]);
   const nextQ = $derived(
-    questionPlan.length > 0 ? questionPlan[(qIdx + 1) % questionPlan.length] : null,
+    phase === "complete" ? null : questionPlan[qIdx + 1] ?? null,
   );
   const nextStudent = $derived(students[nextQ?.student ?? 0]);
   const correctCount = $derived(answered.filter((a) => a.correct).length);
-  const roundNum = $derived(
-    Math.floor((qIdx % totalQuestionCount) / Math.max(1, students.length)) + 1,
+  const turnIndex = $derived(
+    questionPlan.length > 0 ? Math.min(qIdx, questionPlan.length - 1) : 0,
   );
-  const cycleNum = $derived(Math.floor(qIdx / totalQuestionCount) + 1);
-  const progressStep = $derived((qIdx % totalQuestionCount) + 1);
+  const roundNum = $derived(
+    Math.min(
+      QUESTIONS_PER_STUDENT,
+      Math.floor(turnIndex / Math.max(1, students.length)) + 1,
+    ),
+  );
+  const progressStep = $derived(
+    phase === "complete" ? totalQuestionCount : Math.min(qIdx + 1, totalQuestionCount),
+  );
   const progressFilled = $derived(
     Math.max(1, Math.round((progressStep / totalQuestionCount) * PROGRESS_SEGMENTS)),
   );
@@ -148,29 +173,102 @@
   );
   const blockedBySource = $derived(phase === "session" && questionPlan.length === 0);
   const accent = $derived(cls?.color ?? "#6B94E7");
+  const isFinalTurn = $derived(questionPlan.length > 0 && qIdx >= questionPlan.length - 1);
+  const struggleCount = $derived(
+    students.filter((_, idx) => sessionAttempts.some((attempt) => attempt.studentIdx === idx && !attempt.correct)).length,
+  );
   const questionCountdownPercent = $derived(
     Math.max(0, Math.min(100, (questionSecondsLeft / QUESTION_TIME_LIMIT_SEC) * 100)),
   );
   const questionPromptText = $derived(
     questionPromptStatus === "reading"
-      ? `${activeStudent?.name ?? "Student"} is hearing the question`
+      ? sessionLanguage === "ta"
+        ? `${activeStudent?.name ?? "மாணவர்"} கேள்வியை கேட்டு வருகிறார்`
+        : `${activeStudent?.name ?? "Student"} is hearing the question`
       : questionPromptStatus === "timed"
-        ? `${questionSecondsLeft}s to tap one option`
-        : "Still thinking? Tap when ready.",
+        ? sessionLanguage === "ta"
+          ? `${questionSecondsLeft} விநாடிகளில் ஒரு பதிலைத் தொடு`
+          : `${questionSecondsLeft}s to tap one option`
+        : sessionLanguage === "ta"
+          ? "இன்னும் யோசிக்கிறாயா? தயார் ஆனபின் தொடு."
+          : "Still thinking? Tap when ready.",
+  );
+  const sessionLanguageLabel = $derived(sessionLanguage === "ta" ? "Tamil" : "English");
+  const headerLanguageLabel = $derived(
+    phase === "start" ? "Follows textbook" : sessionLanguageLabel,
+  );
+  const summaryLanguageNote = $derived(
+    "Summary and MCQs will match the uploaded textbook language, including Tamil and English.",
   );
 
+  function normalizeLanguage(value: unknown): "en" | "ta" {
+    return value === "ta" ? "ta" : "en";
+  }
+
+  function detectLanguage(text: string): "en" | "ta" {
+    const sample = text.trim();
+    if (!sample) return "en";
+
+    const tamilChars = [...sample].filter((char) => char >= "\u0B80" && char <= "\u0BFF").length;
+    const latinChars = [...sample].filter((char) => /[A-Za-z]/.test(char)).length;
+    return tamilChars >= Math.max(6, Math.floor(latinChars / 2)) ? "ta" : "en";
+  }
+
   function fallbackLines(): string[] {
+    if (sessionLanguage === "ta") {
+      return [
+        `இன்று நாம் ${topic?.topic ?? "இந்த தலைப்பை"} எளிய ${topic?.subject ?? "அறிவியல்"} சொற்களில் தொடங்கப் போகிறோம்.`,
+        "இந்தச் சுருக்கம் பாடத்தின் முக்கிய அம்சங்களை மெதுவாகவும் எளிதாகவும் விளக்கும்.",
+        "சுருக்கத்திற்குப் பிறகு, ஒவ்வொரு மாணவரும் நான்கு விருப்பங்களில் ஒன்றை மட்டும் தொட வேண்டும்.",
+        "ஒவ்வொரு மாணவருக்கும் ஆறு MCQ வாய்ப்புகள் கிடைக்கும்.",
+      ];
+    }
+
     return [
       `Today we are starting ${topic?.topic ?? "this topic"} in simple ${topic?.subject ?? "Science"} words.`,
       "This short summary follows the lesson points and keeps the explanation easy to follow.",
       "After the summary, each student answers only by tapping one of four options.",
-      "Each student gets three MCQ turns, one question at a time.",
+      "Each student gets six MCQ turns, one question at a time.",
     ];
   }
 
   function fallbackQuestions(count: number): SessionQuestion[] {
     const topicName = topic?.topic ?? "this topic";
     const subjectName = topic?.subject ?? "Science";
+    if (sessionLanguage === "ta") {
+      const facts = [
+        `${topicName} எளிய ${subjectName} மொழியில் விளக்கப்படுகிறது.`,
+        `${topicName} அன்றாட உதாரணங்கள் மூலம் கற்றுக்கொள்ளப்படுகிறது.`,
+        `${topicName} கேள்விகளுக்கு ஒரு சரியான பதிலைத் தேர்ந்தெடுத்து விடை அளிக்க வேண்டும்.`,
+        `${topicName} புரிதல் பாடத்தில் உள்ள தகவலைச் சேர்த்து யோசிக்கும் போது மேம்படும்.`,
+        `${topicName} இளம் கற்றவர்களுக்கு படிப்படியாக மறுபார்வை செய்யப்படுகிறது.`,
+        `${topicName} கேள்வியில் பதிலைத் தேர்வதற்கு முன் எல்லா விருப்பங்களையும் படிக்க வேண்டும்.`,
+      ];
+
+      const questionStems = [
+        `இன்றைய ${topicName} சுருக்கத்துடன் பொருந்துவது எது?`,
+        `பாடத்தின் படி ${topicName} குறித்து சரியானது எது?`,
+        `இந்த ${subjectName} அமர்விலிருந்து சரியான தகவலைத் தேர்ந்தெடு.`,
+        `${topicName} பற்றி சரியான கூற்று எது?`,
+      ] as const;
+
+      return Array.from({ length: count }, (_, idx) => {
+        const correct = facts[idx % facts.length];
+        const wrong = [
+          `${topicName} என்பது ${subjectName} பாடத்தின் பகுதி அல்ல.`,
+          `${topicName} கேள்விகளை வகுப்பில் தவிர்க்க வேண்டும்.`,
+          `${topicName} கேள்விக்கு பதில் அளிக்க விருப்பங்களைப் படிக்கத் தேவையில்லை.`,
+        ];
+        const { options, answerIndex } = buildOptions(correct, wrong, idx);
+        return {
+          q: questionStems[idx % questionStems.length],
+          options,
+          answerIndex,
+          explain: "இந்த விருப்பம் இன்றைய சுருக்கத்துடன் பொருந்துகிறது.",
+        };
+      });
+    }
+
     const facts = [
       `${topicName} is explained in simple ${subjectName} language.`,
       `${topicName} is learned through examples from daily life.`,
@@ -225,6 +323,26 @@
   }
 
   function buildFallbackPreviewCards(): PreviewCard[] {
+    if (sessionLanguage === "ta") {
+      return [
+        {
+          title: "தலைப்பு தொடக்கம்",
+          badge: topic?.source === "custom" ? "Web notes" : "Textbook cue",
+          caption: `${topic?.topic ?? "இந்த தலைப்பு"} எளிய ${topic?.subject ?? "அறிவியல்"} சொற்களில் தயாராகிறது.`,
+        },
+        {
+          title: "சிறிய உதாரணம்",
+          badge: "Real-life link",
+          caption: "வீடும் பள்ளியும் சேர்ந்த சிறிய உதாரணங்கள் குழந்தைகளுக்கு விரைவில் புரிய உதவும்.",
+        },
+        {
+          title: "தொட்டு பதிலளி",
+          badge: "MCQ round",
+          caption: "சுருக்கத்திற்குப் பிறகு, ஒவ்வொரு மாணவரும் கேள்வியை கேட்டு ஒரு பதிலைத் தொடுவார்கள்.",
+        },
+      ];
+    }
+
     return [
       {
         title: "Topic start",
@@ -332,7 +450,7 @@
       };
     }
 
-    if (/example|for example|like|such as|home|school|daily/i.test(lower)) {
+    if (/example|for example|like|such as|home|school|daily|உதாரண|வீடு|பள்ளி/i.test(lower)) {
       return {
         label: "Example",
         icon: Shapes,
@@ -344,7 +462,7 @@
       };
     }
 
-    if (/remember|key|important|rule|point|fact/i.test(lower)) {
+    if (/remember|key|important|rule|point|fact|முக்கிய|நினைவில்|தகவல்/i.test(lower)) {
       return {
         label: "Remember",
         icon: Lightbulb,
@@ -356,7 +474,7 @@
       };
     }
 
-    if (/question|mcq|option|tap|round/i.test(lower)) {
+    if (/question|mcq|option|tap|round|கேள்வி|விருப்ப|தொடு/i.test(lower)) {
       return {
         label: "Next step",
         icon: ArrowRight,
@@ -381,10 +499,24 @@
 
   function buildQuestionPrompt(turn: SessionTurn, studentName: string): string {
     const options = turn.options
-      .map((option, idx) => `Option ${OPTION_LABELS[idx] ?? idx + 1}, ${option}.`)
+      .map((option, idx) =>
+        sessionLanguage === "ta"
+          ? `${OPTION_LABELS[idx] ?? idx + 1} விருப்பு, ${option}.`
+          : `Option ${OPTION_LABELS[idx] ?? idx + 1}, ${option}.`,
+      )
       .join(" ");
 
-    return `${studentName}, listen carefully. ${turn.q} ${options} You have ${QUESTION_TIME_LIMIT_SEC} seconds. Tap the correct answer now.`;
+    return sessionLanguage === "ta"
+      ? `${studentName}, கவனமாக கேள். இப்போது உன் கேள்வி வருகிறது. ${turn.q}. நான் விருப்பங்களை மெதுவாக வாசிக்கிறேன். ${options} அவசரம் வேண்டாம். உனக்கு ${QUESTION_TIME_LIMIT_SEC} விநாடிகள் உள்ளன. தயார் ஆனபின் சரியான பதிலைத் தொடு.`
+      : `${studentName}, listen carefully. Here is your question. ${turn.q}. I will read the options slowly. ${options} Take your time. You have ${QUESTION_TIME_LIMIT_SEC} seconds. Tap the correct answer when you are ready.`;
+  }
+
+  function createSessionId(): string {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+
+    return `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
   function buildOptions(
@@ -513,14 +645,33 @@
   }
 
   function pickSummaryVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
+    if (sessionLanguage === "ta") {
+      return (
+        voices.find((voice) => /^ta(-|_)/i.test(voice.lang))
+        ?? voices.find((voice) => /^en(-|_)IN/i.test(voice.lang))
+        ?? voices[0]
+        ?? null
+      );
+    }
+
     return (
       voices.find(
+        (voice) => /^en(-|_)IN/i.test(voice.lang) && /veena|lekha|ananya|rishi|sangeeta|siri/i.test(voice.name),
+      )
+      ?? voices.find(
         (voice) => /^en(-|_)/i.test(voice.lang) && /samantha|karen|zira|serena|moira|siri/i.test(voice.name),
       )
+      ?? voices.find((voice) => /^en(-|_)IN/i.test(voice.lang))
       ?? voices.find((voice) => /^en(-|_)/i.test(voice.lang))
       ?? voices[0]
       ?? null
     );
+  }
+
+  function softenSpeechText(text: string): string {
+    const normalized = text.replace(/\s+/g, " ").replace(/\s*:\s*/g, ". ").trim();
+    if (!normalized) return normalized;
+    return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
   }
 
   function primeSummarySpeech(): void {
@@ -573,7 +724,9 @@
   function speakSummaryLine(line: string, runId: number, onDone: () => void): void {
     clearSummaryFlowTimer();
 
-    const fallbackDelay = summaryLineDelayMs(line) + 500;
+    const spokenLine = softenSpeechText(line);
+
+    const fallbackDelay = summaryLineDelayMs(spokenLine) + 900;
     let finished = false;
 
     const finish = (): void => {
@@ -585,18 +738,18 @@
     };
 
     const synth = getSpeechApi();
-    if (!synth || line.trim().length === 0) {
-      summaryFlowTimer = setTimeout(finish, summaryLineDelayMs(line));
+    if (!synth || spokenLine.trim().length === 0) {
+      summaryFlowTimer = setTimeout(finish, summaryLineDelayMs(spokenLine));
       return;
     }
 
-    const utterance = new SpeechSynthesisUtterance(line);
+    const utterance = new SpeechSynthesisUtterance(spokenLine);
     const voice = pickSummaryVoice(synth.getVoices());
     if (voice) utterance.voice = voice;
 
-    utterance.lang = voice?.lang || "en-US";
-    utterance.rate = 0.96;
-    utterance.pitch = 1;
+    utterance.lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
+    utterance.rate = sessionLanguage === "ta" ? 0.82 : 0.84;
+    utterance.pitch = sessionLanguage === "ta" ? 1 : 0.94;
     utterance.onend = finish;
     utterance.onerror = finish;
 
@@ -629,7 +782,7 @@
     stopQuestionPrompt();
     questionPromptStatus = "reading";
 
-    const script = buildQuestionPrompt(turn, studentName);
+    const script = softenSpeechText(buildQuestionPrompt(turn, studentName));
 
     const finish = (): void => {
       clearQuestionSpeechTimer();
@@ -657,9 +810,9 @@
     const voice = pickSummaryVoice(synth.getVoices());
     if (voice) utterance.voice = voice;
 
-    utterance.lang = voice?.lang || "en-US";
-    utterance.rate = 0.98;
-    utterance.pitch = 1.02;
+    utterance.lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
+    utterance.rate = sessionLanguage === "ta" ? 0.86 : 0.88;
+    utterance.pitch = sessionLanguage === "ta" ? 1 : 0.96;
     utterance.onend = finish;
     utterance.onerror = finish;
 
@@ -677,6 +830,60 @@
   function repeatQuestion(): void {
     if (!currentQ || !activeStudent || phase !== "session" || answerPhase !== "ask") return;
     speakQuestionTurn(currentQ, activeStudent.name ?? "Student");
+  }
+
+  function publishSessionAlerts(): void {
+    if (!sessionId) return;
+
+    const classId = activeClass.id;
+    const className = cls?.name ?? `Class ${classId}`;
+    const topicName = topic?.topic ?? "This topic";
+    const subjectName = topic?.subject ?? "Science";
+    const createdAt = new Date().toISOString();
+
+    const records: SessionAlertRecord[] = students
+      .map((student, idx) => {
+        const attempts = sessionAttempts.filter((attempt) => attempt.studentIdx === idx);
+        const missedQuestions = attempts
+          .filter((attempt) => !attempt.correct)
+          .map((attempt, missIdx) => ({
+            id: `${student.id}-miss-${missIdx + 1}`,
+            question: attempt.question,
+            selectedOption: attempt.selectedOption || "(no answer)",
+            correctOption: attempt.correctOption,
+            explain: attempt.explain,
+          }));
+
+        const correctTurns = attempts.filter((attempt) => attempt.correct).length;
+
+        return {
+          id: `${sessionId}:${student.id}`,
+          sessionId,
+          classId,
+          className,
+          studentId: student.id,
+          studentName: student.name,
+          studentEmoji: student.emoji,
+          topic: topicName,
+          subject: subjectName,
+          totalQuestions: QUESTIONS_PER_STUDENT,
+          correctCount: correctTurns,
+          incorrectCount: missedQuestions.length,
+          score: Math.round((correctTurns / Math.max(1, QUESTIONS_PER_STUDENT)) * 100),
+          missedQuestions,
+          createdAt,
+        };
+      })
+      .filter((record) => record.incorrectCount > 0);
+
+    sessionAlerts.replaceSession(sessionId, records);
+  }
+
+  function finishSession(): void {
+    clearAutoAdvanceTimer();
+    stopQuestionPrompt();
+    publishSessionAlerts();
+    phase = "complete";
   }
 
   function resetTurnState(): void {
@@ -734,6 +941,7 @@
 
       if (response.ok) {
         const data = (await response.json()) as SummarizeResponse;
+        sessionLanguage = normalizeLanguage(data.language);
         const lines = Array.isArray(data.lines)
           ? data.lines.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
           : [];
@@ -745,6 +953,7 @@
         }
       } else {
         const data = (await response.json().catch(() => ({}))) as SummarizeResponse;
+        sessionLanguage = normalizeLanguage(data.language ?? sessionLanguage);
         const apiError = typeof data.error === "string" ? data.error : "Could not load textbook summary.";
         summaryError = apiError;
 
@@ -760,7 +969,9 @@
         }
       }
     } catch {
-      summaryError = "Network issue while loading summary.";
+      summaryError = sessionLanguage === "ta"
+        ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
+        : "Network issue while loading summary.";
       if (topic?.source === "custom") {
         summaryLines = fallbackLines();
         questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
@@ -777,27 +988,7 @@
   }
 
   async function fetchSummaryPreview(): Promise<void> {
-    summaryPreviewLoading = true;
     summaryPreviewCards = buildFallbackPreviewCards();
-
-    try {
-      const response = await fetch("/api/socratic/preview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildSessionRequestBody()),
-      });
-
-      if (response.ok) {
-        const data = (await response.json()) as PreviewResponse;
-        const cards = normalizePreviewCards(data.cards);
-        if (cards.length > 0) {
-          summaryPreviewCards = cards;
-        }
-      }
-    } catch {
-      // Keep local fallback previews.
-    }
-
     summaryPreviewLoading = false;
   }
 
@@ -813,11 +1004,14 @@
     summaryIdx = 0;
     summaryLines = [];
     summaryError = "";
+    sessionLanguage = detectLanguage(topic?.topic ?? "");
     summaryPreviewCards = buildFallbackPreviewCards();
+    sessionId = createSessionId();
+    sessionAttempts = [];
     questionPlan = [];
     resetTurnState();
 
-    void fetchSummaryPreview();
+    await fetchSummaryPreview();
     await fetchSummary();
     const runId = summaryRunId + 1;
     summaryRunId = runId;
@@ -835,7 +1029,10 @@
     summaryIdx = 0;
     summaryLines = [];
     summaryError = "";
+    sessionLanguage = "en";
     summaryPreviewCards = [];
+    sessionId = "";
+    sessionAttempts = [];
     questionPlan = [];
     resetTurnState();
   }
@@ -855,6 +1052,17 @@
     submittedOption = optionIndex;
     lastCorrect = correct;
     answered = [...answered, { studentIdx: currentQ.student, correct }];
+    sessionAttempts = [
+      ...sessionAttempts,
+      {
+        studentIdx: currentQ.student,
+        question: currentQ.q,
+        selectedOption: currentQ.options[optionIndex] ?? "",
+        correctOption: currentQ.options[currentQ.answerIndex] ?? "",
+        correct,
+        explain: currentQ.explain,
+      },
+    ];
     answerPhase = "feedback";
 
     feedbackTitle = correct ? "Right" : "Wrong";
@@ -872,13 +1080,19 @@
     stopQuestionPrompt();
     if (questionPlan.length === 0) return;
 
+    if (qIdx >= questionPlan.length - 1) {
+      finishSession();
+      return;
+    }
+
     const previousQuestion = currentQ?.q ?? "";
     qIdx += 1;
 
     let guard = 0;
     while (
+      qIdx < questionPlan.length - 1 &&
       guard < questionPlan.length - 1 &&
-      questionPlan[qIdx % questionPlan.length]?.q === previousQuestion
+      questionPlan[qIdx]?.q === previousQuestion
     ) {
       qIdx += 1;
       guard += 1;
@@ -920,6 +1134,7 @@
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <Pill tone="cobalt">Question {progressStep} of {totalQuestionCount}</Pill>
+      <Pill tone="success">Language · {headerLanguageLabel}</Pill>
       <Button variant="secondary" onclick={() => goto(resolve("/alert"))}>
         See teacher alert <ArrowRight class="size-3.5" />
       </Button>
@@ -989,6 +1204,9 @@
               </div>
               <div class="text-[14px]" style="color:var(--text-secondary);">
                 Short summary first (about 2-3 mins), then four-option MCQ questions.
+              </div>
+              <div class="max-w-110 text-[12px] leading-[1.6]" style="color:var(--text-tertiary);">
+                {summaryLanguageNote}
               </div>
               <button
                 type="button"
@@ -1164,6 +1382,44 @@
               </button>
             </div>
 
+          {:else if phase === "complete"}
+            <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
+              <div
+                class="grid size-18 place-items-center rounded-full text-[30px] font-semibold text-white"
+                style="background:{accent};"
+              >
+                ✓
+              </div>
+              <div class="text-[28px] font-semibold" style="color:var(--ink);">
+                Session complete
+              </div>
+              <div class="max-w-110 text-[14px] leading-[1.7]" style="color:var(--text-secondary);">
+                {totalQuestionCount} questions are finished. {correctCount} answers were correct, and {struggleCount} student{struggleCount === 1 ? "" : "s"} need a closer look.
+              </div>
+              <div class="flex flex-wrap items-center justify-center gap-2.5">
+                <Pill tone="cobalt">{totalQuestionCount} of {totalQuestionCount} questions done</Pill>
+                <Pill tone="success">Round {QUESTIONS_PER_STUDENT} of {QUESTIONS_PER_STUDENT}</Pill>
+              </div>
+              <div class="mt-2 flex flex-wrap items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onclick={() => goto(resolve("/alert"))}
+                  class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
+                  style="background:{accent};"
+                >
+                  Open alerts <ArrowRight class="size-4" />
+                </button>
+                <button
+                  type="button"
+                  onclick={() => goto(resolve("/student/topic"))}
+                  class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold"
+                  style="background:{accent}12; color:{accent};"
+                >
+                  Pick another topic
+                </button>
+              </div>
+            </div>
+
           {:else}
             <div class="flex flex-1 flex-col overflow-y-auto p-7 pb-5">
               <div
@@ -1282,7 +1538,11 @@
                     {feedbackDetail}
                   </div>
                   <div class="mt-1 pl-7 text-[11px]" style="color:var(--text-tertiary);">
-                    Moving to {nextStudent?.name ?? "next student"}...
+                    {#if isFinalTurn}
+                      Session will end after this review.
+                    {:else}
+                      Moving to {nextStudent?.name ?? "next student"}...
+                    {/if}
                   </div>
                   <div class="mt-3.5 pl-7">
                     <button
@@ -1291,7 +1551,7 @@
                       class="flex cursor-pointer items-center gap-2 rounded-xl px-5 py-2.5 text-[13px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
                       style="background:{accent};"
                     >
-                      Next · {nextStudent?.name ?? "next"}
+                      {isFinalTurn ? "Finish session" : `Next · ${nextStudent?.name ?? "next"}`}
                       <ArrowRight class="size-3.5" />
                     </button>
                   </div>
@@ -1467,7 +1727,7 @@
               </div>
             {:else}
               <div class="text-center text-[10px]" style="color:var(--text-secondary);">
-                3 questions each for {students.length} students.
+                {QUESTIONS_PER_STUDENT} questions each for {students.length} students.
               </div>
             {/if}
           </div>
@@ -1488,7 +1748,7 @@
         <div class="flex items-center gap-1.5 text-[12px]" style="color:var(--text-secondary);">
           <RotateCcw class="size-3 opacity-60" />
           <span>
-            Round <strong style="color:var(--ink);">{roundNum}</strong> of 3 · Cycle <strong style="color:var(--ink);">{cycleNum}</strong>
+            Round <strong style="color:var(--ink);">{roundNum}</strong> of {QUESTIONS_PER_STUDENT}
           </span>
         </div>
         <div class="flex-1"></div>
@@ -1670,6 +1930,44 @@
       </div>
     </div>
 
+  {:else if phase === "complete"}
+    <div class="mx-4 my-auto flex flex-col items-center justify-center gap-5 text-center text-white">
+      <div
+        class="grid size-18 place-items-center rounded-full text-[28px] font-semibold"
+        style="background:{accent};"
+      >
+        ✓
+      </div>
+      <div class="text-[28px] font-semibold leading-tight">Session complete</div>
+      <div class="max-w-sm text-[15px] leading-[1.7]" style="color:rgba(255,255,255,0.68);">
+        {totalQuestionCount} questions are finished. The round has stopped, and {struggleCount} student{struggleCount === 1 ? "" : "s"} can now be reviewed in alerts.
+      </div>
+      <div class="flex flex-wrap items-center justify-center gap-2.5">
+        <div class="rounded-full px-3 py-1.5 text-[12px] font-semibold" style="background:white; color:{accent};">
+          {totalQuestionCount} of {totalQuestionCount} done
+        </div>
+        <div class="rounded-full px-3 py-1.5 text-[12px] font-semibold" style="background:{accent}22; color:white;">
+          Round {QUESTIONS_PER_STUDENT} of {QUESTIONS_PER_STUDENT}
+        </div>
+      </div>
+      <button
+        type="button"
+        onclick={() => goto(resolve("/alert"))}
+        class="mt-2 flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
+        style="background:{accent};"
+      >
+        Open alerts <ArrowRight class="size-4" />
+      </button>
+      <button
+        type="button"
+        onclick={() => goto(resolve("/student/topic"))}
+        class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold"
+        style="background:white; color:{accent};"
+      >
+        Pick another topic
+      </button>
+    </div>
+
   {:else}
     <button
       type="button"
@@ -1847,7 +2145,7 @@
                   class="flex cursor-pointer items-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-semibold text-white"
                   style="background:{accent};"
                 >
-                  Next · {nextStudent?.name}
+                  {isFinalTurn ? "Finish session" : `Next · ${nextStudent?.name ?? "next"}`}
                   <ArrowRight class="size-3.5" />
                 </button>
               </div>
