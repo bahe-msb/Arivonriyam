@@ -26,6 +26,8 @@ if __name__ == "__main__":
     # ingest
     p_ingest = sub.add_parser("ingest")
     p_ingest.add_argument("--force", action="store_true")
+    p_ingest.add_argument("--no-questions", action="store_true",
+                          help="Skip Ollama question generation (faster, no LLM calls during ingest)")
 
     # retrieve  (chapter-scoped — used by lesson blueprint)
     p_ret = sub.add_parser("retrieve")
@@ -57,7 +59,7 @@ if __name__ == "__main__":
 
     if args.cmd == "ingest":
         from ingest import run_ingestion
-        run_ingestion(force=args.force)
+        run_ingestion(force=args.force, generate_questions=not args.no_questions)
 
     elif args.cmd == "retrieve":
         from retrieve import run_chapter_retrieve

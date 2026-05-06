@@ -1,186 +1,157 @@
 """Modular ingestion pipeline.
 
 Stages per PDF:
-  1. partition  — Unstructured hi-res PDF extraction
-  2. chunk      — title-bounded chunking
-  3. build_docs — separate modalities, AI summary, HyDE questions → Documents
-  4. store      — embed + upsert into ChromaDB
-  5. log        — write ingestion_log + manifest to shared SQLite
+  1. partition  — Unstructured PDF extraction (auto strategy)
+  2. preprocess — OCR cleanup, structural tagging, language detection
+  3. chunk      — Semantic/pedagogical chunking
+  4. enrich     — Structural metadata + optional Ollama question generation
+  5. postprocess — Quality filtering, normalization
+  6. store      — Embed (BGE-M3) + upsert into SQLite vector store
+  7. log        — write ingestion_log + manifest to shared SQLite
 """
 
 import hashlib
 import json
-import sys
+import logging
+import os
+import time
 from pathlib import Path
+
+# Load .env from package root before any HuggingFace imports
+_ENV_FILE = Path(__file__).parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+if os.environ.get("TRANSFORMERS_OFFLINE") != "1" and os.environ.get("HF_HUB_OFFLINE") == "1":
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+import sys
 from typing import List
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_chroma import Chroma
 from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
-import chromadb
 
 from db import init_db, log_ingestion, upsert_chapters, is_ingested
+from embeddings import get_embedding_model
+from preprocessor import TextPreprocessor
+from chunker import SemanticChunker
+from metadata_enricher import MetadataEnricher
+from postprocessor import PostProcessor
+from pgvec_store import get_vector_store
+
+logger = logging.getLogger(__name__)
 
 _BASE = Path(__file__).parent.parent
 
-# ChromaDB lives inside the ingestion package — it is the ingestion package's artifact
-CHROMA_PATH = _BASE / "data" / "chroma"
+VEC_DB_PATH = _BASE / "data" / "vectors.db"  # SQLite fallback path
 COLLECTION  = "mm_rag_pipeline"
-
-LLM_MODEL       = "gemma4:latest"
-EMBEDDING_MODEL = "nomic-embed-text"
-
-_llm        = ChatOllama(model=LLM_MODEL, temperature=0)
-_embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
 OCR_LANGUAGES = ["eng", "tam"]
 
+# Shared dedup hash set across the process lifetime
+_seen_hashes: set[str] = set()
 
-def _detect_language(text: str) -> str:
-    sample = (text or "").strip()
-    if not sample:
-        return "en"
-
-    tamil_chars = sum(1 for ch in sample if "\u0B80" <= ch <= "\u0BFF")
-    latin_chars = sum(1 for ch in sample if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
-
-    if tamil_chars >= max(12, latin_chars // 2):
-        return "ta"
-
-    return "en"
+_vec_store = None
 
 
-# ── vector store ──────────────────────────────────────────────────────────────
-def get_vectorstore() -> Chroma:
-    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-    return Chroma(client=client, collection_name=COLLECTION, embedding_function=_embeddings)
+def get_vectorstore():
+    global _vec_store
+    if _vec_store is None:
+        _vec_store = get_vector_store(
+            embedding_function=get_embedding_model(),
+            sqlite_fallback_path=VEC_DB_PATH,
+        )
+    return _vec_store
 
 
 # ── stage 1: partition ────────────────────────────────────────────────────────
 def partition_document(file_path: str):
-    print(f"📄 Partitioning: {file_path}", file=sys.stderr)
-    print(
-        f"   🌐 OCR languages: {', '.join(OCR_LANGUAGES)}",
-        file=sys.stderr,
-    )
+    import time
+    logger.info("Partitioning: %s", file_path)
+    t0 = time.time()
+    # "auto" strategy: uses fast pdfminer text extraction for digital PDFs,
+    # only falls back to hi_res OCR for scanned/image-only pages.
+    # "hi_res" takes 10-60 min for 10 pages; "auto" takes seconds for digital PDFs.
     elements = partition_pdf(
         filename=file_path,
-        strategy="hi_res",
+        strategy="auto",
         languages=OCR_LANGUAGES,
         infer_table_structure=True,
-        extract_image_block_types=["Image"],
-        extract_image_block_to_payload=True,
     )
-    print(f"   ✅ {len(elements)} elements", file=sys.stderr)
+    logger.info("  %d elements extracted in %.1fs", len(elements), time.time() - t0)
     return elements
 
 
-# ── stage 2: chunk ────────────────────────────────────────────────────────────
-def create_chunks(elements):
-    chunks = chunk_by_title(
-        elements,
-        max_characters=3000,
-        new_after_n_chars=2400,
-        combine_text_under_n_chars=500,
+# ── stage 2–5: new pipeline ───────────────────────────────────────────────────
+_preprocessor = TextPreprocessor()
+_chunker      = SemanticChunker()
+
+
+def build_documents(
+    elements,
+    class_name: str,
+    subject: str,
+    source_file: str,
+    generate_questions: bool = True,
+) -> List[Document]:
+    """Run preprocess → chunk → enrich → postprocess and return LangChain Documents."""
+    standard = _parse_standard(class_name)
+
+    # Detect chapter from Title elements (first one wins)
+    chapter_title = ""
+    chapter_number = 0
+    for el in elements:
+        if type(el).__name__ == "Title":
+            txt = (getattr(el, "text", "") or "").strip()
+            if len(txt) >= 3:
+                chapter_title = txt
+                break
+
+    preprocessed = _preprocessor.preprocess(elements)
+    chunks       = _chunker.chunk(preprocessed)
+
+    enricher = MetadataEnricher(generate_questions=generate_questions)
+    docs = enricher.enrich(
+        chunks,
+        source_file=source_file,
+        subject=subject,
+        standard=standard,
+        chapter_title=chapter_title,
+        chapter_number=chapter_number,
     )
-    print(f"   ✅ {len(chunks)} chunks", file=sys.stderr)
-    return chunks
 
+    postprocessor = PostProcessor(seen_hashes=_seen_hashes)
+    docs = postprocessor.filter_and_normalize(docs)
 
-# ── stage 3: build documents ──────────────────────────────────────────────────
-def _separate_modalities(chunk) -> dict:
-    data: dict = {"text": chunk.text, "tables": [], "images": [], "chapter": "", "language": "en"}
-    if hasattr(chunk, "metadata") and hasattr(chunk.metadata, "orig_elements"):
-        for el in chunk.metadata.orig_elements:
-            t = type(el).__name__
-            if t == "Title" and not data["chapter"]:
-                v = (el.text or "").strip()
-                if len(v) >= 3:
-                    data["chapter"] = v
-            elif t == "Table":
-                data["tables"].append(getattr(el.metadata, "text_as_html", el.text))
-            elif t == "Image" and hasattr(el, "metadata") and hasattr(el.metadata, "image_base64"):
-                data["images"].append(el.metadata.image_base64)
-    data["language"] = _detect_language(data["text"])
-    return data
-
-
-def _ai_summary(text: str, tables: List[str], images: List[str]) -> str:
-    prompt = (
-        "Create a comprehensive, searchable description for document retrieval.\n\n"
-        f"TEXT:\n{text}\n\n"
-    )
-    if tables:
-        prompt += "TABLES:\n" + "\n\n".join(f"Table {i+1}:\n{t}" for i, t in enumerate(tables))
-    prompt += (
-        "\n\nWrite a detailed description covering key facts, concepts, "
-        "questions this content answers, and alternative search terms. "
-        "Prioritise findability.\n\nDESCRIPTION:"
-    )
-    parts: List[dict] = [{"type": "text", "text": prompt}]
-    for b64 in images:
-        parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    try:
-        return _llm.invoke([HumanMessage(content=parts)]).content
-    except Exception as e:
-        print(f"     ⚠️  AI summary failed: {e}", file=sys.stderr)
-        suffix = (f" [{len(tables)} table(s)]" if tables else "") + (f" [{len(images)} image(s)]" if images else "")
-        return text[:300] + "..." + suffix
-
-
-def _hyde_questions(summary: str, n: int = 3) -> List[str]:
-    prompt = (
-        f"Write {n} concise questions that this passage directly answers.\n"
-        "One per line, no numbering.\n\nPASSAGE:\n"
-        f"{summary}\n\nQUESTIONS:"
-    )
-    try:
-        raw = _llm.invoke([HumanMessage(content=prompt)]).content
-        qs = [l.strip("-• 0123456789.\t ") for l in raw.splitlines() if l.strip()]
-        return [q for q in qs if len(q) > 5][:n]
-    except Exception as e:
-        print(f"     ⚠️  HyDE questions failed: {e}", file=sys.stderr)
-        return []
-
-
-def build_documents(chunks, class_name: str, subject: str, source_file: str) -> List[Document]:
-    print(f"   🧠 Building {len(chunks)} documents…", file=sys.stderr)
-    docs: List[Document] = []
-    for i, chunk in enumerate(chunks, 1):
-        data = _separate_modalities(chunk)
-        surface = _ai_summary(data["text"], data["tables"], data["images"]) \
-            if (data["tables"] or data["images"]) else data["text"]
-        qs = _hyde_questions(surface)
-        embedded = "\n".join(f"Q: {q}" for q in qs) + "\n\n" + surface if qs else surface
-        docs.append(Document(
-            page_content=embedded,
-            metadata={
-                "class":    class_name,
-                "subject":  subject,
-                "source_file": source_file,
-                "chapter":  data["chapter"],
-                "language": data["language"],
-                "original_content": json.dumps({
-                    "raw_text":     data["text"],
-                    "tables_html":  data["tables"],
-                    "images_base64": data["images"],
-                    "language": data["language"],
-                }),
-            },
-        ))
-        if i % 5 == 0 or i == len(chunks):
-            print(f"   … {i}/{len(chunks)}", file=sys.stderr)
+    # Patch class (grade label) into metadata — used by retrieve.py
+    for doc in docs:
+        doc.metadata["class"] = class_name
     return docs
 
 
-# ── stage 4: store ────────────────────────────────────────────────────────────
+# ── stage 6: store ────────────────────────────────────────────────────────────
+
 def store_documents(docs: List[Document]) -> None:
-    get_vectorstore().add_documents(docs)
-    print(f"   ✅ {len(docs)} chunks → ChromaDB", file=sys.stderr)
+    """Embed all docs in one shot, then write to SQLite vector store."""
+    total = len(docs)
+    logger.info("  Embedding %d chunks (single pass)...", total)
+
+    emb_model = get_embedding_model()
+    texts = [doc.page_content for doc in docs]
+    t0 = time.time()
+    vectors = emb_model.embed_documents(texts)
+    logger.info("  Embedded %d chunks in %.1fs", total, time.time() - t0)
+
+    t0 = time.time()
+    import uuid as _uuid
+    vs = get_vectorstore()
+    ids   = [str(_uuid.uuid4()) for _ in docs]
+    metas = [vs._flatten_meta(doc.metadata) for doc in docs]
+    vs.add(ids=ids, documents=texts, embeddings=vectors, metadatas=metas)
+    logger.info("  Stored %d chunks in %.1fs", total, time.time() - t0)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -188,7 +159,7 @@ def _extract_chapters(docs: List[Document]) -> List[str]:
     seen: set = set()
     out: List[str] = []
     for doc in docs:
-        ch = (doc.metadata.get("chapter") or "").strip()
+        ch = (doc.metadata.get("chapter_title") or doc.metadata.get("chapter") or "").strip()
         if ch and ch not in seen:
             seen.add(ch)
             out.append(ch)
@@ -203,51 +174,79 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def _parse_standard(class_name: str) -> int:
+    digits = "".join(ch for ch in class_name if ch.isdigit())
+    try:
+        return max(1, min(10, int(digits))) if digits else 5
+    except ValueError:
+        return 5
+
+
 # ── orchestrator ──────────────────────────────────────────────────────────────
 PDF_DIR = _BASE / "data" / "pdfs"
 
 
-def ingest_pdf(pdf_path: Path, force: bool = False) -> int:
+def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = True) -> int:
     """Ingest one PDF. Returns chunk count. Skips if hash unchanged."""
     class_name = pdf_path.parent.name
     subject    = pdf_path.stem
     file_hash  = _file_hash(pdf_path)
 
     if not force and is_ingested(class_name, subject, pdf_path.name, file_hash):
-        print(f"   ⏭  unchanged — skipping", file=sys.stderr)
+        logger.info("  unchanged — skipping %s", pdf_path.name)
         return 0
 
+    t_start = time.time()
+
+    t0 = time.time()
     elements = partition_document(str(pdf_path))
-    chunks   = create_chunks(elements)
-    docs     = build_documents(chunks, class_name, subject, pdf_path.name)
+    logger.info("  [stage 1/4] partition: %.1fs", time.time() - t0)
+
+    t0 = time.time()
+    docs = build_documents(
+        elements, class_name, subject, pdf_path.name,
+        generate_questions=generate_questions,
+    )
+    logger.info("  [stage 2-5/4] preprocess+chunk+enrich+postprocess: %.1fs → %d docs",
+                time.time() - t0, len(docs))
+
+    t0 = time.time()
     store_documents(docs)
+    logger.info("  [stage 6/4] embed+store: %.1fs", time.time() - t0)
 
     chapters = _extract_chapters(docs)
     upsert_chapters(class_name, subject, chapters)
     log_ingestion(class_name, subject, pdf_path.name, len(docs), file_hash)
-    print(f"   📝 {len(chapters)} chapters written to manifest", file=sys.stderr)
+    logger.info("  %d chunks, %d chapters — total %.1fs", len(docs), len(chapters), time.time() - t_start)
     return len(docs)
 
 
-def run_ingestion(force: bool = False) -> None:
+def run_ingestion(force: bool = False, generate_questions: bool = False) -> None:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(levelname)s %(name)s: %(message)s")
     init_db()
-    print("🚀 RAG Ingestion Pipeline", file=sys.stderr)
+    logger.info("RAG Ingestion Pipeline (question_generation=%s)", generate_questions)
+    if generate_questions:
+        logger.warning(
+            "LLM question generation is ON — this adds ~10-60s per chunk via Ollama. "
+            "Use --no-questions to skip and run fast."
+        )
 
     pdfs = sorted(PDF_DIR.rglob("*.pdf"))
     if not pdfs:
-        print(f"⚠️  No PDFs found under {PDF_DIR}", file=sys.stderr)
+        logger.warning("No PDFs found under %s", PDF_DIR)
         return
 
     total = 0
     for pdf in pdfs:
         rel = pdf.relative_to(PDF_DIR)
         if len(rel.parts) < 2:
-            print(f"⚠️  Skip {pdf.name}: needs <class>/<subject>.pdf layout", file=sys.stderr)
+            logger.warning("Skip %s: needs <class>/<subject>.pdf layout", pdf.name)
             continue
-        print(f"\n📚 {pdf.parent.name}/{pdf.name}", file=sys.stderr)
+        logger.info("Processing %s/%s", pdf.parent.name, pdf.name)
         try:
-            total += ingest_pdf(pdf, force=force)
+            total += ingest_pdf(pdf, force=force, generate_questions=generate_questions)
         except Exception as e:
-            print(f"❌ Failed: {e}", file=sys.stderr)
+            logger.error("Failed %s: %s", pdf.name, e)
 
-    print(f"\n🎉 Done — {total} chunks total.", file=sys.stderr)
+    logger.info("Done — %d chunks total", total)

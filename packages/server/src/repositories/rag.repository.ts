@@ -43,16 +43,24 @@ function runPython(args: string[]): Promise<string> {
     });
 
     let stdout = "";
-    let stderr = "";
     proc.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
+    // Forward Python logs (stderr) to Node stderr so they appear in server output
     proc.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      process.stderr.write(chunk);
     });
 
-    proc.on("close", () => resolve(stdout));
-    proc.on("error", () => resolve(""));
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        console.error(`[rag] python exited with code ${code}`);
+      }
+      resolve(stdout);
+    });
+    proc.on("error", (err) => {
+      console.error("[rag] spawn error:", err.message);
+      resolve("");
+    });
   });
 }
 

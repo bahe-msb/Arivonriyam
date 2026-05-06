@@ -668,6 +668,21 @@
     );
   }
 
+  function splitSentences(text: string): string[] {
+    // Split on sentence-ending punctuation so each chunk gets a natural pause
+    return text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  }
+
+  function getCardEmoji(badge: string, index: number): string {
+    const b = badge.toLowerCase();
+    if (/textbook|book|web note/i.test(b)) return "📚";
+    if (/real.?life|example|link/i.test(b)) return "🌍";
+    if (/mcq|question|quiz|round/i.test(b)) return "🎯";
+    if (/picture|image|photo/i.test(b)) return "🖼️";
+    const defaults = ["💡", "🌟", "🎨", "🔍", "✏️"];
+    return defaults[index % defaults.length];
+  }
+
   function softenSpeechText(text: string): string {
     const normalized = text.replace(/\s+/g, " ").replace(/\s*:\s*/g, ". ").trim();
     if (!normalized) return normalized;
@@ -725,7 +740,7 @@
     clearSummaryFlowTimer();
 
     const spokenLine = softenSpeechText(line);
-
+    const sentences = splitSentences(spokenLine);
     const fallbackDelay = summaryLineDelayMs(spokenLine) + 900;
     let finished = false;
 
@@ -743,21 +758,42 @@
       return;
     }
 
-    const utterance = new SpeechSynthesisUtterance(spokenLine);
-    const voice = pickSummaryVoice(synth.getVoices());
-    if (voice) utterance.voice = voice;
+    const voices = synth.getVoices();
+    const voice = pickSummaryVoice(voices);
+    const lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
+    // Slightly slower, warmer pitch — feels like a teacher reading to children
+    const rate = sessionLanguage === "ta" ? 0.76 : 0.79;
+    const pitch = sessionLanguage === "ta" ? 0.97 : 0.88;
 
-    utterance.lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
-    utterance.rate = sessionLanguage === "ta" ? 0.82 : 0.84;
-    utterance.pitch = sessionLanguage === "ta" ? 1 : 0.94;
-    utterance.onend = finish;
-    utterance.onerror = finish;
-
-    activeSummaryUtterance = utterance;
     synth.cancel();
     synth.resume();
-    synth.speak(utterance);
 
+    let sentenceIdx = 0;
+
+    const speakNext = (): void => {
+      if (runId !== summaryRunId || finished) return;
+      if (sentenceIdx >= sentences.length) {
+        finish();
+        return;
+      }
+      const sentence = sentences[sentenceIdx++];
+      const utterance = new SpeechSynthesisUtterance(sentence);
+      if (voice) utterance.voice = voice;
+      utterance.lang = lang;
+      utterance.rate = rate;
+      utterance.pitch = pitch;
+      utterance.volume = 1.0;
+      utterance.onend = () => {
+        if (runId !== summaryRunId || finished) return;
+        // Natural breath-pause between sentences
+        setTimeout(speakNext, 320);
+      };
+      utterance.onerror = finish;
+      activeSummaryUtterance = utterance;
+      synth.speak(utterance);
+    };
+
+    speakNext();
     summaryFlowTimer = setTimeout(finish, fallbackDelay);
   }
 
@@ -811,8 +847,8 @@
     if (voice) utterance.voice = voice;
 
     utterance.lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
-    utterance.rate = sessionLanguage === "ta" ? 0.86 : 0.88;
-    utterance.pitch = sessionLanguage === "ta" ? 1 : 0.96;
+    utterance.rate = sessionLanguage === "ta" ? 0.80 : 0.82;
+    utterance.pitch = sessionLanguage === "ta" ? 0.97 : 0.90;
     utterance.onend = finish;
     utterance.onerror = finish;
 
@@ -1870,14 +1906,10 @@
                   <img src={card.imageDataUrl} alt={card.title} class="h-28 w-full rounded-2xl object-cover" />
                 {:else}
                   <div
-                    class="flex items-center justify-between rounded-2xl border border-dashed px-3 py-3 text-[11px]"
-                    style="border-color:{tone.cardBorder}; color:{tone.chipColor}; background:white;"
+                    class="flex h-28 items-center justify-center rounded-2xl text-6xl"
+                    style="background:{tone.chipBackground};"
                   >
-                    <span>idea</span>
-                    <ArrowRight class="size-3.5" />
-                    <span>example</span>
-                    <ArrowRight class="size-3.5" />
-                    <span>answer</span>
+                    {getCardEmoji(card.badge, i)}
                   </div>
                 {/if}
                 <div class="mt-3 text-[13px] leading-[1.55]" style="color:var(--text-body);">
