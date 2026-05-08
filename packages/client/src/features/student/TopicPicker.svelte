@@ -8,18 +8,27 @@
   import { activeClass, reteachTopics } from "@stores";
   import type { ReteachTopic } from "@stores";
 
-  const cls = $derived(CLASSES.find((c) => c.id === activeClass.id));
-  const topics = $derived(reteachTopics.get(activeClass.id));
+  let pickedClassId = $state<number | null>(null);
+  const cls = $derived(CLASSES.find((c) => c.id === pickedClassId));
+  const topics = $derived(pickedClassId !== null ? reteachTopics.get(pickedClassId) : []);
 
   let picked = $state<ReteachTopic | null>(null);
 
+  function selectClass(id: number): void {
+    pickedClassId = id;
+    // Restore previously selected topic for this class if it still exists
+    const saved = reteachTopics.getSelectedTopic(id);
+    picked = saved && reteachTopics.get(id).some((t) => t.id === saved.id) ? saved : null;
+  }
+
   function select(t: ReteachTopic): void {
-    picked = t;
+    picked = picked?.id === t.id ? null : t;
   }
 
   function proceed(): void {
-    if (!picked) return;
-    reteachTopics.selectTopic(picked);
+    if (!picked || pickedClassId === null) return;
+    activeClass.set(pickedClassId);
+    reteachTopics.selectTopic(picked, pickedClassId);
     goto(resolve("/student/socratic"));
   }
 </script>
@@ -31,9 +40,9 @@
   <!-- Page header -->
   <div class="mb-2 flex shrink-0 flex-col gap-4 md:flex-row md:items-end md:justify-between">
     <div>
-      <div class="label-eyebrow text-saffron-600">Student view · {cls?.name ?? "Class"}</div>
+      <div class="label-eyebrow text-saffron-600">Student view · {cls?.name ?? "Select a class"}</div>
       <div class="page-title mt-1">Topic Picker</div>
-      <div class="page-subtitle">Student selects a topic. Class topics use textbook summary; custom topics use web summary at class level. Summary and MCQs follow the uploaded textbook language.</div>
+      <div class="page-subtitle">Select a class, then choose a topic. Summary and MCQs follow the uploaded textbook language.</div>
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <Pill tone="success">
@@ -41,10 +50,27 @@
         Local AI ready
       </Pill>
       <Pill tone="cobalt">Tamil or English follows the textbook PDF</Pill>
-      <Button variant="primary" disabled={!picked} onclick={proceed}>
+      <Button variant="primary" disabled={!picked || pickedClassId === null} onclick={proceed}>
         Start session <ArrowRight class="size-3.5" />
       </Button>
     </div>
+  </div>
+
+  <!-- Class selector -->
+  <div class="flex shrink-0 flex-wrap gap-2">
+    {#each CLASSES as c (c.id)}
+      <button
+        type="button"
+        onclick={() => selectClass(c.id)}
+        class="flex items-center gap-2 rounded-full border px-3 py-1.5 text-[12px] font-semibold transition-all"
+        style="{pickedClassId === c.id
+          ? `background:${c.color}18;border-color:${c.color};color:${c.color};`
+          : 'background:white;border-color:var(--border-default);color:var(--text-secondary);'}"
+      >
+        <span class="inline-block size-2 rounded-full" style="background:{c.color};"></span>
+        {c.name}
+      </button>
+    {/each}
   </div>
 
   <div
@@ -54,7 +80,20 @@
     <div class="h-full w-full overflow-hidden rounded-2xl" style="background:var(--ivory);">
       <div class="flex h-full flex-col">
 
-        {#if topics.length === 0}
+        {#if pickedClassId === null}
+          <!-- No class selected -->
+          <div class="flex flex-1 flex-col items-center justify-center gap-4 px-8 text-center">
+            <div class="text-5xl">🏫</div>
+            <div class="text-[22px] font-semibold" style="color:var(--ink);">Select a class</div>
+            <div class="text-[14px]" style="color:var(--text-secondary);">
+              Choose a class above to see its reteach topics.
+            </div>
+            <div class="font-tamil text-[13px]" style="color:var(--text-tertiary);">
+              வகுப்பை தேர்ந்தெடுக்கவும்.
+            </div>
+          </div>
+
+        {:else if topics.length === 0}
           <!-- Empty state -->
           <div class="flex flex-1 flex-col items-center justify-center gap-4 px-8 text-center">
             <div class="text-5xl">📭</div>
@@ -88,7 +127,7 @@
               {/if}
             </div>
             <div class="text-[13px]" style="color:var(--text-secondary);">
-              {cls?.students} learners · {topics.length} topic{topics.length !== 1 ? "s" : ""}
+              {topics.length} topic{topics.length !== 1 ? "s" : ""}
             </div>
           </div>
 
@@ -109,6 +148,7 @@
           >
             {#each topics as t (t.id)}
               {@const sel = picked?.id === t.id}
+              {@const done = reteachTopics.isCompleted(t.id)}
               {@const accent = cls?.color ?? "#6B94E7"}
               <button
                 type="button"
@@ -140,7 +180,7 @@
                 </div>
 
                 <!-- Subject + type badge -->
-                <div class="mt-4 flex items-center gap-1.5">
+                <div class="mt-4 flex items-center gap-1.5 flex-wrap">
                   <div
                     class="flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium"
                     style="background:{sel ? accent + '15' : '#f0ede8'}; color:{sel ? accent : 'var(--text-secondary)'};"
@@ -151,11 +191,17 @@
                       <BookOpen class="size-2.75" /> Textbook · {t.subject}
                     {/if}
                   </div>
+                  {#if done}
+                    <div class="flex items-center gap-1 rounded-full bg-[#eef9f2] px-2.5 py-1 text-[11px] font-semibold text-[#247a46]">
+                      ✓ Done
+                    </div>
+                  {/if}
                 </div>
 
                 {#if sel}
-                  <div class="mt-3 text-[12px] font-semibold" style="color:{accent};">
+                  <div class="mt-3 flex items-center gap-1.5 text-[12px] font-semibold" style="color:{accent};">
                     ✓ Selected
+                    <span class="text-[10px] font-normal opacity-60">(tap to deselect)</span>
                   </div>
                 {/if}
               </button>

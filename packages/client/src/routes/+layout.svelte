@@ -5,6 +5,7 @@
   import type { Snippet } from "svelte";
   import { Sidebar } from "@shadcn";
   import { AppSidebar, TopBar } from "@components";
+  import { schoolConfig } from "@stores";
   import "../app.css";
 
   type Props = { children?: Snippet };
@@ -25,6 +26,7 @@
   onMount(() => {
     syncViewport();
     window.addEventListener("resize", syncViewport);
+    void schoolConfig.load();
     return () => window.removeEventListener("resize", syncViewport);
   });
 

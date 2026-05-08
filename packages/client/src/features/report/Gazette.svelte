@@ -1,11 +1,30 @@
 <script lang="ts">
   import { Card } from "@shadcn";
-  import type { ReportRow } from "@mocks";
+  import { schoolConfig } from "@stores";
 
-  type Props = { date: string; rows: ReportRow[] };
-  let { date, rows }: Props = $props();
+  type ClassRow = {
+    class_id: number;
+    class_name: string;
+    students_present: number;
+    reteach_sessions: number;
+    struggling_count: number;
+    avg_score: number;
+    completion_pct: number;
+  };
 
-  const total = $derived(rows.reduce((s, r) => s + r.students, 0));
+  type PerformanceData = {
+    byClass: ClassRow[];
+    totals: { total_students: number; total_reteach: number; avg_score: number };
+  };
+
+  type Props = { date: string; data: PerformanceData | null };
+  let { date, data }: Props = $props();
+
+  const cfg = $derived(schoolConfig.config);
+  const rows = $derived(data?.byClass ?? []);
+  const total = $derived(data?.totals.total_students ?? 0);
+  const totalReteach = $derived(data?.totals.total_reteach ?? 0);
+  const strugglingClasses = $derived(rows.filter((r) => r.struggling_count > 0));
 </script>
 
 <Card
@@ -24,24 +43,36 @@
 
   <div class="mb-5 flex flex-wrap justify-between gap-2 text-[12.5px]">
     <div>
-      <b>School:</b> Govt. Primary School, Thenkarai · Block: Alanganallur
+      <b>School:</b>
+      {cfg.school_name || "—"}
+      {#if cfg.location} · Block: {cfg.location}{/if}
     </div>
     <div><b>Date:</b> {date}</div>
   </div>
 
   <p class="text-text-body text-[13.5px] leading-[1.8]">
-    On this day, <b>{total} children</b> attended across five grades under one classroom. Five
-    lessons were delivered at the blackboard and eleven reteach sessions were conducted using the
-    on-device educational assistant. Of the
-    {total} learners, <b>one child (Arjun, Class 3)</b> requires follow-up attention on the topic of photosynthesis.
-    All other learners are progressing as expected. Detailed per-class figures follow.
+    On this day,
+    {#if total > 0}
+      <b>{total} children</b> engaged in Socratic sessions across {rows.length} class{rows.length === 1 ? "" : "es"}.
+      {totalReteach} reteach session{totalReteach === 1 ? "" : "s"} were conducted using the on-device educational assistant.
+      {#if strugglingClasses.length > 0}
+        {#each strugglingClasses as r (r.class_id)}
+          {r.struggling_count} student{r.struggling_count === 1 ? "" : "s"} in {r.class_name} require{r.struggling_count === 1 ? "s" : ""} follow-up attention.
+        {/each}
+      {:else}
+        All learners are progressing as expected.
+      {/if}
+    {:else}
+      no Socratic sessions were recorded. Detailed per-class figures will appear here after sessions are completed.
+    {/if}
+    Detailed per-class figures follow.
   </p>
 
   <div class="overflow-x-auto">
     <table class="mt-5 w-full border-collapse text-[12.5px]">
       <thead>
         <tr class="border-saffron-700 border-b-[1.5px]">
-          {#each ["Class", "Present", "Lessons", "Reteach", "Completion", "Remarks"] as h (h)}
+          {#each ["Class", "Present", "Reteach", "Avg Score", "Completion", "Remarks"] as h (h)}
             <th class="px-2 py-2.5 text-left text-[11px] font-bold tracking-[0.06em] uppercase">
               {h}
             </th>
@@ -49,30 +80,42 @@
         </tr>
       </thead>
       <tbody>
-        {#each rows as r (r.cls)}
-          <tr class="border-clay-100 border-b">
-            <td class="px-2 py-2.5">Class {r.cls}</td>
-            <td class="px-2 py-2.5">{r.students}</td>
-            <td class="px-2 py-2.5">{r.taught}</td>
-            <td class="px-2 py-2.5">{r.retaught}</td>
-            <td class="px-2 py-2.5">{r.completed}%</td>
-            <td class="px-2 py-2.5">
-              {r.struggling > 0 ? "Follow-up required" : "Satisfactory"}
+        {#if rows.length === 0}
+          <tr>
+            <td colspan="6" class="px-2 py-4 text-center text-[12px] text-text-secondary">
+              No session data yet for today.
             </td>
           </tr>
-        {/each}
+        {:else}
+          {#each rows as r (r.class_id)}
+            <tr class="border-clay-100 border-b">
+              <td class="px-2 py-2.5">Class {r.class_id}</td>
+              <td class="px-2 py-2.5">{r.students_present}</td>
+              <td class="px-2 py-2.5">{r.reteach_sessions}</td>
+              <td class="px-2 py-2.5">{r.avg_score}%</td>
+              <td class="px-2 py-2.5">{r.completion_pct}%</td>
+              <td class="px-2 py-2.5">
+                {r.struggling_count > 0 ? "Follow-up required" : "Satisfactory"}
+              </td>
+            </tr>
+          {/each}
+        {/if}
       </tbody>
     </table>
   </div>
 
   <div class="mt-12 flex flex-wrap items-end justify-between gap-4">
     <div>
-      <div class="border-ink h-[30px] w-[220px] border-b"></div>
-      <div class="mt-1.5 text-[11px]">Teacher-in-charge · Kavitha R.</div>
-      <div class="mono text-text-secondary text-[11px]">TNEID-2014-30592</div>
+      <div class="border-ink h-7.5 w-55 border-b"></div>
+      <div class="mt-1.5 text-[11px]">
+        Teacher-in-charge · {cfg.teacher_name || "—"}
+      </div>
+      {#if cfg.teacher_id}
+        <div class="mono text-text-secondary text-[11px]">{cfg.teacher_id}</div>
+      {/if}
     </div>
     <div
-      class="grid size-22 place-items-center rounded-full text-center text-[9px] font-bold tracking-[0.1em] opacity-60"
+      class="grid size-22 place-items-center rounded-full text-center text-[9px] font-bold tracking-widest opacity-60"
       style="border: 2px solid var(--saffron-700); color: var(--saffron-700);"
     >
       <div>

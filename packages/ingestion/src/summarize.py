@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 from retrieve import topic_retrieve
 
 LLM_MODEL = "gemma4:latest"
-_llm      = ChatOllama(model=LLM_MODEL, temperature=0.3)
-_llm_json = ChatOllama(model=LLM_MODEL, temperature=0.3, format="json")
+_llm      = ChatOllama(model=LLM_MODEL, temperature=0.3, timeout=60)
+_llm_json = ChatOllama(model=LLM_MODEL, temperature=0.3, format="json", timeout=60)
 
 # Element-type sort priority — definitions/formulas first, body last
 _ETYPE_PRIORITY = {

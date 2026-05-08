@@ -12,7 +12,7 @@
     FileText,
     Grid3x3,
     Mic,
-    Settings,
+    School,
     type Icon as IconType,
   } from "lucide-svelte";
 
@@ -39,6 +39,10 @@
   const student: NavEntry[] = [
     { label: "Topic Picker", href: "/student/topic", icon: Grid3x3 },
     { label: "Socratic Q&A", href: "/student/socratic", icon: Mic },
+  ];
+
+  const settings: NavEntry[] = [
+    { label: "School Setup", href: "/setup", icon: School },
   ];
 
   const alertCount = $derived(sessionAlerts.count());
@@ -97,6 +101,24 @@
       <Sidebar.GroupLabel>Student view</Sidebar.GroupLabel>
       <Sidebar.Menu>
         {#each student as item (item.href + item.label)}
+          <Sidebar.MenuItem>
+            <Sidebar.MenuButton
+              href={item.href}
+              isActive={isActive(item.href)}
+              tooltip={item.label}
+            >
+              <item.icon class="size-4.25 shrink-0 opacity-90" />
+              <span class="truncate">{item.label}</span>
+            </Sidebar.MenuButton>
+          </Sidebar.MenuItem>
+        {/each}
+      </Sidebar.Menu>
+    </Sidebar.Group>
+
+    <Sidebar.Group>
+      <Sidebar.GroupLabel>Settings</Sidebar.GroupLabel>
+      <Sidebar.Menu>
+        {#each settings as item (item.href + item.label)}
           <Sidebar.MenuItem>
             <Sidebar.MenuButton
               href={item.href}

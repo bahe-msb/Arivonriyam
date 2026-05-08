@@ -2,9 +2,13 @@
   import { goto } from "$app/navigation";
   import {
     AlertTriangle,
+    ArrowLeft,
     ArrowRight,
     BookOpen,
+    CalendarDays,
     CheckCircle2,
+    ChevronLeft,
+    ChevronRight,
     Filter,
     Heart,
     Lightbulb,
@@ -16,7 +20,7 @@
 
   import { Page, PageHeader, Pill } from "@components";
   import { CLASSES } from "@mocks";
-  import { activeClass, sessionAlerts, type SessionAlertRecord } from "@stores";
+  import { activeClass, type SessionAlertRecord } from "@stores";
 
   type AlertSuggestion = {
     gapSummary: string;
@@ -29,22 +33,138 @@
     error?: string;
   };
 
-  const classOptions = $derived(
-    CLASSES.map((cls) => ({
-      ...cls,
-      count: sessionAlerts.countForClass(cls.id),
-    })),
-  );
-  const totalAlerts = $derived(sessionAlerts.count());
+  // ── Date navigation ────────────────────────────────────────────────
+  function todayKey(): string {
+    return new Date().toISOString().split("T")[0];
+  }
 
-  let selectedClassId = $state(activeClass.id);
+  function offsetDate(base: string, days: number): string {
+    const d = new Date(base);
+    d.setDate(d.getDate() + days);
+    return d.toISOString().split("T")[0];
+  }
+
+  function formatDateLabel(key: string): string {
+    const today = todayKey();
+    if (key === today) return "Today";
+    if (key === offsetDate(today, -1)) return "Yesterday";
+    return new Date(key + "T00:00:00").toLocaleDateString("en-IN", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  }
+
+  let selectedDate = $state(todayKey());
+  const isToday = $derived(selectedDate === todayKey());
+  const canGoForward = $derived(selectedDate < todayKey());
+
+  // ── Load records from API for selected date ───────────────────────
+  type ApiAlertRecord = {
+    id: string;
+    session_id: string;
+    class_id: number;
+    class_name: string;
+    student_id: string;
+    student_name: string;
+    student_emoji: string;
+    topic: string;
+    subject: string;
+    total_questions: number;
+    correct_count: number;
+    incorrect_count: number;
+    score: number;
+    missed_questions: SessionAlertRecord["missedQuestions"];
+    session_date: string;
+    created_at: string;
+  };
+
+  let apiRecords = $state<SessionAlertRecord[]>([]);
+  let apiLoading = $state(false);
+
+  async function loadAlerts(date: string): Promise<void> {
+    apiLoading = true;
+    try {
+      const res = await fetch(`/api/alerts?date=${encodeURIComponent(date)}`);
+      const data = (await res.json()) as { alerts: ApiAlertRecord[] };
+      apiRecords = (data.alerts ?? []).map((r) => ({
+        id: r.id,
+        sessionId: r.session_id,
+        classId: r.class_id,
+        className: r.class_name,
+        studentId: r.student_id,
+        studentName: r.student_name,
+        studentEmoji: r.student_emoji,
+        topic: r.topic,
+        subject: r.subject,
+        totalQuestions: r.total_questions,
+        correctCount: r.correct_count,
+        incorrectCount: r.incorrect_count,
+        score: r.score,
+        missedQuestions: Array.isArray(r.missed_questions) ? r.missed_questions : [],
+        createdAt: r.created_at,
+      }));
+    } catch {
+      apiRecords = [];
+    } finally {
+      apiLoading = false;
+    }
+  }
+
+  $effect(() => {
+    void loadAlerts(selectedDate);
+  });
+
+  const allRecords = $derived(apiRecords);
+
+  // ── Filters ────────────────────────────────────────────────────────
+  let selectedClassId = $state<number | null>(null);
+  let selectedSubject = $state<string | null>(null);
+
+  const availableSubjects = $derived(
+    [...new Set(allRecords.map((r) => r.subject))].sort(),
+  );
+
+  // Reset subject filter when date changes or records change
+  $effect(() => {
+    // Only reset if the current selected subject is no longer available
+    if (selectedSubject && !availableSubjects.includes(selectedSubject)) {
+      selectedSubject = null;
+    }
+  });
+
+  const filteredAlerts = $derived(
+    selectedClassId === null
+      ? []
+      : allRecords.filter(
+          (r) =>
+            r.classId === selectedClassId &&
+            (selectedSubject === null || r.subject === selectedSubject),
+        ),
+  );
+
+  const classOptions = $derived(
+    [...new Map(allRecords.map((r) => [r.classId, r])).values()]
+      .map((r) => {
+        const meta = CLASSES.find((c) => c.id === r.classId);
+        return {
+          id: r.classId,
+          name: r.className,
+          color: meta?.color ?? "#6B94E7",
+          count: allRecords.filter((a) => a.classId === r.classId).length,
+        };
+      })
+      .sort((a, b) => a.id - b.id),
+  );
+  const totalAlerts = $derived(allRecords.length);
+
+  // ── Sheet ──────────────────────────────────────────────────────────
   let selectedRecordId = $state<string | null>(null);
   let detailSheetOpen = $state(false);
   let suggestionCache = $state<Record<string, AlertSuggestion>>({});
   let suggestionErrors = $state<Record<string, string>>({});
   let suggestionLoadingId = $state<string | null>(null);
 
-  const filteredAlerts = $derived(sessionAlerts.getByClass(selectedClassId));
   const activeRecord = $derived(
     filteredAlerts.find((record) => record.id === selectedRecordId) ?? null,
   );
@@ -56,13 +176,15 @@
   const activeSuggestionError = $derived(
     activeRecord ? suggestionErrors[activeRecord.id] ?? "" : "",
   );
-  const activeClassInfo = $derived(CLASSES.find((cls) => cls.id === selectedClassId));
+  const activeClassInfo = $derived(classOptions.find((cls) => cls.id === selectedClassId));
   const totalMissesForClass = $derived(
     filteredAlerts.reduce((sum, record) => sum + record.incorrectCount, 0),
   );
   const averageScoreForClass = $derived(
     filteredAlerts.length > 0
-      ? Math.round(filteredAlerts.reduce((sum, record) => sum + record.score, 0) / filteredAlerts.length)
+      ? Math.round(
+          filteredAlerts.reduce((sum, record) => sum + record.score, 0) / filteredAlerts.length,
+        )
       : 0,
   );
 
@@ -105,7 +227,11 @@
     const resolvedFocusAreas =
       focusAreas.length > 0
         ? focusAreas
-        : [`core ${record.topic} facts`, `${record.subject} examples`, "matching the right option"];
+        : [
+            `core ${record.topic} facts`,
+            `${record.subject} examples`,
+            "matching the right option",
+          ];
 
     return {
       gapSummary: `${record.studentName} is missing a few key ${record.topic} ideas and needs a slower recap before the next MCQ round. The main issue is linking the question back to the lesson fact and example.`,
@@ -196,16 +322,14 @@
   }
 
   $effect(() => {
-    const classesWithAlerts = classOptions.filter((cls) => cls.count > 0);
-
-    if (classesWithAlerts.length === 0) {
+    if (classOptions.length === 0) {
+      selectedClassId = null;
       selectedRecordId = null;
       return;
     }
 
-    if (!classesWithAlerts.some((cls) => cls.id === selectedClassId)) {
-      const preferred = classesWithAlerts.find((cls) => cls.id === activeClass.id) ?? classesWithAlerts[0];
-      selectedClassId = preferred.id;
+    if (!classOptions.some((cls) => cls.id === selectedClassId)) {
+      selectedClassId = classOptions[0].id;
     }
   });
 
@@ -227,7 +351,6 @@
       selectedRecordId = null;
     }
   });
-
 </script>
 
 <Page maxWidth={1280}>
@@ -244,17 +367,49 @@
     {/snippet}
   </PageHeader>
 
-  {#if totalAlerts === 0}
+  <!-- ── Date navigation ───────────────────────────────────────── -->
+  <div class="mb-5 flex items-center gap-3">
+    <button
+      type="button"
+      onclick={() => { selectedDate = offsetDate(selectedDate, -1); }}
+      class="flex items-center gap-1 rounded-lg border border-border-default bg-white px-3 py-1.5 text-[12px] font-medium transition-colors hover:bg-gray-50"
+    >
+      <ChevronLeft class="size-3.5" /> Prev day
+    </button>
+
+    <div class="flex items-center gap-2 rounded-lg border border-border-default bg-white px-4 py-1.5">
+      <CalendarDays class="size-3.5 text-text-secondary" />
+      <span class="text-[13px] font-semibold">{formatDateLabel(selectedDate)}</span>
+      {#if !isToday}
+        <span class="text-[11px] text-text-secondary">{selectedDate}</span>
+      {/if}
+    </div>
+
+    <button
+      type="button"
+      onclick={() => { selectedDate = offsetDate(selectedDate, 1); }}
+      disabled={!canGoForward}
+      class="flex items-center gap-1 rounded-lg border border-border-default bg-white px-3 py-1.5 text-[12px] font-medium transition-colors hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+    >
+      Next day <ChevronRight class="size-3.5" />
+    </button>
+
+    {#if apiLoading}
+      <span class="text-[11px] text-text-secondary">Loading…</span>
+    {/if}
+  </div>
+
+  {#if totalAlerts === 0 && !apiLoading}
     <Card class="border-clay-100 bg-clay-50 p-8 text-center">
       <div class="text-saffron-500 mx-auto mb-4 grid size-14 place-items-center rounded-3xl bg-white shadow-sm">
         <CheckCircle2 class="size-6" />
       </div>
-      <div class="text-[22px] font-semibold">No student alerts yet</div>
+      <div class="text-[22px] font-semibold">No alerts for {formatDateLabel(selectedDate)}</div>
       <div class="text-text-secondary mx-auto mt-2 max-w-150 text-[14px] leading-[1.7]">
         Finish a Socratic session and any student who misses questions will appear here with their subject, topic, exact slips, and support ideas.
       </div>
     </Card>
-  {:else}
+  {:else if totalAlerts > 0}
     <div class="space-y-5">
       <div class="grid gap-4 md:grid-cols-3">
         <Card class="border-clay-100 bg-clay-50 p-5">
@@ -262,7 +417,7 @@
             <AlertTriangle class="size-4" /> Active students
           </div>
           <div class="text-[30px] font-semibold">{totalAlerts}</div>
-          <div class="text-text-secondary mt-1 text-[12px]">Students currently needing a second look.</div>
+          <div class="text-text-secondary mt-1 text-[12px]">Students needing a second look on {formatDateLabel(selectedDate)}.</div>
         </Card>
 
         <Card class="border-[#d7e7ff] bg-[#eef6ff] p-5">
@@ -279,7 +434,9 @@
           </div>
           <div class="flex items-end gap-3">
             <div class="text-[30px] font-semibold">{totalMissesForClass}</div>
-            <div class="pb-1 text-[13px] font-medium text-[#247a46]">misses · {averageScoreForClass}% average</div>
+            <div class="pb-1 text-[13px] font-medium text-[#247a46]">
+              misses · {averageScoreForClass}% average
+            </div>
           </div>
           <div class="text-text-secondary mt-1 text-[12px]">Useful for deciding which class needs the next reteach slot.</div>
         </Card>
@@ -287,35 +444,61 @@
 
       <Card class="overflow-hidden p-0">
         <div class="border-border-default border-b px-5 py-4">
-          <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
             <div>
               <div class="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#6b7280]">
-                <Filter class="size-4" /> Class filter
+                <Filter class="size-4" /> Filters
               </div>
               <div class="text-[18px] font-semibold">Students who missed the Socratic round</div>
-              <div class="text-text-secondary mt-1 text-[12px]">
-                Choose a class to see which students struggled, and which subject or topic they missed.
-              </div>
             </div>
-            <div class="flex flex-wrap gap-2">
-              {#each classOptions as cls (cls.id)}
-                <button
-                  type="button"
-                  onclick={() => selectClass(cls.id)}
-                  disabled={cls.count === 0}
-                  class="flex cursor-pointer items-center gap-2 rounded-full border px-3 py-1.5 text-[12px] font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-45"
-                  style="{selectedClassId === cls.id
-                    ? `background:${cls.color}18;border-color:${cls.color};color:${cls.color};`
-                    : 'background:white;border-color:var(--border-default);color:var(--text-secondary);'}"
-                >
-                  <span
-                    class="inline-block size-2 rounded-full"
-                    style="background:{cls.color};"
-                  ></span>
-                  {cls.name}
-                  <span class="rounded-full bg-white/80 px-1.5 py-0.5 text-[10px]">{cls.count}</span>
-                </button>
-              {/each}
+
+            <!-- Class + Subject filters -->
+            <div class="flex flex-col gap-2">
+              <!-- Class filter -->
+              <div class="flex flex-wrap gap-1.5">
+                {#each classOptions as cls (cls.id)}
+                  <button
+                    type="button"
+                    onclick={() => selectClass(cls.id)}
+                    class="flex cursor-pointer items-center gap-2 rounded-full border px-3 py-1.5 text-[12px] font-semibold transition-all"
+                    style="{selectedClassId === cls.id
+                      ? `background:${cls.color}18;border-color:${cls.color};color:${cls.color};`
+                      : 'background:white;border-color:var(--border-default);color:var(--text-secondary);'}"
+                  >
+                    <span class="inline-block size-2 rounded-full" style="background:{cls.color};"></span>
+                    {cls.name}
+                    <span class="rounded-full bg-white/80 px-1.5 py-0.5 text-[10px]">{cls.count}</span>
+                  </button>
+                {/each}
+              </div>
+
+              <!-- Subject filter -->
+              {#if availableSubjects.length > 1}
+                <div class="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onclick={() => { selectedSubject = null; }}
+                    class="rounded-full border px-3 py-1 text-[11px] font-semibold transition-all
+                           {selectedSubject === null
+                      ? 'border-[#6b7280] bg-[#6b728018] text-[#374151]'
+                      : 'border-border-default bg-white text-text-secondary'}"
+                  >
+                    All subjects
+                  </button>
+                  {#each availableSubjects as subject (subject)}
+                    <button
+                      type="button"
+                      onclick={() => { selectedSubject = subject; }}
+                      class="rounded-full border px-3 py-1 text-[11px] font-semibold transition-all
+                             {selectedSubject === subject
+                        ? 'border-[#2f67c8] bg-[#eef6ff] text-[#2f67c8]'
+                        : 'border-border-default bg-white text-text-secondary'}"
+                    >
+                      {subject}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
             </div>
           </div>
         </div>
@@ -373,6 +556,14 @@
                   </td>
                 </tr>
               {/each}
+
+              {#if filteredAlerts.length === 0}
+                <tr>
+                  <td colspan="6" class="px-5 py-8 text-center text-[13px] text-text-secondary">
+                    No alerts for this class{selectedSubject ? ` · ${selectedSubject}` : ""} on {formatDateLabel(selectedDate)}.
+                  </td>
+                </tr>
+              {/if}
             </tbody>
           </table>
         </div>
@@ -403,7 +594,11 @@
                   </div>
 
                   <div class="mt-4 flex flex-wrap gap-2">
-                    <Button variant="secondary" class="justify-start" onclick={() => void loadSuggestion(activeRecord)}>
+                    <Button
+                      variant="secondary"
+                      class="justify-start"
+                      onclick={() => void loadSuggestion(activeRecord)}
+                    >
                       <RefreshCw class="size-3.5" /> Improve with AI
                     </Button>
                     <Button variant="ghost" class="justify-start" onclick={() => goto("/student/topic")}>

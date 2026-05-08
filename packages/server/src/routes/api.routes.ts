@@ -1,15 +1,22 @@
 import { Router } from "express";
 import {
+  getAlerts,
   getHealth,
   getLessonChapters,
   getLessonSubjects,
   getTodayPlans,
   getTestStt,
+  getSchoolConfig,
+  getStudents,
+  getReportPerformance,
+  postAlertsSession,
   postSocraticAlertSuggestion,
   postSocraticPreview,
   postLessonBlueprint,
   postSavePlan,
   postSocraticSummarize,
+  postSchoolConfig,
+  postStudents,
   postTestAsk,
   postVoiceFile,
 } from "../controllers";
@@ -19,21 +26,38 @@ import { upload } from "../middleware";
 export function createApiRouter(): Router {
   const router = Router();
 
-  // Project Specific endpoints
+  // Health
   router.get("/health", getHealth);
-  router.post("/api/student/conservation", upload.single("audio"), postVoiceFile);
+
+  // School setup
+  router.get("/api/school/config", getSchoolConfig);
+  router.post("/api/school/config", postSchoolConfig);
+  router.get("/api/school/students", getStudents);
+  router.post("/api/school/students", postStudents);
+
+  // Alerts
+  router.get("/api/alerts", getAlerts);
+  router.post("/api/alerts/session", postAlertsSession);
+
+  // Report
+  router.get("/api/report/performance", getReportPerformance);
+
+  // Socratic
   router.post("/api/socratic/alerts/suggestion", postSocraticAlertSuggestion);
   router.post("/api/socratic/preview", postSocraticPreview);
   router.post("/api/socratic/summarize", postSocraticSummarize);
 
-  // Lesson plan endpoints
+  // Lesson plan
   router.get("/api/lesson/subjects", getLessonSubjects);
   router.get("/api/lesson/chapters", getLessonChapters);
   router.post("/api/lesson/blueprint", postLessonBlueprint);
   router.post("/api/lesson/plan/save", postSavePlan);
   router.get("/api/lesson/plan/today", getTodayPlans);
 
-  // Test endpoints
+  // Voice
+  router.post("/api/student/conservation", upload.single("audio"), postVoiceFile);
+
+  // Test
   router.post("/api/test/ask", postTestAsk);
   router.get("/api/test/stt", getTestStt);
 

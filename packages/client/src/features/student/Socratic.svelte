@@ -8,7 +8,6 @@
     BookOpen,
     Image as ImageIcon,
     Lightbulb,
-    Pencil,
     Phone,
     CheckCircle2,
     Shapes,
@@ -17,10 +16,11 @@
   } from "lucide-svelte";
   import { Button } from "@shadcn";
   import { Pill } from "@components";
-  import { STUDENTS_BY_CLASS, CLASSES } from "@mocks";
+  import { CLASSES } from "@mocks";
   import {
     activeClass,
     reteachTopics,
+    schoolConfig,
     sessionAlerts,
     type SessionAlertRecord,
   } from "@stores";
@@ -77,22 +77,36 @@
   const QUESTIONS_PER_STUDENT = 6;
   const PROGRESS_SEGMENTS = 6;
   const AUTO_ADVANCE_MS = 5000;
-  const SUMMARY_FETCH_TIMEOUT_MS = 120000;
+  const SUMMARY_FETCH_TIMEOUT_MS = 180000;
+  type SocraticStudent = { id: string; name: string; emoji: string };
+
   const FALLBACK_EMOJIS = ["🦁", "🌻", "🦚", "🌙"];
   const OPTION_LABELS = ["A", "B", "C", "D"] as const;
 
   const cls = $derived(CLASSES.find((c) => c.id === activeClass.id));
-  const students = $derived(
-    STUDENTS_BY_CLASS[activeClass.id] ??
-      Array.from({ length: 4 }, (_, idx) => ({
+  const students = $derived<SocraticStudent[]>(
+    schoolConfig.studentsByClass[activeClass.id]?.map((s) => ({
+      id: s.id,
+      name: s.name,
+      emoji: s.emoji,
+    })) ??
+      Array.from({ length: 4 }, (_, idx): SocraticStudent => ({
         id: `student-${activeClass.id}-${idx + 1}`,
         name: `Student ${idx + 1}`,
         emoji: FALLBACK_EMOJIS[idx % FALLBACK_EMOJIS.length],
-        streak: 0,
-        status: "ok" as const,
       })),
   );
-  const topic = $derived(reteachTopics.selectedTopic);
+
+  // Start screen: no class pre-selected; derived topic comes from per-class store
+  let startClassId = $state<number | null>(null);
+  const topic = $derived(
+    startClassId !== null ? reteachTopics.getSelectedTopic(startClassId) : null,
+  );
+
+  function pickStartClass(id: number): void {
+    startClassId = id;
+    activeClass.set(id);
+  }
 
   let phase = $state<Phase>("start");
 
@@ -716,6 +730,7 @@
   function finishSession(): void {
     clearAutoAdvanceTimer();
     publishSessionAlerts();
+    if (topic) reteachTopics.markCompleted(topic.id);
     phase = "complete";
   }
 
@@ -841,8 +856,8 @@
       const isAbort = error instanceof Error && error.name === "AbortError";
       summaryError = isAbort
         ? sessionLanguage === "ta"
-          ? "Ollama பதிலளிக்க அதிக நேரம் எடுத்துக்கொண்டது. மீண்டும் முயற்சிக்கவும்."
-          : "Ollama took too long to respond. Please try again."
+          ? "AI சுருக்கம் தயாரிக்க அதிக நேரம் எடுத்துக்கொண்டது. மீண்டும் முயற்சிக்கவும்."
+          : "AI took too long to prepare the summary. Please try again."
         : sessionLanguage === "ta"
           ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
           : "Network issue while loading summary.";
@@ -1236,48 +1251,74 @@
         <div class="flex flex-col overflow-hidden">
           {#if phase === "start"}
             <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
-              <div
-                class="flex items-center gap-2 rounded-full px-4 py-1.5 text-[12px] font-medium"
-                style="background:{accent}18; color:{accent};"
-              >
-                {#if topic?.source === "custom"}
-                  <Pencil class="size-3" />
-                {:else}
-                  <BookOpen class="size-3" />
-                {/if}
-                {topic?.subject ?? "Science"}
+              <!-- Class selector: disabled if no topic set for that class -->
+              <div class="flex flex-wrap justify-center gap-1.5">
+                {#each CLASSES as c (c.id)}
+                  {@const hasTopic = reteachTopics.getSelectedTopic(c.id) !== null}
+                  <button
+                    type="button"
+                    onclick={() => pickStartClass(c.id)}
+                    disabled={!hasTopic}
+                    class="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-all disabled:opacity-35 disabled:cursor-not-allowed"
+                    style="{startClassId === c.id
+                      ? `background:${c.color}18;border-color:${c.color};color:${c.color};`
+                      : 'background:white;border-color:var(--border-default);color:var(--text-secondary);'}"
+                  >
+                    <span class="inline-block size-1.5 rounded-full" style="background:{c.color};"></span>
+                    {c.name}
+                  </button>
+                {/each}
               </div>
-              <div
-                class="max-w-120 text-[28px] font-semibold leading-tight tracking-tight"
-                style="color:var(--ink); text-wrap:balance;"
-              >
-                {topic?.topic ?? "Today's reteach"}
-              </div>
-              <div class="text-[14px]" style="color:var(--text-secondary);">
-                Short summary first (about 2-3 mins), then four-option MCQ questions.
-              </div>
-              <div class="max-w-110 text-[12px] leading-[1.6]" style="color:var(--text-tertiary);">
-                {summaryLanguageNote}
-              </div>
-              <button
-                type="button"
-                onclick={startSession}
-                class="mt-1 flex cursor-pointer items-center gap-3 rounded-2xl px-10 py-4 text-[17px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
-                style="background:{accent}; box-shadow:0 14px 36px -10px {accent}66;"
-              >
-                🧠 Start Thinking <Sparkles class="size-5" />
-              </button>
-              <div class="text-[11px]" style="color:var(--text-tertiary);">
-                Teacher: tap "Start Thinking" to pre-load. Students will see "Start Beginning" when ready.
-              </div>
-              <button
-                type="button"
-                onclick={() => goto(resolve("/student/topic"))}
-                class="cursor-pointer text-[11px] underline underline-offset-2"
-                style="color:var(--text-tertiary);"
-              >
-                ← Choose a different topic
-              </button>
+
+              {#if startClassId === null}
+                <div class="text-[16px] font-semibold" style="color:var(--ink);">Select a class to begin</div>
+                <div class="text-[13px]" style="color:var(--text-secondary);">
+                  Choose a class above, then start the session for that class.
+                </div>
+              {:else if topic}
+                <div
+                  class="flex items-center gap-2 rounded-full px-4 py-1.5 text-[12px] font-medium"
+                  style="background:{accent}18; color:{accent};"
+                >
+                  {cls?.name ?? "Class"}
+                </div>
+                <div
+                  class="max-w-120 text-[28px] font-semibold leading-tight tracking-tight"
+                  style="color:var(--ink); text-wrap:balance;"
+                >
+                  {topic.topic}
+                </div>
+                <div class="text-[14px]" style="color:var(--text-secondary);">
+                  Short summary first (about 2-3 mins), then four-option MCQ questions.
+                </div>
+                <div class="max-w-110 text-[12px] leading-[1.6]" style="color:var(--text-tertiary);">
+                  {summaryLanguageNote}
+                </div>
+                <button
+                  type="button"
+                  onclick={startSession}
+                  class="mt-1 flex cursor-pointer items-center gap-3 rounded-2xl px-10 py-4 text-[17px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
+                  style="background:{accent}; box-shadow:0 14px 36px -10px {accent}66;"
+                >
+                  🧠 Start Thinking <Sparkles class="size-5" />
+                </button>
+                <div class="text-[11px]" style="color:var(--text-tertiary);">
+                  Teacher: tap "Start Thinking" to pre-load. Students will see "Start Beginning" when ready.
+                </div>
+              {:else}
+                <div class="text-[18px] font-semibold" style="color:var(--ink);">No topic set for {cls?.name ?? "this class"}</div>
+                <div class="text-[13px]" style="color:var(--text-secondary);">
+                  Go to Topic Picker to select a topic for this class first.
+                </div>
+                <button
+                  type="button"
+                  onclick={() => goto(resolve("/student/topic"))}
+                  class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
+                  style="background:{accent};"
+                >
+                  Go to Topic Picker <ArrowRight class="size-4" />
+                </button>
+              {/if}
             </div>
 
           {:else if phase === "preloading"}
@@ -1304,7 +1345,7 @@
               <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
                 <div class="text-[48px]">⚠️</div>
                 <div class="text-[24px] font-semibold" style="color:var(--ink);">
-                  Could not prepare this custom topic
+                  Could not prepare this topic
                 </div>
                 <div class="max-w-110 text-[14px] leading-[1.7]" style="color:var(--text-secondary);">
                   {summaryError}
@@ -1943,35 +1984,69 @@
 <div class="fixed inset-0 z-50 flex flex-col md:hidden" style="background:#0b0d14;">
 
   {#if phase === "start"}
-    <div class="flex flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
-      <div
-        class="flex items-center gap-2 rounded-full px-4 py-2 text-[13px] font-medium"
-        style="background:{accent}22; color:{accent};"
-      >
-        {#if topic?.source === "custom"}
-          <Pencil class="size-3.5" />
-        {:else}
-          <BookOpen class="size-3.5" />
-        {/if}
-        {topic?.subject ?? "Science"}
+    <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
+      <!-- Class selector: disabled if no topic set for that class -->
+      <div class="flex flex-wrap justify-center gap-1.5">
+        {#each CLASSES as c (c.id)}
+          {@const hasTopic = reteachTopics.getSelectedTopic(c.id) !== null}
+          <button
+            type="button"
+            onclick={() => pickStartClass(c.id)}
+            disabled={!hasTopic}
+            class="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-all disabled:opacity-35 disabled:cursor-not-allowed"
+            style="{startClassId === c.id
+              ? `background:${c.color}33;border-color:${c.color};color:${c.color};`
+              : 'background:rgba(255,255,255,0.08);border-color:rgba(255,255,255,0.18);color:rgba(255,255,255,0.55);'}"
+          >
+            <span class="inline-block size-1.5 rounded-full" style="background:{c.color};"></span>
+            {c.name}
+          </button>
+        {/each}
       </div>
-      <div
-        class="text-[30px] font-semibold leading-tight tracking-tight text-white"
-        style="text-wrap:balance;"
-      >
-        {topic?.topic ?? "Today's reteach"}
-      </div>
-      <div class="text-[16px]" style="color:rgba(255,255,255,0.45);">
-        Short summary first, then four-option MCQs. Tap one option to answer.
-      </div>
-      <button
-        type="button"
-        onclick={startSession}
-        class="mt-4 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-4 text-[18px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
-        style="background:{accent}; box-shadow:0 16px 40px -12px {accent}88;"
-      >
-        🧠 Start Thinking <Sparkles class="size-5" />
-      </button>
+
+      {#if startClassId === null}
+        <div class="text-[18px] font-semibold text-white">Select a class to begin</div>
+        <div class="text-[14px]" style="color:rgba(255,255,255,0.45);">
+          Choose a class above to see its topic.
+        </div>
+      {:else if topic}
+        <div
+          class="flex items-center gap-2 rounded-full px-4 py-2 text-[13px] font-medium"
+          style="background:{accent}22; color:{accent};"
+        >
+          {cls?.name ?? "Class"}
+        </div>
+        <div
+          class="text-[26px] font-semibold leading-tight tracking-tight text-white"
+          style="text-wrap:balance;"
+        >
+          {topic.topic}
+        </div>
+        <div class="text-[14px]" style="color:rgba(255,255,255,0.45);">
+          Short summary first, then four-option MCQs. Tap one option to answer.
+        </div>
+        <button
+          type="button"
+          onclick={startSession}
+          class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-4 text-[18px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
+          style="background:{accent}; box-shadow:0 16px 40px -12px {accent}88;"
+        >
+          🧠 Start Thinking <Sparkles class="size-5" />
+        </button>
+      {:else}
+        <div class="text-[18px] font-semibold text-white">No topic set for {cls?.name ?? "this class"}</div>
+        <div class="text-[14px]" style="color:rgba(255,255,255,0.45);">
+          Go to Topic Picker to select a topic first.
+        </div>
+        <button
+          type="button"
+          onclick={() => goto(resolve("/student/topic"))}
+          class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
+          style="background:{accent};"
+        >
+          Go to Topic Picker <ArrowRight class="size-4" />
+        </button>
+      {/if}
     </div>
 
   {:else if phase === "preloading"}

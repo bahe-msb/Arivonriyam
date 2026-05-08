@@ -3,6 +3,26 @@
   import OfflineChip from "./OfflineChip.svelte";
   import UserChip from "./UserChip.svelte";
   import { Sidebar } from "@shadcn";
+  import { schoolConfig } from "@stores";
+
+  function initials(name: string): string {
+    return name
+      .trim()
+      .split(/\s+/)
+      .map((w) => w[0]?.toUpperCase() ?? "")
+      .filter(Boolean)
+      .slice(0, 2)
+      .join("");
+  }
+
+  const teacherName = $derived(schoolConfig.config.teacher_name || "Teacher");
+  const schoolName  = $derived(schoolConfig.config.school_name || "Arivonriyam");
+  const teacherInitials = $derived(initials(teacherName));
+  const roleLabel = $derived(
+    schoolConfig.config.location
+      ? `Teacher · ${schoolName}, ${schoolConfig.config.location}`
+      : `Teacher · ${schoolName}`,
+  );
 </script>
 
 <header
@@ -17,6 +37,6 @@
     <div class="hidden sm:block">
       <OfflineChip />
     </div>
-    <UserChip />
+    <UserChip name={teacherName} role={roleLabel} initials={teacherInitials} />
   </div>
 </header>

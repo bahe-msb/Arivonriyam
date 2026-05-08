@@ -176,28 +176,17 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
             images_base64: summaryImages,
             exercise_chunks: summaryExercises,
           };
-        } else if (normalized.intro.length >= 20 && normalized.content.length >= 80) {
-          // RAG content exists but formatting is incomplete (missing key_points/bridge).
-          // Repair in-place rather than discarding textbook content for a generic fallback.
+        } else if (normalized.intro.length >= 10 || normalized.content.length >= 40) {
+          // RAG content exists but may be thin or missing some fields.
+          // Repair in-place — curriculum topics must stay textbook-grounded, no Ollama fallback.
           effective = {
             ..._repairRagSummary(normalized, topic, summary.chunks_used, targetLanguage),
             images_base64: summaryImages,
             exercise_chunks: summaryExercises,
           };
         } else {
-          // Thin content — use LLM fallback with RAG context as hint.
-          effective = {
-            ...(await _fallbackSummary(
-              topic,
-              subject,
-              "curriculum",
-              classLevel,
-              _summaryToContextHint(summary),
-              targetLanguage,
-            )),
-            images_base64: summaryImages,
-            exercise_chunks: summaryExercises,
-          };
+          // Truly empty RAG output — treat as no chunks found.
+          effective = null;
         }
       } else {
         effective = null;
@@ -563,145 +552,6 @@ async function _buildCustomTopicSummary(
   );
 }
 
-async function _fallbackSummary(
-  topic: string,
-  subject: string,
-  source: string,
-  classLevel: number,
-  contextHint = "",
-  lang: SupportedLanguage = "en",
-): Promise<SummaryShape> {
-  const sourceNote =
-    source === "custom"
-      ? "This is a custom teacher-selected topic that should use simple web-friendly explanations."
-      : "This is from the standard school curriculum and must stay textbook-aligned.";
-
-  const prompt =
-    lang === "ta"
-      ? [
-          "தமிழில் மட்டும் பதிலளிக்கவும்.",
-          "நீங்கள் மென்மையான தொடக்கப்பள்ளி கற்பித்தல் உதவியாளர்.",
-          `கற்றல் நிலை: வகுப்பு ${classLevel} (India, Class 1-5).`,
-          `தலைப்பு: ${topic}`,
-          `பாடம்: ${subject}`,
-          source === "custom"
-            ? "இது ஆசிரியர் தேர்ந்தெடுத்த தனிப்பயன் தலைப்பு. எளிய web-style விளக்கம் போதுமானது."
-            : "இது பாடத்திட்டத்தில் உள்ள தலைப்பு. பாடப்புத்தக நடையைப் பின்பற்றவும்.",
-          ...(contextHint ? ["", "குறிப்பு:", contextHint] : []),
-          "",
-          "சுமார் 2-3 நிமிடங்களுக்கு ஏற்ற வகையில் குறும்படிக் குரல் சுருக்கத்தை உருவாக்கவும்.",
-          "தலைப்பை நேராகத் தொடங்கவும்.",
-          "மிக மென்மையான ஆசிரியர் நடையில் எழுதவும்; கடுமையான கட்டளை குரல் வேண்டாம்.",
-          "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
-          "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
-          "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
-          `மொத்த வார்த்தைகள் குறைந்தது ${MIN_SUMMARY_WORDS} இருக்க வேண்டும்.`,
-          "குழந்தைகள் புரியும் எளிய தமிழை மட்டும் பயன்படுத்தவும்.",
-          `வகுப்பு ${Math.min(classLevel, MAX_CLASS_LEVEL)} நிலையைத் தாண்டிய கருத்துகள் வேண்டாம்.`,
-          "இறுதியில் MCQ சுற்றுக்கான bridge வரி வேண்டும்.",
-          "",
-          "JSON keys மட்டும் intro, content, key_points, bridge ஆகவே இருக்க வேண்டும்.",
-          "Return ONLY valid JSON.",
-          '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
-        ].join("\n")
-      : [
-          "Respond only in English.",
-          "You are a calm primary school teaching assistant.",
-          `Target learners: Class ${classLevel} (India, Class 1-5).`,
-          `Topic: ${topic}`,
-          `Subject: ${subject}`,
-          sourceNote,
-          ...(contextHint ? ["", "Reference notes:", contextHint] : []),
-          "",
-          "Create a short classroom narration for about 2-3 minutes.",
-          "Start directly with the topic.",
-          "Use a soft Indian teacher tone, not a strict or commanding tone.",
-          "If you greet, use only one short greeting sentence and then continue with the summary.",
-          "Do not ask the students questions. Do not use question marks in the summary.",
-          "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
-          "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
-          `Total words must be at least ${MIN_SUMMARY_WORDS}.`,
-          "Use simple child-friendly language only.",
-          `Do not go beyond Class ${Math.min(classLevel, MAX_CLASS_LEVEL)} level concepts.`,
-          "Bridge naturally into an MCQ question round at the end.",
-          "",
-          "Return ONLY valid JSON in this exact shape:",
-          '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
-        ].join("\n");
-
-  let lastError: unknown = null;
-
-  try {
-    const generated =
-      await generateLlmJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
-    const normalized = _normalizeSummary(generated);
-    const lines = _toLines({ ...normalized, word_count: 0, chunks_used: 0 });
-    const words = _countWords(lines);
-    // Accept any response with real content
-    if (normalized.content.length >= 60) {
-      return {
-        ...normalized,
-        word_count: words,
-        chunks_used: 0,
-      };
-    }
-  } catch (error) {
-    lastError = error;
-    // JSON mode failed — try plain text below.
-  }
-
-  // --- Fallback: plain-text LLM call ---
-  try {
-    const textPrompt =
-      lang === "ta"
-        ? [
-            "தமிழில் மட்டும் பதிலளிக்கவும்.",
-            `வகுப்பு ${classLevel} மாணவர்களுக்கு "${topic}" (${subject}) பற்றி 3-4 பத்திகளில் எளிமையாக விளக்குங்கள்.`,
-            "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
-            "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
-            "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
-            ...(contextHint ? ["", "குறிப்பு:", contextHint.slice(0, 800)] : []),
-          ].join("\n")
-        : [
-            `Explain "${topic}" (${subject}) for Class ${classLevel} students in 3-4 simple paragraphs.`,
-            "Use a warm teacher tone and daily-life examples.",
-            "Do not ask the students questions. Do not use question marks.",
-            "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
-            "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
-            ...(contextHint ? ["", "Reference notes:", contextHint.slice(0, 800)] : []),
-          ].join("\n");
-
-    const raw =
-      lang === "ta"
-        ? await generateTamilResponse(textPrompt)
-        : await generateLlmResponse(textPrompt);
-
-    if (raw && raw.trim().length >= 40) {
-      const shape = _textToSummaryShape(raw, topic, lang);
-      const lines = _toLines({ ...shape, word_count: 0, chunks_used: 0 });
-      return { ...shape, word_count: _countWords(lines), chunks_used: 0 };
-    }
-  } catch (error) {
-    lastError = error;
-    // Fall through to context-based fallback.
-  }
-
-  if (contextHint.trim()) {
-    const shape = _textToSummaryShape(contextHint, topic, lang);
-    const lines = _toLines({ ...shape, word_count: 0, chunks_used: 0 });
-    return { ...shape, word_count: _countWords(lines), chunks_used: 0 };
-  }
-
-  if (lastError instanceof AppError) throw lastError;
-
-  throw new AppError(
-    lang === "ta"
-      ? `"${topic}" தலைப்புக்கான சுருக்கத்தை Ollama உருவாக்க முடியவில்லை.`
-      : `Ollama could not generate a summary for "${topic}".`,
-    502,
-    "ollama",
-  );
-}
 
 async function _buildQuestionBank(
   topic: string,
@@ -1107,14 +957,6 @@ function _compactPreviewCaption(text: string, topic: string, subject: string): s
   return `${words.slice(0, 18).join(" ")}...`;
 }
 
-function _summaryToContextHint(value: Partial<SummaryShape>): string {
-  const normalized = _normalizeSummary(value);
-  return [normalized.intro, normalized.content, ...normalized.key_points, normalized.bridge]
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .join("\n")
-    .slice(0, 2400);
-}
 
 function _tightenSummaryOpening(
   summary: SummaryShape,

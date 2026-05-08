@@ -98,6 +98,18 @@ class SessionAlertsStore {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(this.records));
   }
 
+  private async syncToServer(sessionId: string, records: SessionAlertRecord[]): Promise<void> {
+    try {
+      await fetch("/api/alerts/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, records }),
+      });
+    } catch {
+      // Non-fatal — local copy is authoritative for the current session
+    }
+  }
+
   replaceSession(sessionId: string, nextRecords: SessionAlertRecord[]): void {
     const fresh = nextRecords.filter((record) => record.sessionId === sessionId);
     const preserved = this.records.filter((record) => record.sessionId !== sessionId);
@@ -109,6 +121,7 @@ class SessionAlertsStore {
     });
 
     this.persist();
+    void this.syncToServer(sessionId, fresh);
   }
 
   count(): number {
