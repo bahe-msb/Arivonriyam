@@ -21,6 +21,7 @@ from langchain_ollama import ChatOllama
 
 from retriever import HybridRetriever
 from utils.language_detect import detect_dominant_language
+from db import get_page_images
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +78,31 @@ def _hyde_expand(query: str) -> str:
         return query
 
 
+_CONTENT_MARKERS = ("content:", "Content:", "உள்ளடக்கம்:")
+
+
+def _strip_hyde_prefix(text: str) -> str:
+    """Remove the 'question: X\\n\\ncontent: Y' wrapper stored for HyDE embedding.
+
+    The question prefix improves cosine matching during retrieval but must be
+    stripped before the text is sent to the summarizer LLM — otherwise it
+    hallucinates Q&A instead of narrating the actual lesson content.
+    """
+    for marker in _CONTENT_MARKERS:
+        idx = text.find(marker)
+        if idx != -1:
+            clean = text[idx + len(marker):].strip()
+            if clean:
+                return clean
+    return text
+
+
 def _doc_to_chunk(doc, score: float = 1.0) -> Dict[str, Any]:
     """Convert a LangChain Document to the JSON shape Node.js expects."""
     meta = doc.metadata
-    # The new pipeline stores flat metadata — no original_content JSON blob.
-    # Use page_content directly (full text, not truncated).
-    raw_text = doc.page_content
+    # Prefer metadata["raw_text"] (stored clean by enricher since v2).
+    # Fall back to stripping the HyDE prefix from page_content for older data.
+    raw_text = meta.get("raw_text") or _strip_hyde_prefix(doc.page_content)
     language = (
         meta.get("dominant_language")
         or meta.get("language")
@@ -114,14 +134,32 @@ def _build_filters(class_name: str, subject: str) -> dict | None:
     return None
 
 
-def _search(query: str, class_name: str, subject: str, top_k: int) -> List[Dict[str, Any]]:
+def _search(
+    query: str,
+    class_name: str,
+    subject: str,
+    top_k: int,
+    min_cosine: float = 0.20,
+) -> List[Dict[str, Any]]:
     retriever = _get_retriever()
     filters = _build_filters(class_name, subject)
     t0 = time.time()
     try:
-        docs = retriever.retrieve(query, filters=filters, top_k=top_k, dense_candidates=top_k * 4)
-        logger.info("Hybrid search: %d results in %.1fs", len(docs), time.time() - t0)
-        return [_doc_to_chunk(doc) for doc in docs]
+        hits = retriever.retrieve(
+            query,
+            filters=filters,
+            top_k=top_k,
+            dense_candidates=top_k * 5,
+            min_cosine=min_cosine,
+        )
+        logger.info(
+            "Hybrid search: %d results in %.1fs (best cosine=%.3f)",
+            len(hits),
+            time.time() - t0,
+            hits[0][1] if hits else 0,
+        )
+        return [_doc_to_chunk(doc, doc.metadata.get("_cosine_score", score))
+                for doc, score in hits]
     except Exception as e:
         logger.warning("Hybrid search failed: %s", e)
         return []
@@ -140,18 +178,50 @@ def chapter_retrieve(class_name: str, subject: str, chapter: str, top_k: int = 8
     return result
 
 
-def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 12) -> List[Dict[str, Any]]:
+def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 14) -> List[Dict[str, Any]]:
     t0 = time.time()
     language = _detect_language(topic)
     logger.info("topic_retrieve: class=%s subject=%s topic=%r lang=%s top_k=%d",
                 class_name, subject, topic, language, top_k)
+
+    # HyDE expansion: ask for a child-friendly explanation to anchor the query
+    # vector near explanatory content rather than question/exercise text.
     expanded = _hyde_expand(
         f"{topic} பற்றி தொடக்கப்பள்ளி மாணவருக்கு எளிதாக விளக்கவும்."
         if language == "ta"
-        else f"Explain {topic} in detail for a primary school student."
+        else f"Explain {topic} clearly for a primary school student with examples."
     )
-    result = _search(expanded, class_name, subject, top_k)
-    logger.info("topic_retrieve done: %d chunks in %.1fs total", len(result), time.time() - t0)
+
+    result = _search(expanded, class_name, subject, top_k, min_cosine=0.18)
+
+    # Re-rank: chunks from a chapter whose title contains the topic keyword
+    # are almost certainly on-topic — move them to the front.
+    topic_lower = topic.lower()
+    on_topic = [c for c in result
+                if topic_lower in (c.get("chapter") or "").lower()
+                or topic_lower in c.get("text", "").lower()[:120]]
+    off_topic = [c for c in result if c not in on_topic]
+    result = on_topic + off_topic
+
+    # Sort within the on-topic group by page number so the LLM reads the
+    # section in book order (narrative coherence matters for summarization).
+    if on_topic:
+        on_topic.sort(key=lambda c: c.get("page", 0))
+
+    # Attach extracted images for the pages covered by retrieved chunks
+    if result and class_name and subject:
+        pages = list({c["page"] for c in result if c.get("page")})
+        if pages:
+            img_rows = get_page_images(class_name, subject, pages, limit=6)
+            page_img_map: dict[int, list[str]] = {}
+            for row in img_rows:
+                page_img_map.setdefault(row["page_number"], []).append(row["image_b64"])
+            for chunk in result:
+                pg = chunk.get("page", 0)
+                chunk["images_base64"] = page_img_map.get(pg, [])
+
+    logger.info("topic_retrieve done: %d chunks in %.1fs total (on_topic=%d)",
+                len(result), time.time() - t0, len(on_topic))
     return result
 
 

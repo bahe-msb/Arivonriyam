@@ -1,13 +1,13 @@
 """Modular ingestion pipeline.
 
 Stages per PDF:
-  1. partition  — Unstructured PDF extraction (auto strategy)
+  1. partition  — Unstructured PDF extraction (hi_res, image payloads inline)
   2. preprocess — OCR cleanup, structural tagging, language detection
   3. chunk      — Semantic/pedagogical chunking
   4. enrich     — Structural metadata + optional Ollama question generation
   5. postprocess — Quality filtering, normalization
-  6. store      — Embed (BGE-M3) + upsert into SQLite vector store
-  7. log        — write ingestion_log + manifest to shared SQLite
+  6. store      — Embed (BGE-M3) + upsert into pgvector
+  7. log        — write ingestion_log + manifest to PostgreSQL
 """
 
 import hashlib
@@ -34,7 +34,7 @@ from typing import List
 from langchain_core.documents import Document
 from unstructured.partition.pdf import partition_pdf
 
-from db import init_db, log_ingestion, upsert_chapters, is_ingested
+from db import init_db, log_ingestion, upsert_chapters, is_ingested, upsert_pdf_images
 from embeddings import get_embedding_model
 from preprocessor import TextPreprocessor
 from chunker import SemanticChunker
@@ -46,9 +46,7 @@ logger = logging.getLogger(__name__)
 
 _BASE = Path(__file__).parent.parent
 
-VEC_DB_PATH = _BASE / "data" / "vectors.db"  # SQLite fallback path
-COLLECTION  = "mm_rag_pipeline"
-
+COLLECTION    = "mm_rag_pipeline"
 OCR_LANGUAGES = ["eng", "tam"]
 
 # Shared dedup hash set across the process lifetime
@@ -60,10 +58,7 @@ _vec_store = None
 def get_vectorstore():
     global _vec_store
     if _vec_store is None:
-        _vec_store = get_vector_store(
-            embedding_function=get_embedding_model(),
-            sqlite_fallback_path=VEC_DB_PATH,
-        )
+        _vec_store = get_vector_store(embedding_function=get_embedding_model())
     return _vec_store
 
 
@@ -72,22 +67,97 @@ def partition_document(file_path: str):
     import time
     logger.info("Partitioning: %s", file_path)
     t0 = time.time()
-    # "auto" strategy: uses fast pdfminer text extraction for digital PDFs,
-    # only falls back to hi_res OCR for scanned/image-only pages.
-    # "hi_res" takes 10-60 min for 10 pages; "auto" takes seconds for digital PDFs.
     elements = partition_pdf(
         filename=file_path,
-        strategy="auto",
+        strategy="hi_res",
         languages=OCR_LANGUAGES,
         infer_table_structure=True,
+        extract_image_block_types=["Image", "FigureCaption"],
+        extract_image_block_to_payload=True,
     )
-    logger.info("  %d elements extracted in %.1fs", len(elements), time.time() - t0)
+    n_images = sum(1 for e in elements if type(e).__name__ in {"Image", "FigureCaption"})
+    n_tables = sum(1 for e in elements if type(e).__name__ == "Table")
+    logger.info(
+        "  %d `elements extracted in` %.1fs (%d images, %d tables)",
+        len(elements), time.time() - t0, n_images, n_tables,
+    )
     return elements
+
+
+def _extract_pdf_images(pdf_path: Path, min_px: int = 300, max_images: int = 30) -> list[dict]:
+    """Extract embedded images from a PDF using PyMuPDF.
+
+    min_px filters out small icons/logos — only real figures (diagrams, charts) pass through.
+    """
+    try:
+        import fitz
+        import base64
+    except ImportError:
+        logger.warning("pymupdf not installed — skipping image extraction")
+        return []
+
+    results: list[dict] = []
+    try:
+        doc = fitz.open(str(pdf_path))
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            for img_idx, img_ref in enumerate(page.get_images(full=True)):
+                xref = img_ref[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    w, h = base_image["width"], base_image["height"]
+                    if w < min_px or h < min_px:
+                        continue
+                    b64 = base64.b64encode(base_image["image"]).decode("ascii")
+                    results.append({
+                        "page_number": page_num + 1,
+                        "img_index":   img_idx,
+                        "width":       w,
+                        "height":      h,
+                        "image_b64":   b64,
+                    })
+                    if len(results) >= max_images:
+                        doc.close()
+                        return results
+                except Exception:
+                    continue
+        doc.close()
+    except Exception as e:
+        logger.warning("Image extraction failed for %s: %s", pdf_path.name, e)
+    return results
 
 
 # ── stage 2–5: new pipeline ───────────────────────────────────────────────────
 _preprocessor = TextPreprocessor()
 _chunker      = SemanticChunker()
+
+
+def _build_chapter_map(elements) -> dict[int, tuple[str, int]]:
+    """Return page_number → (chapter_title, chapter_number) by scanning Title elements.
+
+    We walk the element list in order; every Title element starts a new chapter.
+    Non-Title elements inherit the most-recently-seen chapter.
+    """
+    page_chapter: dict[int, tuple[str, int]] = {}
+    current_title = ""
+    current_number = 0
+    chapter_seq = 0
+
+    for el in elements:
+        page = getattr(el, "metadata", None)
+        page_num = int(page.page_number) if page and page.page_number else 0
+
+        if type(el).__name__ == "Title":
+            txt = (getattr(el, "text", "") or "").strip()
+            if len(txt) >= 3:
+                chapter_seq += 1
+                current_title = txt
+                current_number = chapter_seq
+
+        if page_num not in page_chapter:
+            page_chapter[page_num] = (current_title, current_number)
+
+    return page_chapter
 
 
 def build_documents(
@@ -100,18 +170,19 @@ def build_documents(
     """Run preprocess → chunk → enrich → postprocess and return LangChain Documents."""
     standard = _parse_standard(class_name)
 
-    # Detect chapter from Title elements (first one wins)
-    chapter_title = ""
-    chapter_number = 0
-    for el in elements:
-        if type(el).__name__ == "Title":
-            txt = (getattr(el, "text", "") or "").strip()
-            if len(txt) >= 3:
-                chapter_title = txt
-                break
+    # Build page → (chapter_title, chapter_number) map so each chunk gets
+    # the correct chapter, not just the first Title in the entire PDF.
+    chapter_map = _build_chapter_map(elements)
 
     preprocessed = _preprocessor.preprocess(elements)
     chunks       = _chunker.chunk(preprocessed)
+
+    # Inject per-chunk chapter metadata before enrichment
+    for chunk in chunks:
+        pg = chunk.get("page_number", 0)
+        ch_title, ch_num = chapter_map.get(pg, ("", 0))
+        chunk.setdefault("chapter_title", ch_title)
+        chunk.setdefault("chapter_number", ch_num)
 
     enricher = MetadataEnricher(generate_questions=generate_questions)
     docs = enricher.enrich(
@@ -119,8 +190,8 @@ def build_documents(
         source_file=source_file,
         subject=subject,
         standard=standard,
-        chapter_title=chapter_title,
-        chapter_number=chapter_number,
+        chapter_title="",   # per-chunk chapter_title now set above
+        chapter_number=0,
     )
 
     postprocessor = PostProcessor(seen_hashes=_seen_hashes)
@@ -135,7 +206,7 @@ def build_documents(
 # ── stage 6: store ────────────────────────────────────────────────────────────
 
 def store_documents(docs: List[Document]) -> None:
-    """Embed all docs in one shot, then write to SQLite vector store."""
+    """Embed all docs in one shot, then write to pgvector."""
     total = len(docs)
     logger.info("  Embedding %d chunks (single pass)...", total)
 
@@ -217,6 +288,13 @@ def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = T
     chapters = _extract_chapters(docs)
     upsert_chapters(class_name, subject, chapters)
     log_ingestion(class_name, subject, pdf_path.name, len(docs), file_hash)
+
+    t0 = time.time()
+    images = _extract_pdf_images(pdf_path)
+    if images:
+        upsert_pdf_images(class_name, subject, pdf_path.name, images)
+        logger.info("  [images] stored %d images (PyMuPDF) in %.1fs", len(images), time.time() - t0)
+
     logger.info("  %d chunks, %d chapters — total %.1fs", len(docs), len(chapters), time.time() - t_start)
     return len(docs)
 

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppError } from "../lib/errors";
-import { getDb } from "../lib/db";
+import { getPgPool } from "../lib/pgdb";
 import { generateLlmJson, retrieveTextbookChunks, type RetrieverChunk } from "../repositories";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -36,30 +36,25 @@ const titleCase = (slug: string): string =>
 
 const isSafe = (v: string): boolean => /^[a-z0-9_-]+$/i.test(v);
 
-// ── manifest queries (SQLite, synchronous) ────────────────────────────────────
+// ── manifest queries (PostgreSQL, async) ─────────────────────────────────────
 
 /**
- * Subjects available for a class.
- * Primary source: SQLite manifest (populated after ingestion).
- * Fallback: PDF folder scan (so subjects show immediately when PDFs are placed,
- *           even before ingestion has been run).
+ * Subjects available for a class — queries the PostgreSQL manifest table.
+ * Falls back to PDF folder scan if the manifest has no rows yet.
  */
-export function listSubjects(className: string): SubjectOption[] {
+export async function listSubjects(className: string): Promise<SubjectOption[]> {
   if (!isSafe(className)) throw new AppError("Invalid class name.", 400, "lesson");
 
-  // Try SQLite manifest first (has richer data post-ingestion).
-  // If SQLite is unavailable (for example native bindings mismatch),
-  // continue to PDF fallback instead of failing the subjects endpoint.
   try {
-    const rows = getDb()
-      .prepare("SELECT DISTINCT subject FROM manifest WHERE class_name = ? ORDER BY subject")
-      .all(className) as { subject: string }[];
-
+    const { rows } = await getPgPool().query<{ subject: string }>(
+      "SELECT DISTINCT subject FROM manifest WHERE class_name = $1 ORDER BY subject",
+      [className],
+    );
     if (rows.length > 0) {
       return rows.map((r) => ({ id: r.subject, label: titleCase(r.subject) }));
     }
   } catch {
-    // Intentionally ignore manifest errors so class subjects can still be listed from PDFs.
+    // fall through to PDF scan
   }
 
   // Fallback: scan the PDF folder so subjects appear before ingestion runs.
@@ -78,18 +73,16 @@ export function listSubjects(className: string): SubjectOption[] {
   }
 }
 
-/** Chapter titles for (class, subject) — read directly from the shared SQLite manifest. */
-export function listChapters(className: string, subject: string): string[] {
+/** Chapter titles for (class, subject) — read from the PostgreSQL manifest. */
+export async function listChapters(className: string, subject: string): Promise<string[]> {
   if (!isSafe(className) || !isSafe(subject)) {
     throw new AppError("Invalid class or subject.", 400, "lesson");
   }
 
-  const rows = getDb()
-    .prepare(
-      "SELECT chapter FROM manifest WHERE class_name = ? AND subject = ? ORDER BY chapter_order",
-    )
-    .all(className, subject) as { chapter: string }[];
-
+  const { rows } = await getPgPool().query<{ chapter: string }>(
+    "SELECT chapter FROM manifest WHERE class_name = $1 AND subject = $2 ORDER BY chapter_order",
+    [className, subject],
+  );
   return rows.map((r) => r.chapter);
 }
 

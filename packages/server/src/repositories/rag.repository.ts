@@ -33,6 +33,8 @@ export interface TopicSummary {
   bridge: string;
   word_count: number;
   chunks_used: number;
+  images_base64?: string[];
+  exercise_chunks?: Array<{ text: string; page: number }>;
 }
 
 // ── shared subprocess helper ──────────────────────────────────────────────────

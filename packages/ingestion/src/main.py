@@ -1,7 +1,7 @@
 """RAG pipeline CLI.
 
 Commands:
-  ingest [--force]                       Ingest all PDFs → ChromaDB + SQLite
+  ingest [--force]                       Ingest all PDFs → pgvector + PostgreSQL
   retrieve --class X --subject Y         Chapter-wise retrieval → JSON stdout
            --chapter Z [--top-k N]
   summarize --class X --subject Y        Topic summarization → JSON stdout
@@ -56,6 +56,13 @@ if __name__ == "__main__":
     p_query.add_argument("question", nargs="+")
 
     args = parser.parse_args()
+
+    # Ensure PostgreSQL schema exists for every command
+    import logging
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(levelname)s %(name)s: %(message)s")
+    from db import init_db
+    init_db()
 
     if args.cmd == "ingest":
         from ingest import run_ingestion

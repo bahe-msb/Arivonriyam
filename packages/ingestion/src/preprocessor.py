@@ -78,6 +78,21 @@ class TextPreprocessor:
                 "orig": element,
             }
 
+        # Image and figure-caption elements — keep as diagram_caption regardless of text length
+        if etype_name in ("Image", "FigureCaption"):
+            caption = raw_text.strip() or f"[Figure on page {page}]"
+            image_b64 = getattr(meta, "image_base64", None) if meta else None
+            return {
+                "text": caption,
+                "element_type": ElementType.DIAGRAM_CAPTION,
+                "dominant_language": DominantLanguage.BILINGUAL,
+                "is_math_expression": False,
+                "page_number": page,
+                "unstructured_type": etype_name,
+                "image_b64": image_b64,
+                "orig": element,
+            }
+
         cleaned = clean(raw_text)
 
         if len(cleaned.strip()) < 20:

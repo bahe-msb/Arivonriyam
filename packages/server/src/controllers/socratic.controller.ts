@@ -29,6 +29,8 @@ interface SummaryShape {
   bridge: string;
   word_count: number;
   chunks_used: number;
+  images_base64?: string[];
+  exercise_chunks?: Array<{ text: string; page: number }>;
 }
 
 interface WikiSearchResponse {
@@ -152,22 +154,44 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
         });
         const words = _countWords(candidateLines);
 
+        // Carry images and exercises from the retrieval pipeline
+        const summaryImages = Array.isArray(summary.images_base64)
+          ? summary.images_base64.filter(Boolean)
+          : [];
+        const summaryExercises = Array.isArray(summary.exercise_chunks)
+          ? summary.exercise_chunks
+          : [];
+
         if (_isSummaryUsable(normalized, words)) {
           effective = {
             ...normalized,
             word_count: words,
             chunks_used: summary.chunks_used,
+            images_base64: summaryImages,
+            exercise_chunks: summaryExercises,
+          };
+        } else if (normalized.intro.length >= 20 && normalized.content.length >= 80) {
+          // RAG content exists but formatting is incomplete (missing key_points/bridge).
+          // Repair in-place rather than discarding textbook content for a generic fallback.
+          effective = {
+            ..._repairRagSummary(normalized, topic, summary.chunks_used, targetLanguage),
+            images_base64: summaryImages,
+            exercise_chunks: summaryExercises,
           };
         } else {
-          // Keep curriculum source and use summary text as hint for a stronger fallback.
-          effective = await _fallbackSummary(
-            topic,
-            subject,
-            "curriculum",
-            classLevel,
-            _summaryToContextHint(summary),
-            targetLanguage,
-          );
+          // Thin content — use LLM fallback with RAG context as hint.
+          effective = {
+            ...(await _fallbackSummary(
+              topic,
+              subject,
+              "curriculum",
+              classLevel,
+              _summaryToContextHint(summary),
+              targetLanguage,
+            )),
+            images_base64: summaryImages,
+            exercise_chunks: summaryExercises,
+          };
         }
       } else {
         effective = null;
@@ -210,6 +234,7 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
       classLevel,
       sourceMode,
       targetLanguage,
+      effective.exercise_chunks ?? [],
     );
 
     res.json({
@@ -584,8 +609,18 @@ async function _buildQuestionBank(
   classLevel: number,
   source: string,
   lang: SupportedLanguage,
+  exerciseChunks: Array<{ text: string; page: number }> = [],
 ): Promise<SocraticQuestion[]> {
   const summaryText = lines.join("\n\n").slice(0, 6000);
+  const exerciseText = exerciseChunks
+    .map((e, i) => `[Exercise ${i + 1}, page ${e.page}]\n${e.text}`)
+    .join("\n\n")
+    .slice(0, 2000);
+  const exerciseNote = exerciseText
+    ? lang === "ta"
+      ? `\n\nபாடப்புத்தகப் பயிற்சிக் கேள்விகள் (இவற்றிலிருந்தும் MCQ உருவாக்கலாம்):\n${exerciseText}`
+      : `\n\nTextbook exercise questions (you may also create MCQs from these):\n${exerciseText}`
+    : "";
   const prompt =
     lang === "ta"
       ? [
@@ -596,7 +631,7 @@ async function _buildQuestionBank(
           `Source mode: ${source}`,
           "",
           "இந்தச் சுருக்கத்தில் உள்ள கருத்துகளை மட்டும் பயன்படுத்தவும்:",
-          summaryText,
+          summaryText + exerciseNote,
           "",
           `மொத்தம் சரியாக ${questionCount} வேறுபட்ட கேள்விகளை உருவாக்கவும்.`,
           "கேள்வி விதிகள்:",
@@ -617,23 +652,26 @@ async function _buildQuestionBank(
         ].join("\n")
       : [
           "Respond only in English.",
-          `You are creating MCQ questions for Class ${classLevel} primary students.`,
+          `You are creating fun, interactive MCQ questions for Class ${classLevel} primary students (under 5 years old).`,
           `Topic: ${topic}`,
           `Subject: ${subject}`,
           `Source mode: ${source}`,
           "",
           "Use only ideas that appear in this summary:",
-          summaryText,
+          summaryText + exerciseNote,
           "",
           `Create exactly ${questionCount} distinct questions.`,
           "Question rules:",
           "- Focus only on topic content (definition, fact, formula/basic relation if present, example, simple application).",
           "- Do NOT ask teaching-process or meta questions (for example: 'core idea', 'why question rounds', 'answer style').",
           "- Keep each question short and child-friendly (max 16 words).",
-          "- Keep options concrete and easy to read.",
+          "- Use emojis in questions and options to make them fun and visual (e.g., '🍎 + 🍎 = ?' for math).",
+          "- For math: use emoji visuals instead of plain numbers when possible.",
+          "- Keep options concrete, easy to read, and visually distinct.",
+          "- If textbook exercise questions are provided, adapt them into MCQ format.",
           "",
           "For each question provide:",
-          "- q: one clear question",
+          "- q: one clear, fun question with emojis where appropriate",
           "- options: exactly 4 short options (no A/B/C/D labels, no 'all/none of the above')",
           "- answerIndex: index of the correct option (0 to 3)",
           "- explain: one short reason why that option is correct",
@@ -1131,6 +1169,58 @@ function _buildOptions(
   const answerIndex = seed % 4;
   options.splice(answerIndex, 0, correct.trim());
   return { options, answerIndex };
+}
+
+function _extractKeyPoints(
+  text: string,
+  topic: string,
+  count: number,
+  lang: SupportedLanguage,
+): string[] {
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => {
+      const words = s.split(/\s+/).filter(Boolean).length;
+      return words >= 5 && words <= 25;
+    });
+
+  const result = sentences.slice(0, count);
+
+  const pad =
+    lang === "ta"
+      ? `${topic} பற்றிய முக்கியமான விவரங்களை நினைவில் கொள்ளவும்.`
+      : `Remember the key details about ${topic} from the lesson.`;
+  while (result.length < count) result.push(pad);
+  return result;
+}
+
+function _repairRagSummary(
+  normalized: Omit<SummaryShape, "word_count" | "chunks_used">,
+  topic: string,
+  chunksUsed: number,
+  lang: SupportedLanguage,
+): SummaryShape {
+  const keyPoints =
+    normalized.key_points.length >= 3
+      ? normalized.key_points
+      : _extractKeyPoints(normalized.intro + "\n" + normalized.content, topic, 3, lang);
+
+  const bridge =
+    normalized.bridge.length >= 10
+      ? normalized.bridge
+      : lang === "ta"
+        ? `சரி. இப்போது ${topic} பற்றி சில கேள்விகளுக்கு பதில் சொல்லுவோம்.`
+        : `Great. Now let us answer a few questions about ${topic}.`;
+
+  const repaired = {
+    intro: normalized.intro,
+    content: normalized.content,
+    key_points: keyPoints,
+    bridge,
+  };
+  const lines = _toLines({ ...repaired, word_count: 0, chunks_used: 0 });
+  return { ...repaired, word_count: _countWords(lines), chunks_used: chunksUsed };
 }
 
 function _deterministicSummary(

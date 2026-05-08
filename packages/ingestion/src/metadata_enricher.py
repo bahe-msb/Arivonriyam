@@ -173,12 +173,16 @@ class MetadataEnricher:
             else:
                 tq, eq, kw = "", "", []
 
+            # Per-chunk chapter overrides the document-level fallback
+            eff_chapter_title  = chunk.get("chapter_title")  or chapter_title
+            eff_chapter_number = chunk.get("chapter_number") or chapter_number
+
             meta = ChunkMeta(
                 source_file=source_file,
                 subject=subject,
                 standard=standard,
-                chapter_number=chapter_number,
-                chapter_title=chapter_title,
+                chapter_number=eff_chapter_number,
+                chapter_title=eff_chapter_title,
                 page_number=chunk.get("page_number", 0),
                 element_type=chunk["element_type"],
                 dominant_language=lang,
@@ -191,7 +195,10 @@ class MetadataEnricher:
                 keywords=kw,
             )
 
-            # Prepend the question in the chunk's own language for embedding quality
+            # page_content = HyDE-enriched text (question + clean content) so
+            # that cosine similarity matches well during retrieval.
+            # The raw clean text is also stored in metadata["raw_text"] so
+            # retrieve.py can surface it to the summarizer without the prefix.
             question = tq or eq
             prefix_label = "கேள்வி" if lang == DominantLanguage.TAMIL else "Question"
             enriched = (
@@ -203,8 +210,8 @@ class MetadataEnricher:
             )
 
             flat = meta.model_dump()
-            # ChromaDB metadata must be flat scalars — serialize list fields
             flat["keywords"] = ",".join(flat.get("keywords") or [])
+            flat["raw_text"] = chunk["text"]   # clean text without HyDE prefix
             docs.append(Document(page_content=enriched, metadata=flat))
 
         logger.info("Enrichment done: %d docs in %.1fs", len(docs), time.time() - t_enrich_start)

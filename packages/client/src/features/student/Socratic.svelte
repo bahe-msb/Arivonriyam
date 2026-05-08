@@ -4,7 +4,6 @@
   import { onDestroy, tick } from "svelte";
   import {
     ArrowRight,
-    Clock3,
     RotateCcw,
     BookOpen,
     Image as ImageIcon,
@@ -14,7 +13,6 @@
     CheckCircle2,
     Shapes,
     Sparkles,
-    Volume2,
     XCircle,
   } from "lucide-svelte";
   import { Button } from "@shadcn";
@@ -40,6 +38,7 @@
     questions?: SessionQuestion[];
     error?: string;
     language?: "en" | "ta";
+    images_base64?: string[];
   };
 
   type PreviewCard = {
@@ -73,16 +72,11 @@
     explain: string;
   };
 
-  type Phase = "start" | "summarizing" | "session" | "complete";
+  type Phase = "start" | "preloading" | "ready" | "summarizing" | "session" | "complete";
 
   const QUESTIONS_PER_STUDENT = 6;
   const PROGRESS_SEGMENTS = 6;
-  const AUTO_ADVANCE_MS = 1800;
-  const QUESTION_TIME_LIMIT_SEC = 12;
-  const QUESTION_PROMPT_MAX_MS = 14000;
-  const SUMMARY_WORDS_PER_MINUTE = 130;
-  const MIN_SUMMARY_STEP_MS = 1200;
-  const MAX_SUMMARY_STEP_MS = 7000;
+  const AUTO_ADVANCE_MS = 5000;
   const FALLBACK_EMOJIS = ["🦁", "🌻", "🦚", "🌙"];
   const OPTION_LABELS = ["A", "B", "C", "D"] as const;
 
@@ -118,16 +112,12 @@
   let summaryPreviewLoading = $state(false);
   let sessionId = $state("");
   let sessionAttempts = $state<SessionAttempt[]>([]);
+  let summaryImages = $state<string[]>([]);
 
   let questionPlan = $state<SessionTurn[]>([]);
   let autoAdvanceTimer: ReturnType<typeof setTimeout> | null = null;
+  let mcqTtsGeneration = 0;
   let summaryFlowTimer: ReturnType<typeof setTimeout> | null = null;
-  let activeSummaryUtterance: SpeechSynthesisUtterance | null = null;
-  let activeQuestionUtterance: SpeechSynthesisUtterance | null = null;
-  let questionSpeechTimer: ReturnType<typeof setTimeout> | null = null;
-  let questionCountdownTimer: ReturnType<typeof setInterval> | null = null;
-  let questionSecondsLeft = $state(QUESTION_TIME_LIMIT_SEC);
-  let questionPromptStatus = $state<"idle" | "reading" | "timed">("idle");
   let summaryRunId = 0;
 
   let desktopSummaryStageEl = $state<HTMLDivElement | null>(null);
@@ -176,22 +166,6 @@
   const isFinalTurn = $derived(questionPlan.length > 0 && qIdx >= questionPlan.length - 1);
   const struggleCount = $derived(
     students.filter((_, idx) => sessionAttempts.some((attempt) => attempt.studentIdx === idx && !attempt.correct)).length,
-  );
-  const questionCountdownPercent = $derived(
-    Math.max(0, Math.min(100, (questionSecondsLeft / QUESTION_TIME_LIMIT_SEC) * 100)),
-  );
-  const questionPromptText = $derived(
-    questionPromptStatus === "reading"
-      ? sessionLanguage === "ta"
-        ? `${activeStudent?.name ?? "மாணவர்"} கேள்வியை கேட்டு வருகிறார்`
-        : `${activeStudent?.name ?? "Student"} is hearing the question`
-      : questionPromptStatus === "timed"
-        ? sessionLanguage === "ta"
-          ? `${questionSecondsLeft} விநாடிகளில் ஒரு பதிலைத் தொடு`
-          : `${questionSecondsLeft}s to tap one option`
-        : sessionLanguage === "ta"
-          ? "இன்னும் யோசிக்கிறாயா? தயார் ஆனபின் தொடு."
-          : "Still thinking? Tap when ready.",
   );
   const sessionLanguageLabel = $derived(sessionLanguage === "ta" ? "Tamil" : "English");
   const headerLanguageLabel = $derived(
@@ -302,16 +276,6 @@
     });
   }
 
-  function summaryLineDelayMs(line: string, maxMs = MAX_SUMMARY_STEP_MS): number {
-    const words = line
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean).length;
-    const perWordMs = Math.round(60000 / SUMMARY_WORDS_PER_MINUTE);
-    const estimated = words * perWordMs;
-    return Math.max(MIN_SUMMARY_STEP_MS, Math.min(maxMs, estimated));
-  }
-
   function buildSessionRequestBody(): Record<string, unknown> {
     return {
       topic: topic?.topic ?? "this topic",
@@ -415,7 +379,7 @@
     if (toneIndex === 2) {
       return {
         label: "Ready",
-        icon: Volume2,
+        icon: Lightbulb,
         cardBackground: "#eefcf2",
         cardBorder: "#c9eed6",
         chipBackground: "#d7f6e0",
@@ -495,20 +459,6 @@
       chipColor: "#7d6222",
       trailColor: "#d6c086",
     };
-  }
-
-  function buildQuestionPrompt(turn: SessionTurn, studentName: string): string {
-    const options = turn.options
-      .map((option, idx) =>
-        sessionLanguage === "ta"
-          ? `${OPTION_LABELS[idx] ?? idx + 1} விருப்பு, ${option}.`
-          : `Option ${OPTION_LABELS[idx] ?? idx + 1}, ${option}.`,
-      )
-      .join(" ");
-
-    return sessionLanguage === "ta"
-      ? `${studentName}, கவனமாக கேள். இப்போது உன் கேள்வி வருகிறது. ${turn.q}. நான் விருப்பங்களை மெதுவாக வாசிக்கிறேன். ${options} அவசரம் வேண்டாம். உனக்கு ${QUESTION_TIME_LIMIT_SEC} விநாடிகள் உள்ளன. தயார் ஆனபின் சரியான பதிலைத் தொடு.`
-      : `${studentName}, listen carefully. Here is your question. ${turn.q}. I will read the options slowly. ${options} Take your time. You have ${QUESTION_TIME_LIMIT_SEC} seconds. Tap the correct answer when you are ready.`;
   }
 
   function createSessionId(): string {
@@ -625,54 +575,6 @@
     }
   }
 
-  function clearQuestionSpeechTimer(): void {
-    if (questionSpeechTimer !== null) {
-      clearTimeout(questionSpeechTimer);
-      questionSpeechTimer = null;
-    }
-  }
-
-  function clearQuestionCountdownTimer(): void {
-    if (questionCountdownTimer !== null) {
-      clearInterval(questionCountdownTimer);
-      questionCountdownTimer = null;
-    }
-  }
-
-  function getSpeechApi(): SpeechSynthesis | null {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return null;
-    return window.speechSynthesis;
-  }
-
-  function pickSummaryVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
-    if (sessionLanguage === "ta") {
-      return (
-        voices.find((voice) => /^ta(-|_)/i.test(voice.lang))
-        ?? voices.find((voice) => /^en(-|_)IN/i.test(voice.lang))
-        ?? voices[0]
-        ?? null
-      );
-    }
-
-    return (
-      voices.find(
-        (voice) => /^en(-|_)IN/i.test(voice.lang) && /veena|lekha|ananya|rishi|sangeeta|siri/i.test(voice.name),
-      )
-      ?? voices.find(
-        (voice) => /^en(-|_)/i.test(voice.lang) && /samantha|karen|zira|serena|moira|siri/i.test(voice.name),
-      )
-      ?? voices.find((voice) => /^en(-|_)IN/i.test(voice.lang))
-      ?? voices.find((voice) => /^en(-|_)/i.test(voice.lang))
-      ?? voices[0]
-      ?? null
-    );
-  }
-
-  function splitSentences(text: string): string[] {
-    // Split on sentence-ending punctuation so each chunk gets a natural pause
-    return text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
-  }
-
   function getCardEmoji(badge: string, index: number): string {
     const b = badge.toLowerCase();
     if (/textbook|book|web note/i.test(b)) return "📚";
@@ -683,48 +585,65 @@
     return defaults[index % defaults.length];
   }
 
-  function softenSpeechText(text: string): string {
-    const normalized = text.replace(/\s+/g, " ").replace(/\s*:\s*/g, ". ").trim();
-    if (!normalized) return normalized;
-    return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
+  /** Detect if a line looks like dialogue/conversation (e.g., "Teacher: ...", "Student: ...") */
+  function isDialogueLine(line: string): { speaker: string; text: string; side: "left" | "right" } | null {
+    const match = line.match(/^([\w\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20})\s*[:：]\s*(.+)/);
+    if (!match) return null;
+    const speaker = match[1].trim();
+    const text = match[2].trim();
+    const leftSpeakers = /^(teacher|ஆசிரியர்|அம்மா|அப்பா|mom|dad|parent|mother|father|person\s*1|speaker\s*1)/i;
+    const rightSpeakers = /^(student|மாணவ|குழந்தை|child|kid|boy|girl|ram|ravi|priya|sita|person\s*2|speaker\s*2)/i;
+    if (leftSpeakers.test(speaker)) return { speaker, text, side: "left" };
+    if (rightSpeakers.test(speaker)) return { speaker, text, side: "right" };
+    // Any unrecognised speaker — alternate sides based on line position
+    return null;
   }
 
-  function primeSummarySpeech(): void {
-    const synth = getSpeechApi();
-    if (!synth) return;
-
-    synth.getVoices();
-    synth.resume();
+  /** Strip emoji characters from text so TTS doesn't read them out */
+  function stripEmojis(text: string): string {
+    return text
+      .replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{2702}-\u{27B0}\u{1FA00}-\u{1FA9F}\u{1FAA0}-\u{1FAFF}\u{2702}-\u{27B0}\u{FE0F}\u{200D}]/gu, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
   }
 
-  function stopSummarySpeech(): void {
-    const synth = getSpeechApi();
-    if (!synth) return;
-
-    synth.cancel();
-    activeSummaryUtterance = null;
-  }
-
-  function stopQuestionSpeech(): void {
-    const synth = getSpeechApi();
-    if (!synth) return;
-
-    synth.cancel();
-    activeQuestionUtterance = null;
-  }
-
-  function stopQuestionPrompt(): void {
-    clearQuestionSpeechTimer();
-    clearQuestionCountdownTimer();
-    stopQuestionSpeech();
-    questionPromptStatus = "idle";
-    questionSecondsLeft = QUESTION_TIME_LIMIT_SEC;
+  /** Add fun emojis to content text for young learners */
+  function enrichWithEmojis(text: string): string {
+    return text
+      .replace(/\b(apple|apples|ஆப்பிள்)\b/gi, "🍎 $1")
+      .replace(/\b(mango|mangoes|மாம்பழ)\b/gi, "🥭 $1")
+      .replace(/\b(sun|சூரியன்)\b/gi, "☀️ $1")
+      .replace(/\b(moon|நிலா|சந்திரன்)\b/gi, "🌙 $1")
+      .replace(/\b(star|stars|நட்சத்திர)\b/gi, "⭐ $1")
+      .replace(/\b(water|தண்ணீர்|நீர்)\b/gi, "💧 $1")
+      .replace(/\b(tree|trees|மரம்)\b/gi, "🌳 $1")
+      .replace(/\b(flower|flowers|பூ|மலர்)\b/gi, "🌺 $1")
+      .replace(/\b(bird|birds|பறவை)\b/gi, "🐦 $1")
+      .replace(/\b(fish|மீன்)\b/gi, "🐟 $1")
+      .replace(/\b(cat|பூனை)\b/gi, "🐱 $1")
+      .replace(/\b(dog|நாய்)\b/gi, "🐶 $1")
+      .replace(/\b(cow|பசு)\b/gi, "🐄 $1")
+      .replace(/\b(elephant|யானை)\b/gi, "🐘 $1")
+      .replace(/\b(lion|சிங்கம்)\b/gi, "🦁 $1")
+      .replace(/\b(leaf|leaves|இலை)\b/gi, "🍃 $1")
+      .replace(/\b(rain|மழை)\b/gi, "🌧️ $1")
+      .replace(/\b(book|புத்தகம்)\b/gi, "📖 $1")
+      .replace(/\b(school|பள்ளி)\b/gi, "🏫 $1")
+      .replace(/\b(home|house|வீடு)\b/gi, "🏠 $1")
+      .replace(/\b(earth|பூமி)\b/gi, "🌍 $1")
+      .replace(/\b(plus|add|கூட்டு)\b/gi, "➕ $1")
+      .replace(/\b(minus|subtract|கழி)\b/gi, "➖ $1")
+      .replace(/\b(equal|equals|சமம்)\b/gi, "🟰 $1")
+      .replace(/\b(heart|இதயம்)\b/gi, "❤️ $1")
+      .replace(/\b(hand|hands|கை)\b/gi, "✋ $1")
+      .replace(/\b(eye|eyes|கண்)\b/gi, "👁️ $1")
+      .replace(/\b(family|குடும்பம்)\b/gi, "👨‍👩‍👧 $1");
   }
 
   function stopSummaryPlayback(): void {
     summaryRunId += 1;
     clearSummaryFlowTimer();
-    stopSummarySpeech();
+    stopSpeech();
   }
 
   async function scrollSummaryToLine(idx: number): Promise<void> {
@@ -734,138 +653,6 @@
       const line = host?.querySelector<HTMLElement>(`[data-summary-line="${idx}"]`);
       line?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
-  }
-
-  function speakSummaryLine(line: string, runId: number, onDone: () => void): void {
-    clearSummaryFlowTimer();
-
-    const spokenLine = softenSpeechText(line);
-    const sentences = splitSentences(spokenLine);
-    const fallbackDelay = summaryLineDelayMs(spokenLine) + 900;
-    let finished = false;
-
-    const finish = (): void => {
-      if (finished || runId !== summaryRunId) return;
-      finished = true;
-      clearSummaryFlowTimer();
-      activeSummaryUtterance = null;
-      onDone();
-    };
-
-    const synth = getSpeechApi();
-    if (!synth || spokenLine.trim().length === 0) {
-      summaryFlowTimer = setTimeout(finish, summaryLineDelayMs(spokenLine));
-      return;
-    }
-
-    const voices = synth.getVoices();
-    const voice = pickSummaryVoice(voices);
-    const lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
-    // Slightly slower, warmer pitch — feels like a teacher reading to children
-    const rate = sessionLanguage === "ta" ? 0.76 : 0.79;
-    const pitch = sessionLanguage === "ta" ? 0.97 : 0.88;
-
-    synth.cancel();
-    synth.resume();
-
-    let sentenceIdx = 0;
-
-    const speakNext = (): void => {
-      if (runId !== summaryRunId || finished) return;
-      if (sentenceIdx >= sentences.length) {
-        finish();
-        return;
-      }
-      const sentence = sentences[sentenceIdx++];
-      const utterance = new SpeechSynthesisUtterance(sentence);
-      if (voice) utterance.voice = voice;
-      utterance.lang = lang;
-      utterance.rate = rate;
-      utterance.pitch = pitch;
-      utterance.volume = 1.0;
-      utterance.onend = () => {
-        if (runId !== summaryRunId || finished) return;
-        // Natural breath-pause between sentences
-        setTimeout(speakNext, 320);
-      };
-      utterance.onerror = finish;
-      activeSummaryUtterance = utterance;
-      synth.speak(utterance);
-    };
-
-    speakNext();
-    summaryFlowTimer = setTimeout(finish, fallbackDelay);
-  }
-
-  function startQuestionCountdown(): void {
-    clearQuestionCountdownTimer();
-    questionPromptStatus = "timed";
-    questionSecondsLeft = QUESTION_TIME_LIMIT_SEC;
-
-    questionCountdownTimer = setInterval(() => {
-      if (questionSecondsLeft <= 1) {
-        questionSecondsLeft = 0;
-        clearQuestionCountdownTimer();
-        questionPromptStatus = "idle";
-        return;
-      }
-
-      questionSecondsLeft -= 1;
-    }, 1000);
-  }
-
-  function speakQuestionTurn(turn: SessionTurn, studentName: string): void {
-    stopQuestionPrompt();
-    questionPromptStatus = "reading";
-
-    const script = softenSpeechText(buildQuestionPrompt(turn, studentName));
-
-    const finish = (): void => {
-      clearQuestionSpeechTimer();
-      activeQuestionUtterance = null;
-
-      if (
-        phase !== "session"
-        || answerPhase !== "ask"
-        || currentQ?.q !== turn.q
-        || activeStudent?.name !== studentName
-      ) {
-        return;
-      }
-
-      startQuestionCountdown();
-    };
-
-    const synth = getSpeechApi();
-    if (!synth) {
-      finish();
-      return;
-    }
-
-    const utterance = new SpeechSynthesisUtterance(script);
-    const voice = pickSummaryVoice(synth.getVoices());
-    if (voice) utterance.voice = voice;
-
-    utterance.lang = voice?.lang || (sessionLanguage === "ta" ? "ta-IN" : "en-IN");
-    utterance.rate = sessionLanguage === "ta" ? 0.80 : 0.82;
-    utterance.pitch = sessionLanguage === "ta" ? 0.97 : 0.90;
-    utterance.onend = finish;
-    utterance.onerror = finish;
-
-    activeQuestionUtterance = utterance;
-    synth.cancel();
-    synth.resume();
-    synth.speak(utterance);
-
-    questionSpeechTimer = setTimeout(
-      finish,
-      summaryLineDelayMs(script, QUESTION_PROMPT_MAX_MS) + 900,
-    );
-  }
-
-  function repeatQuestion(): void {
-    if (!currentQ || !activeStudent || phase !== "session" || answerPhase !== "ask") return;
-    speakQuestionTurn(currentQ, activeStudent.name ?? "Student");
   }
 
   function publishSessionAlerts(): void {
@@ -917,7 +704,6 @@
 
   function finishSession(): void {
     clearAutoAdvanceTimer();
-    stopQuestionPrompt();
     publishSessionAlerts();
     phase = "complete";
   }
@@ -944,14 +730,19 @@
     const isLastLine = nextIdx >= summaryLines.length - 1;
     const line = summaryLines[nextIdx] ?? "";
 
-    speakSummaryLine(line, runId, () => {
+    // Wait for TTS to finish speaking the line before advancing
+    void speakAsync(line, sessionLanguage).then(() => {
       if (runId !== summaryRunId || phase !== "summarizing") return;
-      if (isLastLine) {
-        phase = "session";
-        return;
-      }
 
-      revealSummaryLine(nextIdx + 1, runId);
+      // Small pause between lines for natural flow
+      summaryFlowTimer = setTimeout(() => {
+        if (runId !== summaryRunId || phase !== "summarizing") return;
+        if (isLastLine) {
+          phase = "session";
+          return;
+        }
+        revealSummaryLine(nextIdx + 1, runId);
+      }, 600);
     });
   }
 
@@ -983,6 +774,10 @@
           : [];
 
         summaryLines = lines.length > 0 ? lines : fallbackLines();
+        // Capture images from the response
+        summaryImages = Array.isArray(data.images_base64)
+          ? data.images_base64.filter((img): img is string => typeof img === "string" && img.length > 0)
+          : [];
         questionPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
         if (questionPlan.length === 0) {
           questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
@@ -1030,11 +825,11 @@
 
   async function startSession(): Promise<void> {
     clearAutoAdvanceTimer();
+    clearMcqTimer();
     stopSummaryPlayback();
-    stopQuestionPrompt();
-    primeSummarySpeech();
+    _initTTS();
 
-    phase = "summarizing";
+    phase = "preloading";
     qIdx = 0;
     answered = [];
     summaryIdx = 0;
@@ -1044,11 +839,23 @@
     summaryPreviewCards = buildFallbackPreviewCards();
     sessionId = createSessionId();
     sessionAttempts = [];
+    summaryImages = [];
     questionPlan = [];
     resetTurnState();
 
     await fetchSummaryPreview();
     await fetchSummary();
+
+    // Content is preloaded — show "Start Beginning" button
+    phase = "ready";
+  }
+
+  /** Begin playback of pre-loaded content (called when student clicks "Start Beginning") */
+  function startBeginning(): void {
+    if (phase !== "ready") return;
+    _initTTS();
+    phase = "summarizing";
+    summaryIdx = 0;
     const runId = summaryRunId + 1;
     summaryRunId = runId;
     revealSummaryLine(0, runId);
@@ -1056,8 +863,8 @@
 
   function startOver(): void {
     clearAutoAdvanceTimer();
+    clearMcqTimer();
     stopSummaryPlayback();
-    stopQuestionPrompt();
 
     phase = "start";
     qIdx = 0;
@@ -1076,6 +883,7 @@
   function selectOption(optionIndex: number): void {
     if (!currentQ || phase !== "session" || answerPhase !== "ask") return;
 
+    clearMcqTimer();
     submit(optionIndex === currentQ.answerIndex, optionIndex);
   }
 
@@ -1083,7 +891,6 @@
     if (!currentQ) return;
 
     clearAutoAdvanceTimer();
-    stopQuestionPrompt();
 
     submittedOption = optionIndex;
     lastCorrect = correct;
@@ -1105,15 +912,11 @@
     feedbackDetail = correct
       ? currentQ.explain
       : `Correct option: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`;
-
-    autoAdvanceTimer = setTimeout(() => {
-      if (phase === "session" && answerPhase === "feedback") next();
-    }, AUTO_ADVANCE_MS);
+    // Auto-advance is now handled by the feedback TTS $effect after speech finishes
   }
 
   function next(): void {
     clearAutoAdvanceTimer();
-    stopQuestionPrompt();
     if (questionPlan.length === 0) return;
 
     if (qIdx >= questionPlan.length - 1) {
@@ -1137,22 +940,132 @@
     resetTurnState();
   }
 
+  // ── TTS ────────────────────────────────────────────────────────────────────
+  function _initTTS(): void {
+    if (typeof speechSynthesis === "undefined") return;
+    // Chrome loads voices async — trigger the list so _pickVoice works later
+    speechSynthesis.getVoices();
+    if ("onvoiceschanged" in speechSynthesis) {
+      speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
+    }
+  }
+
+  function _pickVoice(lang: "en" | "ta"): SpeechSynthesisVoice | undefined {
+    const voices = speechSynthesis.getVoices();
+    const prefix = lang === "ta" ? "ta" : "en";
+    // prefer exact locale match (ta-IN, en-IN, en-GB…) then any matching lang
+    return (
+      voices.find((v) => v.lang.toLowerCase().startsWith(prefix + "-in")) ??
+      voices.find((v) => v.lang.toLowerCase().startsWith(prefix))
+    );
+  }
+
+  /** Speak text and return a promise that resolves when utterance finishes. */
+  function speakAsync(text: string, lang: "en" | "ta" = "en"): Promise<void> {
+    return new Promise((resolve) => {
+      const clean = stripEmojis(text);
+      if (typeof speechSynthesis === "undefined" || !clean) {
+        resolve();
+        return;
+      }
+      speechSynthesis.cancel();
+      const utt = new SpeechSynthesisUtterance(clean);
+      utt.lang = lang === "ta" ? "ta-IN" : "en-IN";
+      const voice = _pickVoice(lang);
+      if (voice) utt.voice = voice;
+      utt.rate = lang === "ta" ? 0.82 : 0.88;
+      utt.pitch = 1.05;
+      utt.onend = () => resolve();
+      utt.onerror = () => resolve();
+      speechSynthesis.speak(utt);
+      // Safety net: if onend never fires (some browsers), resolve after max duration
+      const maxMs = Math.max(3000, clean.split(/\s+/).length * 600);
+      setTimeout(() => resolve(), maxMs);
+    });
+  }
+
+  function speak(text: string, lang: "en" | "ta" = "en"): void {
+    void speakAsync(text, lang);
+  }
+
+  function stopSpeech(): void {
+    if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+  }
+
+  // ── MCQ Timer ──────────────────────────────────────────────────────────────
+  const MCQ_TIMER_SECONDS = 12;
+  let mcqTimerValue = $state(0);
+  let mcqTimerInterval: ReturnType<typeof setInterval> | null = null;
+
+  function startMcqTimer(): void {
+    clearMcqTimer();
+    mcqTimerValue = MCQ_TIMER_SECONDS;
+    mcqTimerInterval = setInterval(() => {
+      mcqTimerValue -= 1;
+      if (mcqTimerValue <= 0) {
+        clearMcqTimer();
+      }
+    }, 1000);
+  }
+
+  function clearMcqTimer(): void {
+    if (mcqTimerInterval !== null) {
+      clearInterval(mcqTimerInterval);
+      mcqTimerInterval = null;
+    }
+  }
+
+  // Speak question + options, then start timer when MCQ begins
   $effect(() => {
-    if (phase !== "session" || answerPhase !== "ask" || !currentQ || !activeStudent) return;
+    if (phase === "session" && currentQ && answerPhase === "ask") {
+      clearMcqTimer();
+      mcqTimerValue = 0;
+      const gen = ++mcqTtsGeneration;
+      const student = students[currentQ.student];
+      const prefix = student ? `${student.name}. ` : "";
+      const optionsText = currentQ.options
+        .map((opt, i) => `${OPTION_LABELS[i]}. ${opt}`)
+        .join(". ");
+      const fullText = `${prefix}${currentQ.q}. ${optionsText}`;
+      void speakAsync(fullText, sessionLanguage).then(() => {
+        if (gen !== mcqTtsGeneration) return;
+        if (phase === "session" && answerPhase === "ask") {
+          startMcqTimer();
+        }
+      });
+    }
+  });
 
-    const turn = currentQ;
-    const studentName = activeStudent.name ?? "Student";
-    speakQuestionTurn(turn, studentName);
-
-    return () => {
-      stopQuestionPrompt();
-    };
+  // Speak feedback after answer is submitted, then auto-advance
+  $effect(() => {
+    if (phase === "session" && answerPhase === "feedback" && currentQ) {
+      clearAutoAdvanceTimer();
+      let msg: string;
+      if (lastCorrect) {
+        msg = sessionLanguage === "ta"
+          ? `சரியான பதில்! ${currentQ.explain}`
+          : `That's right! ${currentQ.explain}`;
+      } else {
+        const correctOpt = currentQ.options[currentQ.answerIndex] ?? "";
+        msg = sessionLanguage === "ta"
+          ? `தவறான பதில். சரியான விடை: ${correctOpt}. ${currentQ.explain}`
+          : `Not quite. The correct answer is: ${correctOpt}. ${currentQ.explain}`;
+      }
+      void speakAsync(msg, sessionLanguage).then(() => {
+        if (phase === "session" && answerPhase === "feedback") {
+          autoAdvanceTimer = setTimeout(() => {
+            if (phase === "session" && answerPhase === "feedback") next();
+          }, 1500);
+        }
+      });
+    }
   });
 
   onDestroy(() => {
     clearAutoAdvanceTimer();
+    clearMcqTimer();
     stopSummaryPlayback();
-    stopQuestionPrompt();
+    stopSpeech();
   });
 </script>
 
@@ -1250,8 +1163,11 @@
                 class="mt-1 flex cursor-pointer items-center gap-3 rounded-2xl px-10 py-4 text-[17px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
                 style="background:{accent}; box-shadow:0 14px 36px -10px {accent}66;"
               >
-                Begin session <ArrowRight class="size-5" />
+                🧠 Start Thinking <Sparkles class="size-5" />
               </button>
+              <div class="text-[11px]" style="color:var(--text-tertiary);">
+                Teacher: tap "Start Thinking" to pre-load. Students will see "Start Beginning" when ready.
+              </div>
               <button
                 type="button"
                 onclick={() => goto(resolve("/student/topic"))}
@@ -1260,6 +1176,50 @@
               >
                 ← Choose a different topic
               </button>
+            </div>
+
+          {:else if phase === "preloading"}
+            <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
+              <div class="animate-pulse text-[48px]">🧠</div>
+              <div
+                class="text-[24px] font-semibold"
+                style="color:var(--ink);"
+              >
+                AI is thinking...
+              </div>
+              <div class="text-[14px] max-w-100" style="color:var(--text-secondary);">
+                Generating summary, images, and MCQ questions. This may take a moment.
+              </div>
+              <div class="flex items-center gap-2">
+                <div class="size-2 animate-bounce rounded-full" style="background:{accent};"></div>
+                <div class="size-2 animate-bounce rounded-full" style="background:{accent}; animation-delay:0.1s;"></div>
+                <div class="size-2 animate-bounce rounded-full" style="background:{accent}; animation-delay:0.2s;"></div>
+              </div>
+            </div>
+
+          {:else if phase === "ready"}
+            <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
+              <div class="text-[48px]">✅</div>
+              <div
+                class="text-[24px] font-semibold"
+                style="color:var(--ink);"
+              >
+                Everything is ready!
+              </div>
+              <div class="text-[14px] max-w-110" style="color:var(--text-secondary);">
+                Summary ({summaryLines.length} sections), {questionPlan.length} MCQ questions{summaryImages.length > 0 ? `, and ${summaryImages.length} textbook images` : ""} are preloaded.
+              </div>
+              <button
+                type="button"
+                onclick={startBeginning}
+                class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-5 text-[20px] font-bold text-white transition-all hover:scale-[1.03] active:scale-[0.97]"
+                style="background:#22c55e; box-shadow:0 16px 40px -12px #22c55e88;"
+              >
+                ▶ Start Beginning <ArrowRight class="size-6" />
+              </button>
+              <div class="text-[11px]" style="color:var(--text-tertiary);">
+                Hand the tablet to the student and tap "Start Beginning" to begin.
+              </div>
             </div>
 
           {:else if phase === "summarizing"}
@@ -1358,6 +1318,7 @@
                 {:else}
                   {#each visibleSummaryLines as line, i (i)}
                     {@const tone = getSummaryLineTone(line, i)}
+                    {@const dialogue = isDialogueLine(line)}
                     <div
                       class="relative mb-4 pl-1"
                     >
@@ -1367,25 +1328,59 @@
                           style="background:{tone.trailColor}; opacity:0.45;"
                         ></div>
                       {/if}
-                      <div
-                        data-summary-line={i}
-                        class="rounded-3xl border p-4 text-[20px] font-medium leading-relaxed transition-opacity duration-500"
-                        style="background:{tone.cardBackground}; border-color:{tone.cardBorder}; color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
-                      >
-                        <div class="mb-2 flex items-center gap-2">
+                      {#if dialogue}
+                        <div
+                          data-summary-line={i}
+                          class="flex transition-opacity duration-500"
+                          style="justify-content:{dialogue.side === 'right' ? 'flex-end' : 'flex-start'}; opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
+                        >
                           <div
-                            class="grid size-8 shrink-0 place-items-center rounded-2xl"
-                            style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                            class="max-w-[80%] rounded-3xl p-4 text-[18px] font-medium leading-relaxed"
+                            style="background:{dialogue.side === 'left' ? '#eef8ff' : '#f0fdf4'}; border:1px solid {dialogue.side === 'left' ? '#cfe1ff' : '#bbf7d0'};"
                           >
-                            <tone.icon class="size-4" />
-                          </div>
-                          <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
-                            {tone.label}
+                            <div class="mb-1.5 text-[11px] font-bold uppercase tracking-wider" style="color:{dialogue.side === 'left' ? '#2569c7' : '#15803d'};">
+                              {dialogue.side === 'left' ? '👩‍🏫' : '🧒'} {dialogue.speaker}
+                            </div>
+                            {enrichWithEmojis(dialogue.text)}
                           </div>
                         </div>
-                        {line}
-                      </div>
+                      {:else}
+                        <div
+                          data-summary-line={i}
+                          class="rounded-3xl border p-4 text-[20px] font-medium leading-relaxed transition-opacity duration-500"
+                          style="background:{tone.cardBackground}; border-color:{tone.cardBorder}; color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
+                        >
+                          <div class="mb-2 flex items-center gap-2">
+                            <div
+                              class="grid size-8 shrink-0 place-items-center rounded-2xl"
+                              style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                            >
+                              <tone.icon class="size-4" />
+                            </div>
+                            <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
+                              {tone.label}
+                            </div>
+                          </div>
+                          {enrichWithEmojis(line)}
+                        </div>
+                      {/if}
                     </div>
+                    {#if summaryImages.length > 0 && (i + 1) % 2 === 0}
+                      {@const imgIdx = Math.floor((i + 1) / 2) - 1}
+                      {#if imgIdx < summaryImages.length}
+                        {@const img = summaryImages[imgIdx]}
+                        <div class="my-3 overflow-hidden rounded-2xl border" style="border-color:#f3d49a; background:#fff9ed;">
+                          <img
+                            src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
+                            alt="Textbook illustration {imgIdx + 1}"
+                            class="w-full object-contain max-h-48"
+                          />
+                          <div class="px-3 py-2 text-[11px] font-medium" style="color:#ba7300;">
+                            📖 Textbook image {imgIdx + 1}
+                          </div>
+                        </div>
+                      {/if}
+                    {/if}
                   {/each}
                   <button
                     type="button"
@@ -1475,37 +1470,27 @@
                 {currentQ?.q}
               </div>
 
-              <div class="mt-4 flex flex-wrap items-center gap-2">
-                <div
-                  class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold"
-                  style="background:#eef8ff; color:#2569c7;"
-                >
-                  <Volume2 class="size-3.5" /> {questionPromptStatus === "reading" ? "Reading aloud" : "Voice ready"}
-                </div>
-                <div
-                  class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold"
-                  style="background:#fff8ea; color:#b87907;"
-                >
-                  <Clock3 class="size-3.5" /> {questionPromptText}
-                </div>
-                <button
-                  type="button"
-                  onclick={repeatQuestion}
-                  class="inline-flex cursor-pointer items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold"
-                  style="background:{accent}12; color:{accent};"
-                >
-                  <Volume2 class="size-3.5" /> Read again
-                </button>
-              </div>
-
-              <div class="mt-3 h-2 w-full max-w-120 overflow-hidden rounded-full" style="background:#e8e2d6;">
-                <div
-                  class="h-full rounded-full transition-all duration-500"
-                  style="width:{questionPromptStatus === 'timed' ? questionCountdownPercent : questionPromptStatus === 'reading' ? 100 : 0}%; background:{questionPromptStatus === 'reading' ? accent : '#efc05c'};"
-                ></div>
+              <div class="mt-2 text-[13px]" style="color:var(--text-secondary);">
+                Tap one option below when ready.
               </div>
 
               {#if answerPhase === "ask"}
+                {#if mcqTimerValue > 0}
+                  <div class="mt-3 flex items-center gap-3">
+                    <div class="h-2 flex-1 overflow-hidden rounded-full" style="background:#e5e1d8;">
+                      <div
+                        class="h-full rounded-full transition-all duration-1000 ease-linear"
+                        style="width:{Math.round((mcqTimerValue / MCQ_TIMER_SECONDS) * 100)}%; background:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                      ></div>
+                    </div>
+                    <span
+                      class="text-[14px] font-bold tabular-nums"
+                      style="color:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                    >
+                      {mcqTimerValue}s
+                    </span>
+                  </div>
+                {/if}
                 <div class="mt-6 grid shrink-0 grid-cols-2 gap-3">
                   {#each currentQ?.options ?? [] as option, i (`${option}-${i}`)}
                     <button
@@ -1555,23 +1540,37 @@
                   class="mt-5 shrink-0 rounded-2xl border p-5"
                   style="{lastCorrect
                     ? 'background:#f0fdf4;border-color:#bbf7d0;'
-                    : 'background:#fff7ed;border-color:#fed7aa;'}"
+                    : 'background:#fff1f0;border-color:#fca5a5;'}"
                 >
-                  <div class="mb-1.5 flex items-center gap-2.5">
+                  <div class="mb-2 flex items-center gap-2.5">
                     {#if lastCorrect}
                       <CheckCircle2 class="size-5" style="color:#15803d;" />
+                      <div class="text-[15px] font-bold" style="color:#166534;">
+                        {sessionLanguage === "ta" ? "சரியான பதில்! " : "That's right! "}
+                      </div>
                     {:else}
-                      <XCircle class="size-5" style="color:#b45309;" />
+                      <XCircle class="size-5" style="color:#dc2626;" />
+                      <div class="text-[15px] font-bold" style="color:#dc2626;">
+                        {sessionLanguage === "ta" ? "தவறான பதில்." : "Not quite."}
+                      </div>
                     {/if}
-                    <div
-                      class="text-[15px] font-semibold"
-                      style="color:{lastCorrect ? '#166534' : '#9a3412'};"
-                    >
-                      {feedbackTitle}
-                    </div>
                   </div>
-                  <div class="pl-7 text-[13.5px] leading-[1.6]" style="color:var(--text-body);">
-                    {feedbackDetail}
+                  {#if !lastCorrect}
+                    <div class="mb-2.5 ml-7 rounded-xl border-l-4 bg-white px-3 py-2.5" style="border-color:#22c55e;">
+                      <div class="mb-0.5 text-[10px] font-semibold uppercase tracking-wider" style="color:#15803d;">
+                        {sessionLanguage === "ta" ? "சரியான விடை" : "Correct answer"}
+                      </div>
+                      <div class="text-[14px] font-semibold" style="color:#166534;">
+                        {currentQ?.options[currentQ.answerIndex] ?? ""}
+                      </div>
+                    </div>
+                  {/if}
+                  <div class="pl-7 text-[13px] leading-[1.6]" style="color:var(--text-body);">
+                    {#if lastCorrect}
+                      {currentQ?.explain ?? ""}
+                    {:else}
+                      {sessionLanguage === "ta" ? "ஏன்? " : "Why? "}{currentQ?.explain ?? ""}
+                    {/if}
                   </div>
                   <div class="mt-1 pl-7 text-[11px]" style="color:var(--text-tertiary);">
                     {#if isFinalTurn}
@@ -1644,6 +1643,18 @@
                 </div>
               {/if}
               <div bind:this={desktopSummarySidebarEl} class="mt-3 flex-1 space-y-2 overflow-y-auto pr-1">
+                {#if summaryImages.length > 0}
+                  <div class="flex gap-2 overflow-x-auto pb-1">
+                    {#each summaryImages.slice(0, 3) as img, i (`sidebar-img-${i}`)}
+                      <img
+                        src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
+                        alt="Textbook image {i + 1}"
+                        class="h-16 w-20 shrink-0 rounded-xl object-cover border"
+                        style="border-color:#f3d49a;"
+                      />
+                    {/each}
+                  </div>
+                {/if}
                 {#each visibleSummaryLines as line, i (i)}
                   {@const tone = getSummaryLineTone(line, i)}
                   <div
@@ -1662,7 +1673,7 @@
                         {tone.label}
                       </div>
                     </div>
-                    {line}
+                    {enrichWithEmojis(line)}
                   </div>
                 {/each}
               </div>
@@ -1843,7 +1854,38 @@
         class="mt-4 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-4 text-[18px] font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98]"
         style="background:{accent}; box-shadow:0 16px 40px -12px {accent}88;"
       >
-        Begin <ArrowRight class="size-5" />
+        🧠 Start Thinking <Sparkles class="size-5" />
+      </button>
+    </div>
+
+  {:else if phase === "preloading"}
+    <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
+      <div class="animate-pulse text-[48px]">🧠</div>
+      <div class="text-[24px] font-semibold text-white">AI is thinking...</div>
+      <div class="text-[14px]" style="color:rgba(255,255,255,0.5);">
+        Generating summary, images, and questions.
+      </div>
+      <div class="flex items-center gap-2">
+        <div class="size-2 animate-bounce rounded-full" style="background:{accent};"></div>
+        <div class="size-2 animate-bounce rounded-full" style="background:{accent}; animation-delay:0.1s;"></div>
+        <div class="size-2 animate-bounce rounded-full" style="background:{accent}; animation-delay:0.2s;"></div>
+      </div>
+    </div>
+
+  {:else if phase === "ready"}
+    <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
+      <div class="text-[48px]">✅</div>
+      <div class="text-[24px] font-semibold text-white">Ready!</div>
+      <div class="text-[14px]" style="color:rgba(255,255,255,0.55);">
+        {summaryLines.length} sections, {questionPlan.length} questions preloaded.
+      </div>
+      <button
+        type="button"
+        onclick={startBeginning}
+        class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-5 text-[20px] font-bold text-white transition-all hover:scale-[1.03] active:scale-[0.97]"
+        style="background:#22c55e; box-shadow:0 16px 40px -12px #22c55e88;"
+      >
+        ▶ Start Beginning <ArrowRight class="size-6" />
       </button>
     </div>
 
@@ -1921,6 +1963,7 @@
         {:else}
           {#each visibleSummaryLines as line, i (i)}
             {@const tone = getSummaryLineTone(line, i)}
+            {@const dialogue = isDialogueLine(line)}
             <div
               class="relative mb-4 pl-1 text-left"
             >
@@ -1930,25 +1973,56 @@
                   style="background:{tone.trailColor}; opacity:0.45;"
                 ></div>
               {/if}
-              <div
-                data-summary-line={i}
-                class="rounded-3xl border p-4 text-[18px] font-medium leading-relaxed"
-                style="background:{tone.cardBackground}; border-color:{tone.cardBorder}; color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
-              >
-                <div class="mb-2 flex items-center gap-2">
+              {#if dialogue}
+                <div
+                  data-summary-line={i}
+                  class="flex"
+                  style="justify-content:{dialogue.side === 'right' ? 'flex-end' : 'flex-start'}; opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
+                >
                   <div
-                    class="grid size-8 shrink-0 place-items-center rounded-2xl"
-                    style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                    class="max-w-[85%] rounded-3xl p-3.5 text-[16px] font-medium leading-relaxed"
+                    style="background:{dialogue.side === 'left' ? '#eef8ff' : '#f0fdf4'}; border:1px solid {dialogue.side === 'left' ? '#cfe1ff' : '#bbf7d0'};"
                   >
-                    <tone.icon class="size-4" />
-                  </div>
-                  <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
-                    {tone.label}
+                    <div class="mb-1 text-[10px] font-bold uppercase tracking-wider" style="color:{dialogue.side === 'left' ? '#2569c7' : '#15803d'};">
+                      {dialogue.side === 'left' ? '👩‍🏫' : '🧒'} {dialogue.speaker}
+                    </div>
+                    {enrichWithEmojis(dialogue.text)}
                   </div>
                 </div>
-                {line}
-              </div>
+              {:else}
+                <div
+                  data-summary-line={i}
+                  class="rounded-3xl border p-4 text-[18px] font-medium leading-relaxed"
+                  style="background:{tone.cardBackground}; border-color:{tone.cardBorder}; color:var(--ink); opacity:{summaryIdx - i > 0 ? 0.58 : 1};"
+                >
+                  <div class="mb-2 flex items-center gap-2">
+                    <div
+                      class="grid size-8 shrink-0 place-items-center rounded-2xl"
+                      style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                    >
+                      <tone.icon class="size-4" />
+                    </div>
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.18em]" style="color:{tone.chipColor};">
+                      {tone.label}
+                    </div>
+                  </div>
+                  {enrichWithEmojis(line)}
+                </div>
+              {/if}
             </div>
+            {#if summaryImages.length > 0 && (i + 1) % 2 === 0}
+              {@const imgIdx = Math.floor((i + 1) / 2) - 1}
+              {#if imgIdx < summaryImages.length}
+                {@const img = summaryImages[imgIdx]}
+                <div class="my-3 overflow-hidden rounded-2xl border" style="border-color:#f3d49a; background:#fff9ed;">
+                  <img
+                    src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
+                    alt="Textbook image {imgIdx + 1}"
+                    class="w-full object-contain max-h-36"
+                  />
+                </div>
+              {/if}
+            {/if}
           {/each}
           <button
             type="button"
@@ -2048,34 +2122,8 @@
             {currentQ?.q}
           </div>
 
-          <div class="mt-4 flex flex-wrap items-center gap-2">
-            <div
-              class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold"
-              style="background:#eef8ff; color:#2569c7;"
-            >
-              <Volume2 class="size-3.5" /> {questionPromptStatus === "reading" ? "Reading aloud" : "Voice ready"}
-            </div>
-            <div
-              class="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold"
-              style="background:#fff8ea; color:#b87907;"
-            >
-              <Clock3 class="size-3.5" /> {questionPromptText}
-            </div>
-            <button
-              type="button"
-              onclick={repeatQuestion}
-              class="inline-flex cursor-pointer items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold"
-              style="background:{accent}12; color:{accent};"
-            >
-              <Volume2 class="size-3.5" /> Read again
-            </button>
-          </div>
-
-          <div class="mt-3 h-2 w-full overflow-hidden rounded-full" style="background:#e8e2d6;">
-            <div
-              class="h-full rounded-full transition-all duration-500"
-              style="width:{questionPromptStatus === 'timed' ? questionCountdownPercent : questionPromptStatus === 'reading' ? 100 : 0}%; background:{questionPromptStatus === 'reading' ? accent : '#efc05c'};"
-            ></div>
+          <div class="mt-2 text-[13px]" style="color:var(--text-secondary);">
+            Tap one option below when ready.
           </div>
 
           <details class="mt-3 rounded-xl border" style="border-color:var(--border-default); background:white;">
@@ -2083,6 +2131,18 @@
               View summary
             </summary>
             <div class="max-h-44 space-y-2 overflow-y-auto px-3 pb-3">
+              {#if summaryImages.length > 0}
+                <div class="flex gap-2 overflow-x-auto pb-1">
+                  {#each summaryImages.slice(0, 2) as img, i (`mob-details-img-${i}`)}
+                    <img
+                      src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
+                      alt="Textbook image {i + 1}"
+                      class="h-12 w-16 shrink-0 rounded-lg object-cover border"
+                      style="border-color:#f3d49a;"
+                    />
+                  {/each}
+                </div>
+              {/if}
               {#each summaryLines as line, i (i)}
                 {@const tone = getSummaryLineTone(line, i)}
                 <div
@@ -2100,13 +2160,29 @@
                       {tone.label}
                     </div>
                   </div>
-                  {line}
+                  {enrichWithEmojis(line)}
                 </div>
               {/each}
             </div>
           </details>
 
           {#if answerPhase === "ask"}
+            {#if mcqTimerValue > 0}
+              <div class="mt-3 flex items-center gap-3">
+                <div class="h-2 flex-1 overflow-hidden rounded-full" style="background:rgba(255,255,255,0.15);">
+                  <div
+                    class="h-full rounded-full transition-all duration-1000 ease-linear"
+                    style="width:{Math.round((mcqTimerValue / MCQ_TIMER_SECONDS) * 100)}%; background:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                  ></div>
+                </div>
+                <span
+                  class="text-[14px] font-bold tabular-nums"
+                  style="color:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                >
+                  {mcqTimerValue}s
+                </span>
+              </div>
+            {/if}
             <div class="mt-5 space-y-2.5">
               {#each currentQ?.options ?? [] as option, i (`m-${option}-${i}`)}
                 <button
@@ -2152,23 +2228,37 @@
               class="mt-5 rounded-2xl border p-4"
               style="{lastCorrect
                 ? 'background:#f0fdf4;border-color:#bbf7d0;'
-                : 'background:#fff7ed;border-color:#fed7aa;'}"
+                : 'background:#fff1f0;border-color:#fca5a5;'}"
             >
-              <div class="mb-2 flex items-center gap-2">
+              <div class="mb-2 flex items-center gap-2.5">
                 {#if lastCorrect}
                   <CheckCircle2 class="size-5" style="color:#15803d;" />
+                  <div class="text-[15px] font-bold" style="color:#166534;">
+                    {sessionLanguage === "ta" ? "சரியான பதில்! " : "That's right! "}
+                  </div>
                 {:else}
-                  <XCircle class="size-5" style="color:#b45309;" />
+                  <XCircle class="size-5" style="color:#dc2626;" />
+                  <div class="text-[15px] font-bold" style="color:#dc2626;">
+                    {sessionLanguage === "ta" ? "தவறான பதில்." : "Not quite."}
+                  </div>
                 {/if}
-                <div
-                  class="text-[14px] font-semibold"
-                  style="color:{lastCorrect ? '#166534' : '#9a3412'};"
-                >
-                  {feedbackTitle}
-                </div>
               </div>
+              {#if !lastCorrect}
+                <div class="mb-2.5 ml-7 rounded-xl border-l-4 bg-white px-3 py-2.5" style="border-color:#22c55e;">
+                  <div class="mb-0.5 text-[10px] font-semibold uppercase tracking-wider" style="color:#15803d;">
+                    {sessionLanguage === "ta" ? "சரியான விடை" : "Correct answer"}
+                  </div>
+                  <div class="text-[14px] font-semibold" style="color:#166534;">
+                    {currentQ?.options[currentQ.answerIndex] ?? ""}
+                  </div>
+                </div>
+              {/if}
               <div class="pl-7 text-[13px] leading-[1.6]" style="color:var(--text-body);">
-                {feedbackDetail}
+                {#if lastCorrect}
+                  {currentQ?.explain ?? ""}
+                {:else}
+                  {sessionLanguage === "ta" ? "ஏன்? " : "Why? "}{currentQ?.explain ?? ""}
+                {/if}
               </div>
               <div class="mt-3 pl-7">
                 <button

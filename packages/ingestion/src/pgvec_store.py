@@ -5,8 +5,6 @@ Schema:
 
 Cosine similarity search via <=> operator.
 BM25 corpus fetched via plain SELECT (no re-embedding needed).
-
-Falls back to SQLiteVectorStore if the PostgreSQL connection fails.
 """
 import json
 import logging
@@ -91,7 +89,7 @@ class PGVectorStore:
     """
     pgvector-backed cosine similarity store.
 
-    Interface matches the subset of langchain-chroma / SQLiteVectorStore used in
+    Interface matches the subset used in
     ingest.py and retriever.py.
     """
 
@@ -192,6 +190,9 @@ class PGVectorStore:
             LIMIT %s
         """
         with self._conn.cursor() as cur:
+            # Raise ef_search for this query so HNSW explores more neighbours.
+            # Default is 40; 100 gives significantly better recall at modest cost.
+            cur.execute("SET LOCAL hnsw.ef_search = 100")
             cur.execute(query_sql, [q_vec] + params + [q_vec, k])
             rows = cur.fetchall()
 
@@ -215,25 +216,10 @@ class PGVectorStore:
         self._conn.close()
 
 
-# ── factory with SQLite fallback ──────────────────────────────────────────────
+# ── factory ───────────────────────────────────────────────────────────────────
 
-def get_vector_store(embedding_function=None, sqlite_fallback_path: Path | None = None):
-    """
-    Try to connect to pgvector. Falls back to SQLiteVectorStore if unavailable.
-    """
-    try:
-        store = PGVectorStore(dsn=_DSN, embedding_function=embedding_function)
-        logger.info("Vector store: pgvector (PostgreSQL)")
-        return store
-    except Exception as e:
-        logger.warning("pgvector unavailable (%s) — falling back to SQLiteVectorStore", e)
-        from sqlite_vec_store import SQLiteVectorStore
-        from pathlib import Path
-        fb_path = sqlite_fallback_path or (Path(__file__).parent.parent / "data" / "vectors.db")
-        store = SQLiteVectorStore(
-            db_path=fb_path,
-            collection_name="mm_rag_pipeline",
-            embedding_function=embedding_function,
-        )
-        logger.info("Vector store: SQLiteVectorStore (fallback)")
-        return store
+def get_vector_store(embedding_function=None, **_kwargs):
+    """Connect to pgvector. Raises on failure — no SQLite fallback."""
+    store = PGVectorStore(dsn=_DSN, embedding_function=embedding_function)
+    logger.info("Vector store: pgvector (PostgreSQL)")
+    return store
