@@ -2,6 +2,8 @@ import type { Request, Response } from "express";
 import { AppError } from "../lib/errors";
 import {
   generateLlmJson,
+  generateLlmResponse,
+  generateTamilResponse,
   retrieveTopicChunks,
   summarizeTopic,
   type RetrieverChunk,
@@ -91,6 +93,7 @@ const MIN_SUMMARY_WORDS = 260;
 const DEFAULT_CLASS_LEVEL = 3;
 const MAX_CLASS_LEVEL = 5;
 const MAX_PREVIEW_CARDS = 3;
+const WEB_FETCH_TIMEOUT_MS = 8_000;
 
 /**
  * POST /api/socratic/summarize
@@ -128,8 +131,11 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
   }
 
   try {
-    const targetLanguage = await _resolveSessionLanguage(className, subject, topic);
     const sourceMode = source === "custom" ? "custom" : "curriculum";
+    const targetLanguage =
+      sourceMode === "custom"
+        ? _detectLanguage(`${topic} ${subject}`)
+        : await _resolveSessionLanguage(className, subject, topic);
     const classLevel = _extractClassLevel(className);
     const safeStudentCount = Math.max(
       1,
@@ -432,88 +438,129 @@ async function _buildCustomTopicSummary(
   classLevel: number,
   lang: SupportedLanguage,
 ): Promise<SummaryShape> {
-  const snippets = await _fetchWebSnippets(topic, lang);
-  const webNotes = snippets
-    .map(
-      (snippet, idx) =>
-        `[Web note ${idx + 1}] ${snippet.title}\n${snippet.summary}\nSource: ${snippet.url}`,
-    )
-    .join("\n\n");
+  // Fetch web snippets in parallel — used as optional enrichment only.
+  const snippets = await _fetchWebSnippets(topic, lang).catch(() => [] as WebSnippet[]);
+  const webContext =
+    snippets.length > 0
+      ? snippets
+          .map((s, i) => `[${i + 1}] ${s.title}: ${s.summary}`)
+          .join("\n")
+          .slice(0, 1200)
+      : "";
 
   const prompt =
     lang === "ta"
       ? [
           "தமிழில் மட்டும் பதிலளிக்கவும்.",
           "நீங்கள் இந்திய தொடக்கப்பள்ளிக்கான மென்மையான கற்பித்தல் உதவியாளர்.",
-          `கற்றல் நிலை: வகுப்பு ${classLevel} (Class 1-5).`,
+          `கற்றல் நிலை: வகுப்பு ${classLevel}.`,
           `தலைப்பு: ${topic}`,
           `பாடம்: ${subject}`,
+          ...(webContext ? ["", "கூடுதல் குறிப்புகள்:", webContext] : []),
           "",
-          "கீழே உள்ள WEB NOTES-ஐ மட்டும் அடிப்படையாக கொள்ளவும்.",
-          "தகவல் குறைந்தால் எளிமையாகவே விளக்கவும்; கடினமான கருத்துகளை சேர்க்காதீர்கள்.",
-          "மெதுவான, அன்பான இந்திய ஆசிரியர் நடையில் எழுதவும். கட்டளையிடும் குரல் வேண்டாம்.",
+          `"${topic}" பற்றி வகுப்பு ${classLevel} மாணவர்களுக்கு ஏற்ற எளிய விளக்கம் தயார் செய்யவும்.`,
+          "உங்கள் சொந்த அறிவை பயன்படுத்தவும். அன்பான ஆசிரியர் நடையில் எழுதவும்.",
+          "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
+          "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
+          "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
+          "தமிழ்நாடு பள்ளி நடைபோக்கில் 'வணக்கம்', 'அம்மா', 'அப்பா', 'மாணவர்', 'ஆசிரியர்' போன்ற சொற்களைப் பயன்படுத்தலாம்.",
+          "வீடு அல்லது பள்ளி உதாரணங்களை கொடுக்கவும். MCQ சுற்றுக்கான bridge வரியுடன் முடிக்கவும்.",
           "",
-          "WEB NOTES:",
-          webNotes || "பயன்படுத்தத் தகுந்த web notes கிடைக்கவில்லை.",
-          "",
-          "விதிகள்:",
-          `- வகுப்பு ${classLevel} நிலைக்கு ஏற்ற எளிய தமிழில் எழுதவும்.`,
-          "- தலைப்பை நேராகத் தொடங்கவும்.",
-          "- வாழ்த்து வேண்டுமானால் ஒரு சுருக்கமான வரி மட்டும் போதும்.",
-          "- வீடு அல்லது பள்ளி உதாரணங்களை பயன்படுத்தலாம்.",
-          `- மொத்தம் குறைந்தது ${MIN_SUMMARY_WORDS} வார்த்தைகள் இருக்க வேண்டும்.`,
-          "- இறுதியில் MCQ சுற்றுக்கான மென்மையான bridge வரி வேண்டும்.",
-          "",
-          "JSON keys மட்டும் intro, content, key_points, bridge ஆகவே இருக்க வேண்டும்.",
-          "Return ONLY valid JSON.",
+          "Return ONLY valid JSON:",
           '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
         ].join("\n")
       : [
           "Respond only in English.",
-          "You are a calm primary-school teaching assistant.",
-          `Target learners: Class ${classLevel} (India, Class 1-5 stage).`,
+          "You are a calm Indian primary-school teaching assistant.",
+          `Target learners: Class ${classLevel} (India, Class 1-5).`,
           `Topic: ${topic}`,
           `Subject: ${subject}`,
+          ...(webContext ? ["", "Additional context:", webContext] : []),
           "",
-          "Use the WEB NOTES below as the main reference.",
-          "If a detail is missing, stay simple and avoid advanced explanations.",
-          "Write in a gentle Indian classroom-teacher tone, not an authoritative one.",
-          "",
-          "WEB NOTES:",
-          webNotes || "No web notes were available.",
-          "",
-          "Rules:",
-          `- Keep language and depth suitable for Class ${classLevel}.`,
-          "- Start directly with the topic explanation.",
-          "- If you greet, use only one short greeting like 'Good morning.' and then move straight into the topic.",
-          "- Do not include advanced theory, equations, or terms beyond Class 5 level.",
-          "- Give everyday examples from home or school where possible.",
-          "- Keep the narration suitable for about 2-3 minutes.",
-          `- Total words must be at least ${MIN_SUMMARY_WORDS}.`,
-          "- End with a bridge line that naturally starts MCQ practice.",
+          `Explain "${topic}" for Class ${classLevel} students using your own knowledge.`,
+          "Use a warm Indian classroom-teacher tone. Give simple home or school examples.",
+          "Do not ask the students questions. Do not use question marks in the summary.",
+          "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
+          "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
+          "Use neutral Tamil Nadu school wording such as Good morning, mother, father, student, and teacher.",
+          "Cover what it is, why it matters, and a real-life example. End with a bridge into MCQ practice.",
           "",
           "Return ONLY valid JSON in this exact shape:",
           '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
         ].join("\n");
 
+  let lastError: unknown = null;
+
   try {
     const generated =
       await generateLlmJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
     const normalized = _normalizeSummary(generated);
-    const lines = _toLines({ ...normalized, word_count: 0, chunks_used: 0 });
-    const words = _countWords(lines);
-    if (words >= MIN_SUMMARY_WORDS) {
+    // Accept the LLM response as long as it has real content — don't discard on word count alone.
+    if (normalized.intro.length >= 20 && normalized.content.length >= 60) {
+      const lines = _toLines({ ...normalized, word_count: 0, chunks_used: 0 });
       return {
         ...normalized,
-        word_count: words,
+        word_count: _countWords(lines),
         chunks_used: snippets.length,
       };
     }
-  } catch {
-    // Fall through to constrained fallback.
+  } catch (error) {
+    lastError = error;
+    // JSON mode failed — try plain text below.
   }
 
-  return _fallbackSummary(topic, subject, "custom", classLevel, webNotes, lang);
+  // --- Fallback: plain-text LLM call (no JSON constraint, much more reliable) ---
+  try {
+    const textPrompt =
+      lang === "ta"
+        ? [
+            "தமிழில் மட்டும் பதிலளிக்கவும்.",
+            `நீங்கள் வகுப்பு ${classLevel} மாணவர்களுக்கு "${topic}" (${subject}) பற்றி எளிய தமிழில் விளக்க வேண்டும்.`,
+            "அன்பான ஆசிரியர் நடையில் 3-4 பத்திகளில் எழுதுங்கள்.",
+            "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
+            "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
+            "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
+            "வீடு அல்லது பள்ளி உதாரணங்கள் கொடுக்கவும்.",
+            ...(webContext ? ["", "கூடுதல் குறிப்புகள்:", webContext] : []),
+          ].join("\n")
+        : [
+            `You are a primary school teacher in India. Explain "${topic}" (${subject}) to Class ${classLevel} students.`,
+            "Use simple words and give examples from daily life.",
+            "Write 3-4 paragraphs in a warm, friendly tone.",
+            "Do not ask the students questions. Do not use question marks.",
+            "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
+            "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
+            ...(webContext ? ["", "Additional context:", webContext] : []),
+          ].join("\n");
+
+    const raw =
+      lang === "ta"
+        ? await generateTamilResponse(textPrompt)
+        : await generateLlmResponse(textPrompt);
+
+    if (raw && raw.trim().length >= 40) {
+      const shape = _textToSummaryShape(raw, topic, lang);
+      const lines = _toLines({ ...shape, word_count: 0, chunks_used: 0 });
+      return {
+        ...shape,
+        word_count: _countWords(lines),
+        chunks_used: snippets.length,
+      };
+    }
+  } catch (error) {
+    lastError = error;
+    // Fall through to explicit Ollama error.
+  }
+
+  if (lastError instanceof AppError) throw lastError;
+
+  throw new AppError(
+    lang === "ta"
+      ? `"${topic}" தலைப்புக்கான சுருக்கத்தை Ollama உருவாக்க முடியவில்லை.`
+      : `Ollama could not generate a summary for "${topic}".`,
+    502,
+    "ollama",
+  );
 }
 
 async function _fallbackSummary(
@@ -545,6 +592,9 @@ async function _fallbackSummary(
           "சுமார் 2-3 நிமிடங்களுக்கு ஏற்ற வகையில் குறும்படிக் குரல் சுருக்கத்தை உருவாக்கவும்.",
           "தலைப்பை நேராகத் தொடங்கவும்.",
           "மிக மென்மையான ஆசிரியர் நடையில் எழுதவும்; கடுமையான கட்டளை குரல் வேண்டாம்.",
+          "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
+          "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
+          "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
           `மொத்த வார்த்தைகள் குறைந்தது ${MIN_SUMMARY_WORDS} இருக்க வேண்டும்.`,
           "குழந்தைகள் புரியும் எளிய தமிழை மட்டும் பயன்படுத்தவும்.",
           `வகுப்பு ${Math.min(classLevel, MAX_CLASS_LEVEL)} நிலையைத் தாண்டிய கருத்துகள் வேண்டாம்.`,
@@ -567,6 +617,9 @@ async function _fallbackSummary(
           "Start directly with the topic.",
           "Use a soft Indian teacher tone, not a strict or commanding tone.",
           "If you greet, use only one short greeting sentence and then continue with the summary.",
+          "Do not ask the students questions. Do not use question marks in the summary.",
+          "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
+          "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
           `Total words must be at least ${MIN_SUMMARY_WORDS}.`,
           "Use simple child-friendly language only.",
           `Do not go beyond Class ${Math.min(classLevel, MAX_CLASS_LEVEL)} level concepts.`,
@@ -576,29 +629,78 @@ async function _fallbackSummary(
           '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
         ].join("\n");
 
+  let lastError: unknown = null;
+
   try {
     const generated =
       await generateLlmJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
     const normalized = _normalizeSummary(generated);
     const lines = _toLines({ ...normalized, word_count: 0, chunks_used: 0 });
     const words = _countWords(lines);
-    if (words >= MIN_SUMMARY_WORDS) {
+    // Accept any response with real content
+    if (normalized.content.length >= 60) {
       return {
         ...normalized,
         word_count: words,
         chunks_used: 0,
       };
     }
-  } catch {
-    // Fall through to deterministic fallback.
+  } catch (error) {
+    lastError = error;
+    // JSON mode failed — try plain text below.
   }
 
-  const deterministic = _deterministicSummary(topic, subject, sourceNote, classLevel, lang);
-  return {
-    ...deterministic,
-    word_count: _countWords(_toLines({ ...deterministic, word_count: 0, chunks_used: 0 })),
-    chunks_used: 0,
-  };
+  // --- Fallback: plain-text LLM call ---
+  try {
+    const textPrompt =
+      lang === "ta"
+        ? [
+            "தமிழில் மட்டும் பதிலளிக்கவும்.",
+            `வகுப்பு ${classLevel} மாணவர்களுக்கு "${topic}" (${subject}) பற்றி 3-4 பத்திகளில் எளிமையாக விளக்குங்கள்.`,
+            "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
+            "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
+            "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
+            ...(contextHint ? ["", "குறிப்பு:", contextHint.slice(0, 800)] : []),
+          ].join("\n")
+        : [
+            `Explain "${topic}" (${subject}) for Class ${classLevel} students in 3-4 simple paragraphs.`,
+            "Use a warm teacher tone and daily-life examples.",
+            "Do not ask the students questions. Do not use question marks.",
+            "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
+            "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
+            ...(contextHint ? ["", "Reference notes:", contextHint.slice(0, 800)] : []),
+          ].join("\n");
+
+    const raw =
+      lang === "ta"
+        ? await generateTamilResponse(textPrompt)
+        : await generateLlmResponse(textPrompt);
+
+    if (raw && raw.trim().length >= 40) {
+      const shape = _textToSummaryShape(raw, topic, lang);
+      const lines = _toLines({ ...shape, word_count: 0, chunks_used: 0 });
+      return { ...shape, word_count: _countWords(lines), chunks_used: 0 };
+    }
+  } catch (error) {
+    lastError = error;
+    // Fall through to context-based fallback.
+  }
+
+  if (contextHint.trim()) {
+    const shape = _textToSummaryShape(contextHint, topic, lang);
+    const lines = _toLines({ ...shape, word_count: 0, chunks_used: 0 });
+    return { ...shape, word_count: _countWords(lines), chunks_used: 0 };
+  }
+
+  if (lastError instanceof AppError) throw lastError;
+
+  throw new AppError(
+    lang === "ta"
+      ? `"${topic}" தலைப்புக்கான சுருக்கத்தை Ollama உருவாக்க முடியவில்லை.`
+      : `Ollama could not generate a summary for "${topic}".`,
+    502,
+    "ollama",
+  );
 }
 
 async function _buildQuestionBank(
@@ -625,26 +727,31 @@ async function _buildQuestionBank(
     lang === "ta"
       ? [
           "தமிழில் மட்டும் பதிலளிக்கவும்.",
-          `நீங்கள் வகுப்பு ${classLevel} தொடக்கப்பள்ளி மாணவர்களுக்கான MCQ கேள்விகளை உருவாக்குகிறீர்கள்.`,
+          `நீங்கள் வகுப்பு ${classLevel} தொடக்கப்பள்ளி மாணவர்களுக்கான பாடத்திட்ட-சார்ந்த MCQ கேள்விகளை உருவாக்குகிறீர்கள்.`,
           `தலைப்பு: ${topic}`,
           `பாடம்: ${subject}`,
           `Source mode: ${source}`,
           "",
-          "இந்தச் சுருக்கத்தில் உள்ள கருத்துகளை மட்டும் பயன்படுத்தவும்:",
+          "முக்கியம்: கீழே உள்ள சுருக்கத்தில் உள்ள உண்மைகள், வரையறைகள், எடுத்துக்காட்டுகளை மட்டுமே பயன்படுத்தவும்.",
+          "உங்கள் சொந்த அறிவை சேர்க்காதீர்கள்.",
           summaryText + exerciseNote,
           "",
-          `மொத்தம் சரியாக ${questionCount} வேறுபட்ட கேள்விகளை உருவாக்கவும்.`,
-          "கேள்வி விதிகள்:",
-          "- தலைப்பின் உள்ளடக்கத்தை மட்டும் கேட்கவும்.",
+          `மொத்தம் சரியாக ${questionCount} வேறுபட்ட, தரமான கேள்விகளை உருவாக்கவும்.`,
+          "",
+          "கேள்வி தர விதிகள்:",
+          "- ஒவ்வொரு கேள்வியும் சுருக்கத்தில் உள்ள ஒரு குறிப்பிட்ட உண்மை, வரையறை, அல்லது கருத்தை சோதிக்க வேண்டும்.",
+          "- கேள்வி வகைகள்: நினைவுபடுத்தல் (X என்றால் என்ன?), அடையாளம் காணுதல் (எது Y?), பயன்பாடு (A என்றால் என்ன நடக்கும்?)",
+          "- 'நாம் என்ன கற்றோம்?' அல்லது 'முக்கிய கருத்து என்ன?' போன்ற பொதுவான கேள்விகள் வேண்டாம்.",
           "- கற்றல் நடைமுறை பற்றிய meta கேள்விகள் வேண்டாம்.",
+          "- தவறான விருப்பங்கள் நம்பகமான தவறுகளாக இருக்க வேண்டும் (பொதுவான தவறான புரிதல்கள்).",
           "- ஒவ்வொரு கேள்வியும் சுருக்கமாகவும் குழந்தைகள் புரியும் வகையிலும் இருக்க வேண்டும்.",
-          "- விருப்பங்கள் தெளிவாகவும் படிக்க எளிதாகவும் இருக்க வேண்டும்.",
+          "- பாடப்புத்தக பயிற்சிகள் இருந்தால், அவற்றை MCQ வடிவமாக மாற்றவும்.",
           "",
           "ஒவ்வொரு கேள்விக்கும்:",
-          "- q: ஒரு தெளிவான கேள்வி",
-          "- options: சரியாக 4 குறுகிய விருப்பங்கள்",
+          "- q: சுருக்கத்தில் உள்ள ஒரு குறிப்பிட்ட உண்மையை சோதிக்கும் தெளிவான கேள்வி",
+          "- options: சரியாக 4 குறுகிய விருப்பங்கள் ('மேற்கூறிய அனைத்தும்' வேண்டாம்)",
           "- answerIndex: சரியான விடையின் index (0 முதல் 3)",
-          "- explain: சரியான விடை ஏன் என்று ஒரு குறுகிய காரணம்",
+          "- explain: சரியான விடை ஏன் என்று பாடத்தில் இருந்து காரணம்",
           "",
           "JSON keys மட்டும் questions, q, options, answerIndex, explain ஆகவே இருக்க வேண்டும்.",
           "Return ONLY valid JSON.",
@@ -652,29 +759,46 @@ async function _buildQuestionBank(
         ].join("\n")
       : [
           "Respond only in English.",
-          `You are creating fun, interactive MCQ questions for Class ${classLevel} primary students (under 5 years old).`,
+          `You are creating curriculum-aligned MCQ questions for Class ${classLevel} primary school students.`,
           `Topic: ${topic}`,
           `Subject: ${subject}`,
           `Source mode: ${source}`,
           "",
-          "Use only ideas that appear in this summary:",
+          "IMPORTANT: Base ALL questions directly on the factual content below. Do NOT invent facts.",
+          "Use only ideas, definitions, examples, and facts that appear in this summary:",
           summaryText + exerciseNote,
           "",
-          `Create exactly ${questionCount} distinct questions.`,
-          "Question rules:",
-          "- Focus only on topic content (definition, fact, formula/basic relation if present, example, simple application).",
-          "- Do NOT ask teaching-process or meta questions (for example: 'core idea', 'why question rounds', 'answer style').",
-          "- Keep each question short and child-friendly (max 16 words).",
-          "- Use emojis in questions and options to make them fun and visual (e.g., '🍎 + 🍎 = ?' for math).",
-          "- For math: use emoji visuals instead of plain numbers when possible.",
-          "- Keep options concrete, easy to read, and visually distinct.",
-          "- If textbook exercise questions are provided, adapt them into MCQ format.",
+          `Create exactly ${questionCount} distinct, high-quality questions.`,
+          "",
+          "BANNED question patterns (NEVER use these):",
+          `- "Which option matches today's summary on ${topic}?" — this is a meta question`,
+          '- "What is the main idea?" — too vague',
+          '- "What did we learn today?" — meta question about the session',
+          '- "Today we are going to start..." — this is a statement, not a question',
+          "- Any question about the teaching process, language of instruction, or session format",
+          "- Any question where the options are statements about what the lesson covers",
+          "",
+          "GOOD question patterns (use these):",
+          `- "What is [specific term from the text]?" — tests factual recall`,
+          `- "How many [specific thing] are mentioned in [context]?" — tests comprehension`,
+          `- "Which of these is an example of [concept]?" — tests identification`,
+          `- "If [scenario from text], what happens?" — tests application`,
+          "",
+          "Question quality rules:",
+          "- Every question MUST test a specific fact, definition, concept, or relationship from the summary content.",
+          "- Question types: recall (what is X?), identification (which one is Y?), application (if A then what?), comparison.",
+          "- Do NOT ask about teaching methods, learning activities, the session, or the summary itself.",
+          "- Each question must have ONE clearly correct answer — wrong options must be plausible but definitively wrong.",
+          "- Keep language simple and age-appropriate (max 18 words per question).",
+          "- Wrong options should be common misconceptions or related-but-incorrect facts from the same domain.",
+          "- If textbook exercise questions are provided, adapt them into MCQ format directly.",
+          "- Vary difficulty: mix easy recall with slightly harder application questions.",
           "",
           "For each question provide:",
-          "- q: one clear, fun question with emojis where appropriate",
-          "- options: exactly 4 short options (no A/B/C/D labels, no 'all/none of the above')",
+          "- q: one clear question testing a specific fact from the summary",
+          "- options: exactly 4 short, concrete options (NOT sentences — just the answer words/phrase)",
           "- answerIndex: index of the correct option (0 to 3)",
-          "- explain: one short reason why that option is correct",
+          "- explain: one sentence explaining WHY the correct answer is right, referencing the fact from the text",
           "",
           "Return ONLY valid JSON in this exact shape:",
           '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
@@ -711,7 +835,10 @@ async function _fetchWebSnippets(topic: string, lang: SupportedLanguage): Promis
 
   let search: WikiSearchResponse | null = null;
   try {
-    const response = await fetch(searchUrl);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
+    const response = await fetch(searchUrl, { signal: controller.signal });
+    clearTimeout(timeout);
     if (response.ok) {
       search = (await response.json()) as WikiSearchResponse;
     }
@@ -730,7 +857,10 @@ async function _fetchWebSnippets(topic: string, lang: SupportedLanguage): Promis
     const summaryUrl = `https://${wikiHost}/api/rest_v1/page/summary/${slug}`;
 
     try {
-      const response = await fetch(summaryUrl);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
+      const response = await fetch(summaryUrl, { signal: controller.signal });
+      clearTimeout(timeout);
       if (!response.ok) continue;
       const data = (await response.json()) as WikiSummaryResponse;
       const summary = typeof data.extract === "string" ? data.extract.trim() : "";
@@ -749,18 +879,61 @@ async function _fetchWebSnippets(topic: string, lang: SupportedLanguage): Promis
   return snippets;
 }
 
+function _sanitizeSummaryText(text: string, lang: SupportedLanguage): string {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/_(.*?)_/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*[-*•]\s+/gm, "")
+    .replace(/\bnamaste\b/gi, lang === "ta" ? "வணக்கம்" : "Good morning")
+    .replace(/\bpapa\b/gi, lang === "ta" ? "அப்பா" : "father")
+    .replace(/\bmummy\b|\bmumma\b/gi, lang === "ta" ? "அம்மா" : "mother")
+    .replace(/\bbeta\b|\bbaccha\b/gi, lang === "ta" ? "குழந்தை" : "child")
+    .replace(/\bHow are you(?: doing)?(?: today)?\b[.!?]*/gi, "")
+    .replace(
+      /\bAre you ready\b[.!?]*/gi,
+      lang === "ta" ? "இப்போது தொடங்கலாம். " : "Now let us continue. ",
+    )
+    .replace(
+      /\bWhat do you see\b[.!?]*/gi,
+      lang === "ta" ? "சுற்றிலும் பாருங்கள். " : "Look around you. ",
+    )
+    .replace(
+      /\bCan you see\b[.!?]*/gi,
+      lang === "ta" ? "இங்கு நாம் பார்க்கலாம். " : "Here we can see. ",
+    )
+    .replace(/\bShall we\b[.!?]*/gi, lang === "ta" ? "இப்போது தொடர்வோம். " : "Let us continue. ")
+    .replace(/தயாரா[?!.]*/g, "இப்போது தொடங்கலாம். ")
+    .replace(/என்ன பார்க்கிறீர்கள்[?!.]*/g, "சுற்றிலும் பாருங்கள். ")
+    .replace(/\?/g, ".")
+    .replace(/\s+([,.;:!])/g, "$1")
+    .replace(/\.{2,}/g, ".")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function _normalizeSummary(
   value: Partial<Omit<SummaryShape, "word_count" | "chunks_used">>,
+  lang?: SupportedLanguage,
 ): Omit<SummaryShape, "word_count" | "chunks_used"> {
-  const intro = typeof value.intro === "string" ? value.intro.trim() : "";
-  const content = typeof value.content === "string" ? value.content.trim() : "";
-  const key_points = Array.isArray(value.key_points)
-    ? value.key_points
-        .map((p) => (typeof p === "string" ? p.trim() : ""))
-        .filter(Boolean)
-        .slice(0, 4)
+  const rawIntro = typeof value.intro === "string" ? value.intro.trim() : "";
+  const rawContent = typeof value.content === "string" ? value.content.trim() : "";
+  const rawKeyPoints = Array.isArray(value.key_points)
+    ? value.key_points.map((p) => (typeof p === "string" ? p.trim() : "")).filter(Boolean)
     : [];
-  const bridge = typeof value.bridge === "string" ? value.bridge.trim() : "";
+  const rawBridge = typeof value.bridge === "string" ? value.bridge.trim() : "";
+  const summaryLang =
+    lang ?? _detectLanguage([rawIntro, rawContent, ...rawKeyPoints, rawBridge].join(" "));
+
+  const intro = _sanitizeSummaryText(rawIntro, summaryLang);
+  const content = _sanitizeSummaryText(rawContent, summaryLang);
+  const key_points = rawKeyPoints
+    .map((point) => _sanitizeSummaryText(point, summaryLang))
+    .filter(Boolean)
+    .slice(0, 4);
+  const bridge = _sanitizeSummaryText(rawBridge, summaryLang);
 
   return { intro, content, key_points, bridge };
 }
@@ -949,7 +1122,14 @@ function _tightenSummaryOpening(
   subject: string,
   lang: SupportedLanguage,
 ): SummaryShape {
-  const introLines = _splitForFlow(summary.intro);
+  const sanitized = {
+    ...summary,
+    intro: _sanitizeSummaryText(summary.intro, lang),
+    content: _sanitizeSummaryText(summary.content, lang),
+    key_points: summary.key_points.map((point) => _sanitizeSummaryText(point, lang)),
+    bridge: _sanitizeSummaryText(summary.bridge, lang),
+  };
+  const introLines = _splitForFlow(sanitized.intro);
   const introText = introLines.join(" ").trim();
   const greeting =
     lang === "ta"
@@ -967,7 +1147,7 @@ function _tightenSummaryOpening(
 
   if (!introText || needsCompaction) {
     return {
-      ...summary,
+      ...sanitized,
       intro:
         lang === "ta"
           ? `${greeting}இன்று நாம் ${subject} பாடத்தில் ${topic} தலைப்பை மெதுவாக தொடங்கப் போகிறோம்.`
@@ -975,7 +1155,7 @@ function _tightenSummaryOpening(
     };
   }
 
-  return summary;
+  return sanitized;
 }
 
 function _isSummaryUsable(
@@ -997,16 +1177,93 @@ function _toLines(summary: SummaryShape): string[] {
   );
 }
 
+/** Convert free-form LLM text into the structured SummaryShape. */
+function _textToSummaryShape(
+  text: string,
+  topic: string,
+  lang: SupportedLanguage,
+): Omit<SummaryShape, "word_count" | "chunks_used"> {
+  const cleaned = _sanitizeSummaryText(text.replace(/\r/g, "").trim(), lang);
+  const paragraphs = cleaned
+    .split(/\n\n+/)
+    .map((p) => p.replace(/\s+/g, " ").trim())
+    .filter((p) => p.length > 20);
+
+  const allSentences = cleaned
+    .split(/(?<=[.!?।])\s+/)
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  const usableSentences = allSentences.filter((s) => {
+    const words = s.split(/\s+/).filter(Boolean).length;
+    return words >= 4 && words <= 20;
+  });
+
+  const intro = paragraphs[0] ?? usableSentences.slice(0, 2).join(" ") ?? cleaned;
+  const contentParagraphs = paragraphs.length > 1 ? paragraphs.slice(1) : [];
+  const content =
+    contentParagraphs.length > 0
+      ? contentParagraphs.join("\n\n")
+      : usableSentences.slice(1).join(" ") || intro;
+  const key_points = usableSentences.slice(0, 4);
+  const bridge =
+    allSentences.at(-1) ||
+    (lang === "ta"
+      ? `சரி. இப்போது ${topic} பற்றி ஒரு சிறிய MCQ சுற்றுக்கு செல்லலாம்.`
+      : `Good. Now we will move to a short MCQ round on ${topic}.`);
+
+  return { intro, content, key_points, bridge };
+}
+
 function _splitForFlow(text: string, preserveWhole = false): string[] {
   const trimmed = text.trim();
   if (!trimmed) return [];
   if (preserveWhole) return [trimmed];
 
-  return trimmed
-    .split(/\n+/)
-    .flatMap((part) => part.split(/(?<=[.!?])\s+/))
-    .map((line) => line.trim())
-    .filter(Boolean);
+  // Dialogue pattern: "Speaker: text" or "Speaker : text"
+  const dialogueRe = /^[\w\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20}\s*[:：]\s*.+/;
+  // Inline dialogue split: detect a second speaker starting mid-line
+  const inlineDialogueSplitRe =
+    /(?<=[.!?""']\s{1,3})(?=[A-Z\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20}\s*[:：])/g;
+
+  // Split by paragraphs (double newline) to keep natural text flow.
+  const paragraphs = trimmed.split(/\n\n+/);
+  const result: string[] = [];
+
+  for (const para of paragraphs) {
+    const subLines = para.split(/\n/);
+    // If any sub-line looks like dialogue, keep them as separate lines
+    if (subLines.some((sl) => dialogueRe.test(sl.trim()))) {
+      for (const sl of subLines) {
+        // Further split if multiple speakers are jammed into one line
+        const parts = sl.trim().split(inlineDialogueSplitRe);
+        for (const part of parts) {
+          const t = part.trim();
+          if (t) result.push(t);
+        }
+      }
+    } else {
+      // Regular paragraph — merge into one flowing block
+      const merged = subLines
+        .join(" ")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      if (merged) {
+        // Also check if the merged block contains inline dialogue
+        if (dialogueRe.test(merged)) {
+          const parts = merged.split(inlineDialogueSplitRe);
+          for (const part of parts) {
+            const t = part.trim();
+            if (t) result.push(t);
+          }
+        } else {
+          result.push(merged);
+        }
+      }
+    }
+  }
+
+  return result;
 }
 
 function _countWords(lines: string[]): number {
@@ -1069,7 +1326,29 @@ function _normalizeQuestions(raw: unknown, expectedCount: number): SocraticQuest
       };
     })
     .filter((q): q is SocraticQuestion => q !== null)
+    .filter((q) => !_isMetaQuestion(q))
     .slice(0, expectedCount);
+}
+
+/** Reject questions about the session/summary/lesson rather than topic content. */
+function _isMetaQuestion(q: SocraticQuestion): boolean {
+  const lower = q.q.toLowerCase();
+  const optionsLower = q.options.map((o) => o.toLowerCase()).join(" ");
+  // Meta patterns: questions about the lesson/summary itself
+  if (
+    /which option matches|today.?s summary|what did we learn|main idea of (the|this) (lesson|summary)|what is this (lesson|topic) about/i.test(
+      lower,
+    )
+  )
+    return true;
+  // Options that are statements about the lesson
+  if (
+    /today we are going to|this topic should be|are needed for this topic|is unrelated to/i.test(
+      optionsLower,
+    )
+  )
+    return true;
+  return false;
 }
 
 function _fallbackQuestions(
@@ -1210,8 +1489,8 @@ function _repairRagSummary(
     normalized.bridge.length >= 10
       ? normalized.bridge
       : lang === "ta"
-        ? `சரி. இப்போது ${topic} பற்றி சில கேள்விகளுக்கு பதில் சொல்லுவோம்.`
-        : `Great. Now let us answer a few questions about ${topic}.`;
+        ? `சரி. இப்போது ${topic} பற்றி ஒரு சிறிய MCQ சுற்றுக்கு செல்லலாம்.`
+        : `Good. Now we will move to a short MCQ round on ${topic}.`;
 
   const repaired = {
     intro: normalized.intro,
@@ -1221,40 +1500,4 @@ function _repairRagSummary(
   };
   const lines = _toLines({ ...repaired, word_count: 0, chunks_used: 0 });
   return { ...repaired, word_count: _countWords(lines), chunks_used: chunksUsed };
-}
-
-function _deterministicSummary(
-  topic: string,
-  subject: string,
-  sourceNote: string,
-  classLevel: number,
-  lang: SupportedLanguage,
-): Omit<SummaryShape, "word_count" | "chunks_used"> {
-  if (lang === "ta") {
-    return {
-      intro: `காலை வணக்கம். இன்று நாம் ${subject} பாடத்தில் ${topic} தலைப்பை அமைதியாக தொடங்கப் போகிறோம். இந்தப் பாடம் வகுப்பு ${classLevel} மாணவர்களுக்கு எளிமையாக இருக்கும்.`,
-      content: `முதலில், ${topic} என்றால் என்ன என்பதை எளிதாகப் புரிந்துகொள்வோம். இந்தத் தலைப்பை கடினமான வரிகளை மனப்பாடம் செய்ய மட்டும் நாம் கற்கவில்லை. அதை தெளிவாகச் சொல்லவும், வகுப்புப் பாடத்துடன் இணைக்கவும், அன்றாட வாழ்க்கையில் கண்டுபிடிக்கவும் நாம் கற்கிறோம். கேட்கும் போது மூன்று விஷயங்களை நினைவில் கொள்ளுங்கள்: அது என்ன, அதை எங்கு பார்க்கிறோம், அது எதற்கு உதவுகிறது. இந்த மூன்றையும் நினைவில் வைத்தால் பெரும்பாலான பள்ளிக் கேள்விகளுக்கு நம்பிக்கையுடன் பதிலளிக்கலாம்.\n\nஅடுத்து, இந்தத் தலைப்பை நம் தினசரி அனுபவத்துடன் இணைக்கலாம். வகுப்பறைச் செயல்கள், வீட்டுப் பொருட்கள், காலநிலை, உணவு, ஒளி, ஒலி, தாவரங்கள் அல்லது எளிய கருவிகள் போன்ற உதாரணங்கள் பாடத்தை உயிர்ப்புடன் காட்டும். ஒரு புதிய சொல் வந்தால் பயப்பட வேண்டாம். அதை எளிய பொருளாக உடைத்து, ஏற்கனவே தெரிந்த உதாரணத்துடன் இணைத்தால் புரிதல் வலுவாகும். இதுவே தொடக்க வகுப்புகளில் நல்ல கற்றலை உருவாக்கும்.\n\nஇப்போது தலைப்பை படிப்படியாக ஒழுங்குபடுத்திக் கொள்வோம்: பொருள், ஒரு தெளிவான தகவல், ஒரு உதாரணம், ஒரு முடிவு. இப்படிச் சிந்தித்தால் குழப்பம் குறையும். பாடத்தில் வரையறை, விதி அல்லது தொடர்பு இருந்தால் அதைச் சுருக்கமாக நினைவில் வைத்துக் கொள்ளுங்கள். உங்கள் வகுப்பு நிலையைத் தாண்டிய விபரங்கள் தேவையில்லை. குறுகியதும் சரியானதும் நீண்டதிலும் குழப்பமானதிலும் விட சிறந்தது.\n\nஇறுதியாக, முக்கிய அம்சங்களை கவனமாகக் கேட்டு, பதில்களைத் தேர்வுசெய்யும் முன் ஒவ்வொரு விருப்பத்தையும் ஒப்பிடுங்கள். தவறானவற்றை நீக்கி, பாடத்தில் சொன்ன கருத்துடன் சரியாகப் பொருந்தும் ஒன்றைத் தேர்ந்தெடுக்குங்கள். இந்த முறை மெதுவாக யோசிக்கும் மாணவர்களுக்கும் உதவும்.`,
-      key_points: [
-        `${topic} என்ற சொல்லின் எளிய பொருளை முதலில் சொல்.`,
-        "பாடத்துடன் பொருந்தும் ஒரு அன்றாட உதாரணத்தை நினைவில் கொள்.",
-        "முக்கிய தகவல் அல்லது விதியைச் சரியாக நினைவில் வை.",
-        "MCQ-யில் சுருக்கத்துடன் பொருந்தும் விருப்பத்தைத் தேர்ந்தெடு.",
-      ],
-      bridge:
-        "சரி. இப்போது MCQ சுற்றைத் தொடங்கலாம். ஒவ்வொரு கேள்வியையும் கவனமாகக் கேட்டு ஒரு சரியான விருப்பத்தைத் தொடு.",
-    };
-  }
-
-  return {
-    intro: `Good morning. Today we are going to start ${topic} in ${subject}. ${sourceNote} This lesson will stay simple, clear, and suitable for Class ${classLevel}.`,
-    content: `First, let us understand what ${topic} means in a simple way. We are not learning this topic to memorize difficult lines. We are learning it so we can explain it clearly, use it in classwork, and identify it in real life. While listening, think of three things: what it is, where we see it, and why it is useful. If you remember these three points, you can answer most school questions with confidence.\n\nNext, connect the topic with daily experience. Use examples from classroom activities, home objects, weather, food, light, sound, plants, or simple machines depending on the lesson. When a new word appears, do not panic. Break it into easy meaning and connect it to an example you already know. That is how strong understanding is built in primary classes.\n\nNow let us organize the topic step by step: meaning, one clear fact, one example, and one result. This order helps you avoid confusion. If the lesson includes a definition, relation, rule, or formula, remember it in short form and say what it tells us. Do not add advanced details beyond your class level. Short and correct is always better than long and confusing.\n\nFinally, listen carefully to key points and compare options before choosing answers. Read every option, remove wrong ones, and pick the one that exactly matches the lesson explanation. This method helps all students, including those who need extra time.`,
-    key_points: [
-      `Say the meaning of ${topic} in simple words first.`,
-      "Use one real-life example that matches the lesson.",
-      "Remember key fact or rule exactly as taught.",
-      "Choose MCQ options by matching them with summary facts.",
-    ],
-    bridge:
-      "Great. Now we will start the MCQ round. Read each question and tap one correct option.",
-  };
 }

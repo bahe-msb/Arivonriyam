@@ -77,6 +77,7 @@
   const QUESTIONS_PER_STUDENT = 6;
   const PROGRESS_SEGMENTS = 6;
   const AUTO_ADVANCE_MS = 5000;
+  const SUMMARY_FETCH_TIMEOUT_MS = 120000;
   const FALLBACK_EMOJIS = ["🦁", "🌻", "🦚", "🌙"];
   const OPTION_LABELS = ["A", "B", "C", "D"] as const;
 
@@ -585,18 +586,28 @@
     return defaults[index % defaults.length];
   }
 
+  /** Track dialogue speakers for alternating sides */
+  let _dialogueSpeakers: string[] = [];
+
   /** Detect if a line looks like dialogue/conversation (e.g., "Teacher: ...", "Student: ...") */
   function isDialogueLine(line: string): { speaker: string; text: string; side: "left" | "right" } | null {
-    const match = line.match(/^([\w\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20})\s*[:：]\s*(.+)/);
+    const match = line.match(/^([\w\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20})\s*[:：]\s*[""]?(.+?)[""]?\s*$/);
     if (!match) return null;
     const speaker = match[1].trim();
     const text = match[2].trim();
+    if (!text || text.length < 2) return null;
+
     const leftSpeakers = /^(teacher|ஆசிரியர்|அம்மா|அப்பா|mom|dad|parent|mother|father|person\s*1|speaker\s*1)/i;
     const rightSpeakers = /^(student|மாணவ|குழந்தை|child|kid|boy|girl|ram|ravi|priya|sita|person\s*2|speaker\s*2)/i;
     if (leftSpeakers.test(speaker)) return { speaker, text, side: "left" };
     if (rightSpeakers.test(speaker)) return { speaker, text, side: "right" };
-    // Any unrecognised speaker — alternate sides based on line position
-    return null;
+
+    // For any other speaker name — alternate sides based on who's speaking
+    if (!_dialogueSpeakers.includes(speaker)) {
+      _dialogueSpeakers.push(speaker);
+    }
+    const speakerIdx = _dialogueSpeakers.indexOf(speaker);
+    return { speaker, text, side: speakerIdx % 2 === 0 ? "left" : "right" };
   }
 
   /** Strip emoji characters from text so TTS doesn't read them out */
@@ -734,7 +745,7 @@
     void speakAsync(line, sessionLanguage).then(() => {
       if (runId !== summaryRunId || phase !== "summarizing") return;
 
-      // Small pause between lines for natural flow
+      // Longer pause between lines for natural flow and comprehension
       summaryFlowTimer = setTimeout(() => {
         if (runId !== summaryRunId || phase !== "summarizing") return;
         if (isLastLine) {
@@ -742,7 +753,7 @@
           return;
         }
         revealSummaryLine(nextIdx + 1, runId);
-      }, 600);
+      }, 1200);
     });
   }
 
@@ -752,19 +763,29 @@
     phase = "session";
   }
 
+  function customTopicLoadErrorMessage(): string {
+    return sessionLanguage === "ta"
+      ? "Ollama இந்த custom topic-க்கு சுருக்கத்தை உருவாக்கவில்லை. மீண்டும் முயற்சிக்கவும்."
+      : "Ollama did not generate a summary for this custom topic. Please try again.";
+  }
+
   async function fetchSummary(): Promise<void> {
     summaryLoading = true;
     summaryError = "";
 
     const expectedTurns = Math.max(1, students.length) * QUESTIONS_PER_STUDENT;
     const requestBody = buildSessionRequestBody();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SUMMARY_FETCH_TIMEOUT_MS);
 
     try {
       const response = await fetch("/api/socratic/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify(requestBody),
       });
+      clearTimeout(timeout);
 
       if (response.ok) {
         const data = (await response.json()) as SummarizeResponse;
@@ -772,16 +793,31 @@
         const lines = Array.isArray(data.lines)
           ? data.lines.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
           : [];
+        const normalizedPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
 
-        summaryLines = lines.length > 0 ? lines : fallbackLines();
+        if (topic?.source === "custom") {
+          if (lines.length === 0 || normalizedPlan.length === 0) {
+            summaryError = typeof data.error === "string" && data.error.trim()
+              ? data.error
+              : customTopicLoadErrorMessage();
+            summaryLines = [summaryError];
+            questionPlan = [];
+          } else {
+            summaryLines = lines;
+            questionPlan = normalizedPlan;
+          }
+        } else {
+          summaryLines = lines.length > 0 ? lines : fallbackLines();
+          questionPlan = normalizedPlan;
+          if (questionPlan.length === 0) {
+            questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+          }
+        }
+
         // Capture images from the response
         summaryImages = Array.isArray(data.images_base64)
           ? data.images_base64.filter((img): img is string => typeof img === "string" && img.length > 0)
           : [];
-        questionPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
-        if (questionPlan.length === 0) {
-          questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
-        }
       } else {
         const data = (await response.json().catch(() => ({}))) as SummarizeResponse;
         sessionLanguage = normalizeLanguage(data.language ?? sessionLanguage);
@@ -789,8 +825,9 @@
         summaryError = apiError;
 
         if (topic?.source === "custom") {
-          summaryLines = fallbackLines();
-          questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+          summaryLines = [apiError || customTopicLoadErrorMessage()];
+          summaryImages = [];
+          questionPlan = [];
         } else {
           summaryLines = [
             apiError,
@@ -799,13 +836,20 @@
           questionPlan = [];
         }
       }
-    } catch {
-      summaryError = sessionLanguage === "ta"
-        ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
-        : "Network issue while loading summary.";
+    } catch (error) {
+      clearTimeout(timeout);
+      const isAbort = error instanceof Error && error.name === "AbortError";
+      summaryError = isAbort
+        ? sessionLanguage === "ta"
+          ? "Ollama பதிலளிக்க அதிக நேரம் எடுத்துக்கொண்டது. மீண்டும் முயற்சிக்கவும்."
+          : "Ollama took too long to respond. Please try again."
+        : sessionLanguage === "ta"
+          ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
+          : "Network issue while loading summary.";
       if (topic?.source === "custom") {
-        summaryLines = fallbackLines();
-        questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+        summaryLines = [summaryError || customTopicLoadErrorMessage()];
+        summaryImages = [];
+        questionPlan = [];
       } else {
         summaryLines = [
           "Could not load textbook chunks for this class topic.",
@@ -834,6 +878,7 @@
     answered = [];
     summaryIdx = 0;
     summaryLines = [];
+    _dialogueSpeakers = [];
     summaryError = "";
     sessionLanguage = detectLanguage(topic?.topic ?? "");
     summaryPreviewCards = buildFallbackPreviewCards();
@@ -853,6 +898,7 @@
   /** Begin playback of pre-loaded content (called when student clicks "Start Beginning") */
   function startBeginning(): void {
     if (phase !== "ready") return;
+    if (summaryError || summaryLines.length === 0 || questionPlan.length === 0) return;
     _initTTS();
     phase = "summarizing";
     summaryIdx = 0;
@@ -953,7 +999,18 @@
   function _pickVoice(lang: "en" | "ta"): SpeechSynthesisVoice | undefined {
     const voices = speechSynthesis.getVoices();
     const prefix = lang === "ta" ? "ta" : "en";
-    // prefer exact locale match (ta-IN, en-IN, en-GB…) then any matching lang
+
+    if (lang === "en") {
+      // Strongly prefer Indian English voices for natural accent
+      const indianVoice =
+        voices.find((v) => v.lang === "en-IN") ??
+        voices.find((v) => v.lang.toLowerCase() === "en-in") ??
+        voices.find((v) => /\bindia\b/i.test(v.name) && v.lang.startsWith("en")) ??
+        voices.find((v) => v.lang.toLowerCase().startsWith("en-in"));
+      if (indianVoice) return indianVoice;
+    }
+
+    // Fallback: locale match then any matching lang
     return (
       voices.find((v) => v.lang.toLowerCase().startsWith(prefix + "-in")) ??
       voices.find((v) => v.lang.toLowerCase().startsWith(prefix))
@@ -969,17 +1026,21 @@
         return;
       }
       speechSynthesis.cancel();
-      const utt = new SpeechSynthesisUtterance(clean);
+      // Add natural pauses: insert brief pauses after commas and periods
+      const withPauses = clean
+        .replace(/([,;])\s*/g, "$1 ... ")
+        .replace(/([.!?])\s+/g, "$1 ... ");
+      const utt = new SpeechSynthesisUtterance(withPauses);
       utt.lang = lang === "ta" ? "ta-IN" : "en-IN";
       const voice = _pickVoice(lang);
       if (voice) utt.voice = voice;
-      utt.rate = lang === "ta" ? 0.82 : 0.88;
+      utt.rate = lang === "ta" ? 0.72 : 0.78;
       utt.pitch = 1.05;
       utt.onend = () => resolve();
       utt.onerror = () => resolve();
       speechSynthesis.speak(utt);
       // Safety net: if onend never fires (some browsers), resolve after max duration
-      const maxMs = Math.max(3000, clean.split(/\s+/).length * 600);
+      const maxMs = Math.max(4000, clean.split(/\s+/).length * 800);
       setTimeout(() => resolve(), maxMs);
     });
   }
@@ -995,15 +1056,32 @@
   // ── MCQ Timer ──────────────────────────────────────────────────────────────
   const MCQ_TIMER_SECONDS = 12;
   let mcqTimerValue = $state(0);
+  let mcqTimerRound = $state(0); // 0 = not started, 1 = first 12s, 2 = second 12s
   let mcqTimerInterval: ReturnType<typeof setInterval> | null = null;
 
   function startMcqTimer(): void {
     clearMcqTimer();
+    mcqTimerRound = 1;
     mcqTimerValue = MCQ_TIMER_SECONDS;
     mcqTimerInterval = setInterval(() => {
       mcqTimerValue -= 1;
       if (mcqTimerValue <= 0) {
-        clearMcqTimer();
+        if (mcqTimerRound === 1) {
+          // First 12s expired — give a second chance
+          mcqTimerRound = 2;
+          mcqTimerValue = MCQ_TIMER_SECONDS;
+          // Nudge speech
+          speak(
+            sessionLanguage === "ta"
+              ? "நேரம் முடிகிறது, விரைவாக பதிலளிக்கவும்!"
+              : "Time is running out, please answer quickly!",
+            sessionLanguage,
+          );
+        } else {
+          // Second 12s expired — auto-reveal answer
+          clearMcqTimer();
+          _autoRevealAnswer();
+        }
       }
     }, 1000);
   }
@@ -1013,6 +1091,30 @@
       clearInterval(mcqTimerInterval);
       mcqTimerInterval = null;
     }
+    mcqTimerRound = 0;
+  }
+
+  /** Auto-reveal answer when student doesn't respond in time */
+  function _autoRevealAnswer(): void {
+    if (!currentQ || phase !== "session" || answerPhase !== "ask") return;
+    // Mark as incorrect / unanswered
+    submittedOption = null;
+    lastCorrect = false;
+    answered = [...answered, { studentIdx: currentQ.student, correct: false }];
+    sessionAttempts = [
+      ...sessionAttempts,
+      {
+        studentIdx: currentQ.student,
+        question: currentQ.q,
+        selectedOption: "No answer (timed out)",
+        correctOption: currentQ.options[currentQ.answerIndex] ?? "",
+        correct: false,
+        explain: currentQ.explain,
+      },
+    ];
+    answerPhase = "feedback";
+    feedbackTitle = "Time Up";
+    feedbackDetail = `Correct answer: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`;
   }
 
   // Speak question + options, then start timer when MCQ begins
@@ -1022,11 +1124,11 @@
       mcqTimerValue = 0;
       const gen = ++mcqTtsGeneration;
       const student = students[currentQ.student];
-      const prefix = student ? `${student.name}. ` : "";
+      const prefix = student ? `${student.name}, ` : "";
       const optionsText = currentQ.options
-        .map((opt, i) => `${OPTION_LABELS[i]}. ${opt}`)
+        .map((opt, i) => `${OPTION_LABELS[i]}, ${opt}`)
         .join(". ");
-      const fullText = `${prefix}${currentQ.q}. ${optionsText}`;
+      const fullText = `${prefix}${currentQ.q}. ... ${optionsText}`;
       void speakAsync(fullText, sessionLanguage).then(() => {
         if (gen !== mcqTtsGeneration) return;
         if (phase === "session" && answerPhase === "ask") {
@@ -1198,29 +1300,59 @@
             </div>
 
           {:else if phase === "ready"}
-            <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
-              <div class="text-[48px]">✅</div>
-              <div
-                class="text-[24px] font-semibold"
-                style="color:var(--ink);"
-              >
-                Everything is ready!
+            {#if summaryError && questionPlan.length === 0}
+              <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
+                <div class="text-[48px]">⚠️</div>
+                <div class="text-[24px] font-semibold" style="color:var(--ink);">
+                  Could not prepare this custom topic
+                </div>
+                <div class="max-w-110 text-[14px] leading-[1.7]" style="color:var(--text-secondary);">
+                  {summaryError}
+                </div>
+                <div class="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onclick={startSession}
+                    class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
+                    style="background:{accent};"
+                  >
+                    Retry <RotateCcw class="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onclick={() => goto(resolve("/student/topic"))}
+                    class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold"
+                    style="background:{accent}12; color:{accent};"
+                  >
+                    Pick another topic
+                  </button>
+                </div>
               </div>
-              <div class="text-[14px] max-w-110" style="color:var(--text-secondary);">
-                Summary ({summaryLines.length} sections), {questionPlan.length} MCQ questions{summaryImages.length > 0 ? `, and ${summaryImages.length} textbook images` : ""} are preloaded.
+            {:else}
+              <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
+                <div class="text-[48px]">✅</div>
+                <div
+                  class="text-[24px] font-semibold"
+                  style="color:var(--ink);"
+                >
+                  Everything is ready!
+                </div>
+                <div class="text-[14px] max-w-110" style="color:var(--text-secondary);">
+                  Summary ({summaryLines.length} sections), {questionPlan.length} MCQ questions{summaryImages.length > 0 ? `, and ${summaryImages.length} textbook images` : ""} are preloaded.
+                </div>
+                <button
+                  type="button"
+                  onclick={startBeginning}
+                  class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-5 text-[20px] font-bold text-white transition-all hover:scale-[1.03] active:scale-[0.97]"
+                  style="background:#22c55e; box-shadow:0 16px 40px -12px #22c55e88;"
+                >
+                  ▶ Start Beginning <ArrowRight class="size-6" />
+                </button>
+                <div class="text-[11px]" style="color:var(--text-tertiary);">
+                  Hand the tablet to the student and tap "Start Beginning" to begin.
+                </div>
               </div>
-              <button
-                type="button"
-                onclick={startBeginning}
-                class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-5 text-[20px] font-bold text-white transition-all hover:scale-[1.03] active:scale-[0.97]"
-                style="background:#22c55e; box-shadow:0 16px 40px -12px #22c55e88;"
-              >
-                ▶ Start Beginning <ArrowRight class="size-6" />
-              </button>
-              <div class="text-[11px]" style="color:var(--text-tertiary);">
-                Hand the tablet to the student and tap "Start Beginning" to begin.
-              </div>
-            </div>
+            {/if}
 
           {:else if phase === "summarizing"}
             <div class="flex min-h-0 flex-1 flex-col gap-5 px-10 py-8">
@@ -1365,22 +1497,6 @@
                         </div>
                       {/if}
                     </div>
-                    {#if summaryImages.length > 0 && (i + 1) % 2 === 0}
-                      {@const imgIdx = Math.floor((i + 1) / 2) - 1}
-                      {#if imgIdx < summaryImages.length}
-                        {@const img = summaryImages[imgIdx]}
-                        <div class="my-3 overflow-hidden rounded-2xl border" style="border-color:#f3d49a; background:#fff9ed;">
-                          <img
-                            src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
-                            alt="Textbook illustration {imgIdx + 1}"
-                            class="w-full object-contain max-h-48"
-                          />
-                          <div class="px-3 py-2 text-[11px] font-medium" style="color:#ba7300;">
-                            📖 Textbook image {imgIdx + 1}
-                          </div>
-                        </div>
-                      {/if}
-                    {/if}
                   {/each}
                   <button
                     type="button"
@@ -1480,15 +1596,18 @@
                     <div class="h-2 flex-1 overflow-hidden rounded-full" style="background:#e5e1d8;">
                       <div
                         class="h-full rounded-full transition-all duration-1000 ease-linear"
-                        style="width:{Math.round((mcqTimerValue / MCQ_TIMER_SECONDS) * 100)}%; background:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                        style="width:{Math.round((mcqTimerValue / MCQ_TIMER_SECONDS) * 100)}%; background:{mcqTimerValue <= 3 ? '#ef4444' : mcqTimerRound === 2 ? '#f59e0b' : accent};"
                       ></div>
                     </div>
                     <span
                       class="text-[14px] font-bold tabular-nums"
-                      style="color:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                      style="color:{mcqTimerValue <= 3 ? '#ef4444' : mcqTimerRound === 2 ? '#f59e0b' : accent};"
                     >
                       {mcqTimerValue}s
                     </span>
+                    {#if mcqTimerRound === 2}
+                      <span class="text-[10px] font-semibold uppercase" style="color:#f59e0b;">Last chance</span>
+                    {/if}
                   </div>
                 {/if}
                 <div class="mt-6 grid shrink-0 grid-cols-2 gap-3">
@@ -1642,40 +1761,37 @@
                   {/each}
                 </div>
               {/if}
-              <div bind:this={desktopSummarySidebarEl} class="mt-3 flex-1 space-y-2 overflow-y-auto pr-1">
+              <div bind:this={desktopSummarySidebarEl} class="mt-3 flex-1 overflow-y-auto pr-1">
                 {#if summaryImages.length > 0}
-                  <div class="flex gap-2 overflow-x-auto pb-1">
+                  <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
                     {#each summaryImages.slice(0, 3) as img, i (`sidebar-img-${i}`)}
                       <img
                         src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
                         alt="Textbook image {i + 1}"
-                        class="h-16 w-20 shrink-0 rounded-xl object-cover border"
-                        style="border-color:#f3d49a;"
+                        class="h-14 w-18 shrink-0 rounded-lg object-cover border"
+                        style="border-color:#e8dfc8;"
                       />
                     {/each}
                   </div>
                 {/if}
-                {#each visibleSummaryLines as line, i (i)}
-                  {@const tone = getSummaryLineTone(line, i)}
-                  <div
-                    data-summary-line={i}
-                    class="rounded-2xl border px-3 py-2.5 text-[12px] leading-relaxed"
-                    style="border-color:{tone.cardBorder}; background:{tone.cardBackground}; color:var(--ink); opacity:{phase === 'summarizing' && summaryIdx - i > 0 ? 0.6 : 1};"
-                  >
-                    <div class="mb-1.5 flex items-center gap-2">
-                      <div
-                        class="grid size-6 shrink-0 place-items-center rounded-xl"
-                        style="background:{tone.chipBackground}; color:{tone.chipColor};"
+                <div class="text-[12px] leading-[1.7]" style="color:var(--text-body);">
+                  {#each visibleSummaryLines as line, i (i)}
+                    {@const dialogue = isDialogueLine(line)}
+                    {#if dialogue}
+                      <div class="my-1.5 rounded-lg px-2.5 py-1.5 text-[11px]" style="background:{dialogue.side === 'left' ? '#f0f7ff' : '#f0fdf4'};">
+                        <span class="font-bold" style="color:{dialogue.side === 'left' ? '#2569c7' : '#15803d'};">{dialogue.speaker}:</span>
+                        {dialogue.text}
+                      </div>
+                    {:else}
+                      <p
+                        class="mb-1.5"
+                        style="color:{phase === 'summarizing' && summaryIdx === i ? 'var(--ink)' : phase === 'summarizing' && i < summaryIdx ? '#999' : 'var(--text-body)'}; font-weight:{phase === 'summarizing' && summaryIdx === i ? 500 : 400};"
                       >
-                        <tone.icon class="size-3.5" />
-                      </div>
-                      <div class="text-[9.5px] font-semibold uppercase tracking-[0.16em]" style="color:{tone.chipColor};">
-                        {tone.label}
-                      </div>
-                    </div>
-                    {enrichWithEmojis(line)}
-                  </div>
-                {/each}
+                        {enrichWithEmojis(line)}
+                      </p>
+                    {/if}
+                  {/each}
+                </div>
               </div>
             {/if}
 
@@ -1873,21 +1989,39 @@
     </div>
 
   {:else if phase === "ready"}
-    <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
-      <div class="text-[48px]">✅</div>
-      <div class="text-[24px] font-semibold text-white">Ready!</div>
-      <div class="text-[14px]" style="color:rgba(255,255,255,0.55);">
-        {summaryLines.length} sections, {questionPlan.length} questions preloaded.
+    {#if summaryError && questionPlan.length === 0}
+      <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
+        <div class="text-[48px]">⚠️</div>
+        <div class="text-[24px] font-semibold text-white">Could not prepare this topic</div>
+        <div class="text-[14px] max-w-sm leading-[1.7]" style="color:rgba(255,255,255,0.58);">
+          {summaryError}
+        </div>
+        <button
+          type="button"
+          onclick={startSession}
+          class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-10 py-4 text-[17px] font-semibold text-white"
+          style="background:{accent}; box-shadow:0 16px 40px -12px {accent}88;"
+        >
+          Retry <RotateCcw class="size-5" />
+        </button>
       </div>
-      <button
-        type="button"
-        onclick={startBeginning}
-        class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-5 text-[20px] font-bold text-white transition-all hover:scale-[1.03] active:scale-[0.97]"
-        style="background:#22c55e; box-shadow:0 16px 40px -12px #22c55e88;"
-      >
-        ▶ Start Beginning <ArrowRight class="size-6" />
-      </button>
-    </div>
+    {:else}
+      <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
+        <div class="text-[48px]">✅</div>
+        <div class="text-[24px] font-semibold text-white">Ready!</div>
+        <div class="text-[14px]" style="color:rgba(255,255,255,0.55);">
+          {summaryLines.length} sections, {questionPlan.length} questions preloaded.
+        </div>
+        <button
+          type="button"
+          onclick={startBeginning}
+          class="mt-2 flex cursor-pointer items-center gap-3 rounded-2xl px-12 py-5 text-[20px] font-bold text-white transition-all hover:scale-[1.03] active:scale-[0.97]"
+          style="background:#22c55e; box-shadow:0 16px 40px -12px #22c55e88;"
+        >
+          ▶ Start Beginning <ArrowRight class="size-6" />
+        </button>
+      </div>
+    {/if}
 
   {:else if phase === "summarizing"}
     <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6">
@@ -2010,19 +2144,6 @@
                 </div>
               {/if}
             </div>
-            {#if summaryImages.length > 0 && (i + 1) % 2 === 0}
-              {@const imgIdx = Math.floor((i + 1) / 2) - 1}
-              {#if imgIdx < summaryImages.length}
-                {@const img = summaryImages[imgIdx]}
-                <div class="my-3 overflow-hidden rounded-2xl border" style="border-color:#f3d49a; background:#fff9ed;">
-                  <img
-                    src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
-                    alt="Textbook image {imgIdx + 1}"
-                    class="w-full object-contain max-h-36"
-                  />
-                </div>
-              {/if}
-            {/if}
           {/each}
           <button
             type="button"
@@ -2172,15 +2293,18 @@
                 <div class="h-2 flex-1 overflow-hidden rounded-full" style="background:rgba(255,255,255,0.15);">
                   <div
                     class="h-full rounded-full transition-all duration-1000 ease-linear"
-                    style="width:{Math.round((mcqTimerValue / MCQ_TIMER_SECONDS) * 100)}%; background:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                    style="width:{Math.round((mcqTimerValue / MCQ_TIMER_SECONDS) * 100)}%; background:{mcqTimerValue <= 3 ? '#ef4444' : mcqTimerRound === 2 ? '#f59e0b' : accent};"
                   ></div>
                 </div>
                 <span
                   class="text-[14px] font-bold tabular-nums"
-                  style="color:{mcqTimerValue <= 3 ? '#ef4444' : accent};"
+                  style="color:{mcqTimerValue <= 3 ? '#ef4444' : mcqTimerRound === 2 ? '#f59e0b' : accent};"
                 >
                   {mcqTimerValue}s
                 </span>
+                {#if mcqTimerRound === 2}
+                  <span class="text-[10px] font-semibold uppercase" style="color:#f59e0b;">Last chance</span>
+                {/if}
               </div>
             {/if}
             <div class="mt-5 space-y-2.5">

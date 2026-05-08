@@ -5,22 +5,38 @@ interface OllamaResponse {
   response?: string;
 }
 
+const OLLAMA_TIMEOUT_MS = 45_000;
+
 async function callOllama(body: Record<string, unknown>): Promise<string> {
   let response: Response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+  const baseUrl = env.ollamaBaseUrl.replace(/\/+$/, "");
 
   try {
-    response = await fetch(`${env.ollamaBaseUrl}/api/generate`, {
+    response = await fetch(`${baseUrl}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({ model: env.ollamaModel, stream: false, ...body }),
     });
-  } catch {
+  } catch (error) {
+    clearTimeout(timeout);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new AppError(
+        `Ollama did not respond within ${Math.round(OLLAMA_TIMEOUT_MS / 1000)} seconds.`,
+        504,
+        "ollama",
+      );
+    }
     throw new AppError(
       "Could not connect to Ollama. Ensure Ollama is running locally.",
       503,
       "ollama",
     );
   }
+
+  clearTimeout(timeout);
 
   if (!response.ok) {
     throw new AppError(
