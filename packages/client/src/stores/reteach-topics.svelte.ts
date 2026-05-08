@@ -73,7 +73,14 @@ class ReteachTopicsStore {
   }
 
   getSelectedTopic(classId: number): ReteachTopic | null {
-    return this.selectedTopicByClass[classId] ?? null;
+    const selected = this.selectedTopicByClass[classId] ?? null;
+    if (!selected || !this.completedTopicIds.includes(selected.id)) return selected;
+
+    const next = { ...this.selectedTopicByClass };
+    delete next[classId];
+    this.selectedTopicByClass = next;
+    this.persistSelected();
+    return null;
   }
 
   set(classId: number, topics: ReteachTopic[]): void {
@@ -98,6 +105,7 @@ class ReteachTopicsStore {
   }
 
   selectTopic(topic: ReteachTopic, classId: number): void {
+    if (this.completedTopicIds.includes(topic.id)) return;
     this.selectedTopicByClass = { ...this.selectedTopicByClass, [classId]: topic };
     this.persistSelected();
   }
@@ -113,6 +121,15 @@ class ReteachTopicsStore {
     if (!this.completedTopicIds.includes(topicId)) {
       this.completedTopicIds = [...this.completedTopicIds, topicId];
       this.persistCompleted();
+    }
+
+    const next = Object.fromEntries(
+      Object.entries(this.selectedTopicByClass).filter(([, topic]) => topic?.id !== topicId),
+    ) as Record<number, ReteachTopic>;
+
+    if (Object.keys(next).length !== Object.keys(this.selectedTopicByClass).length) {
+      this.selectedTopicByClass = next;
+      this.persistSelected();
     }
   }
 

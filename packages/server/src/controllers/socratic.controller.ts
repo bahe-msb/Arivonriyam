@@ -552,7 +552,6 @@ async function _buildCustomTopicSummary(
   );
 }
 
-
 async function _buildQuestionBank(
   topic: string,
   subject: string,
@@ -956,7 +955,6 @@ function _compactPreviewCaption(text: string, topic: string, subject: string): s
   if (words.length <= 18) return words.join(" ");
   return `${words.slice(0, 18).join(" ")}...`;
 }
-
 
 function _tightenSummaryOpening(
   summary: SummaryShape,

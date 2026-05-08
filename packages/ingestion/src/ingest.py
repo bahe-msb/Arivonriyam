@@ -132,12 +132,180 @@ _preprocessor = TextPreprocessor()
 _chunker      = SemanticChunker()
 
 
-def _build_chapter_map(elements) -> dict[int, tuple[str, int]]:
-    """Return page_number → (chapter_title, chapter_number) by scanning Title elements.
+# ── ToC extraction ────────────────────────────────────────────────────────────
 
-    We walk the element list in order; every Title element starts a new chapter.
-    Non-Title elements inherit the most-recently-seen chapter.
+_TOC_MARKERS = frozenset({
+    "பொருளடக்கம்", "பொருளடக்கம",
+    "உள்ளடக்கம்", "உள்ளடக்கம",
+    "contents", "table of contents", "index",
+})
+
+_TITLE_COL_HINTS = {"unit", "chapter", "பாடத்தலைப்பு", "title", "lesson", "topic", "units", "name", "பாடம்"}
+_PAGE_COL_HINTS  = {"page", "பக்க", "pg", "page no", "p.no", "பக்க எண்", "பக்கம்"}
+_SNO_COL_HINTS   = {"s.no", "sno", "no", "வ.எண்", "வ. எண்", "#", "sl", "வ.எண", "sl.no"}
+
+
+def _is_toc_marker(text: str) -> bool:
+    t = text.strip().lower()
+    return any(m in t for m in _TOC_MARKERS) and len(t) < 80
+
+
+def _parse_toc_table_html(html: str) -> list[tuple[str, int]]:
+    """Parse a ToC table HTML → [(chapter_title, page_start), ...].
+
+    Handles both Tamil (பொருளடக்கம்) and English (CONTENTS) table formats.
+    Sub-chapters like "1.1" are filtered out — only top-level rows kept.
     """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.warning("beautifulsoup4 not available for ToC parsing")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.find_all("tr")
+    if len(rows) < 2:
+        return []
+
+    # Detect columns from header row
+    header_cells = rows[0].find_all(["th", "td"])
+    headers = [c.get_text(strip=True).lower() for c in header_cells]
+
+    title_col: int | None = None
+    page_col:  int | None = None
+    sno_col:   int | None = None
+
+    for i, h in enumerate(headers):
+        if title_col is None and any(hint in h for hint in _TITLE_COL_HINTS):
+            title_col = i
+        if page_col is None and any(hint in h for hint in _PAGE_COL_HINTS):
+            page_col = i
+        if sno_col is None and any(hint in h for hint in _SNO_COL_HINTS):
+            sno_col = i
+
+    # Sensible defaults when header detection fails
+    if title_col is None:
+        title_col = 1 if len(headers) >= 2 else 0
+    if page_col is None and len(headers) >= 3:
+        page_col = 2
+
+    results: list[tuple[str, int]] = []
+    for row in rows[1:]:
+        cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+        if len(cells) <= title_col:
+            continue
+
+        # Skip sub-chapter rows ("1.1", "2.3", etc.)
+        if sno_col is not None and sno_col < len(cells):
+            sno = cells[sno_col].strip()
+            if "." in sno and sno[0].isdigit():
+                continue
+
+        title = cells[title_col].strip()
+        if not title or len(title) < 3:
+            continue
+
+        page_num = 0
+        if page_col is not None and page_col < len(cells):
+            digits = "".join(c for c in cells[page_col] if c.isdigit())
+            page_num = int(digits) if digits else 0
+
+        results.append((title, page_num))
+
+    return results
+
+
+def _extract_toc_chapters(elements) -> list[tuple[str, int]] | None:
+    """Detect a Table of Contents page and extract (chapter_title, page_start) pairs.
+
+    Looks for பொருளடக்கம் / INDEX / CONTENTS in the first 10 pages,
+    then parses Table elements on that page.
+    Returns sorted [(title, page_start), ...], or None if no ToC found.
+    """
+    # Phase 1: find ToC page numbers
+    toc_pages: set[int] = set()
+    for el in elements:
+        meta = getattr(el, "metadata", None)
+        pg = int(meta.page_number) if meta and meta.page_number else 0
+        if pg > 10:
+            break
+        if _is_toc_marker(getattr(el, "text", "") or ""):
+            toc_pages.update({pg, pg + 1})
+
+    if not toc_pages:
+        return None
+
+    # Phase 2: parse Table elements on those pages
+    chapters: list[tuple[str, int]] = []
+    for el in elements:
+        meta = getattr(el, "metadata", None)
+        pg = int(meta.page_number) if meta and meta.page_number else 0
+        if pg not in toc_pages:
+            continue
+        if type(el).__name__ == "Table":
+            html = getattr(meta, "text_as_html", None)
+            if html:
+                parsed = _parse_toc_table_html(html)
+                chapters.extend(parsed)
+
+    if len(chapters) >= 2:
+        logger.info("  ToC table extracted: %d chapters", len(chapters))
+        return sorted(chapters, key=lambda x: x[1])
+
+    # Phase 3: text fallback — numbered entries on the ToC page
+    import re
+    fallback: list[tuple[str, int]] = []
+    for el in elements:
+        meta = getattr(el, "metadata", None)
+        pg = int(meta.page_number) if meta and meta.page_number else 0
+        if pg not in toc_pages:
+            continue
+        el_type = type(el).__name__
+        if el_type not in ("NarrativeText", "ListItem", "Title"):
+            continue
+        txt = (getattr(el, "text", "") or "").strip()
+        if _is_toc_marker(txt):
+            continue
+        m = re.match(r"^(\d+)[.\s]+(.+?)(?:\s+(\d+))?$", txt)
+        if m and len(m.group(2).strip()) >= 3:
+            fallback.append((m.group(2).strip(), int(m.group(3) or 0)))
+
+    if len(fallback) >= 2:
+        logger.info("  ToC text-fallback extracted: %d chapters", len(fallback))
+        return sorted(fallback, key=lambda x: x[1])
+
+    return None
+
+
+def _build_chapter_map_from_toc(
+    toc_chapters: list[tuple[str, int]],
+) -> dict[int, tuple[str, int]]:
+    """Build page_number → (chapter_title, chapter_number) using ToC page ranges."""
+    with_pages = [(t, p, i + 1) for i, (t, p) in enumerate(toc_chapters) if p > 0]
+    if not with_pages:
+        # No page numbers in ToC — return a simple mapping for page 0
+        return {0: (toc_chapters[0][0], 1)} if toc_chapters else {}
+
+    result: dict[int, tuple[str, int]] = {}
+    for idx, (title, page_start, chapter_num) in enumerate(with_pages):
+        page_end = with_pages[idx + 1][1] - 1 if idx + 1 < len(with_pages) else 9999
+        for pg in range(page_start, page_end + 1):
+            result[pg] = (title, chapter_num)
+    return result
+
+
+def _build_chapter_map(
+    elements,
+    toc_chapters: list[tuple[str, int]] | None = None,
+) -> dict[int, tuple[str, int]]:
+    """Return page_number → (chapter_title, chapter_number).
+
+    Uses ToC page-range mapping when available; falls back to Title scanning.
+    """
+    if toc_chapters and len(toc_chapters) >= 2:
+        return _build_chapter_map_from_toc(toc_chapters)
+
+    # Fallback: walk elements and treat every Title as a new chapter
     page_chapter: dict[int, tuple[str, int]] = {}
     current_title = ""
     current_number = 0
@@ -166,13 +334,14 @@ def build_documents(
     subject: str,
     source_file: str,
     generate_questions: bool = True,
+    toc_chapters: list[tuple[str, int]] | None = None,
 ) -> List[Document]:
     """Run preprocess → chunk → enrich → postprocess and return LangChain Documents."""
     standard = _parse_standard(class_name)
 
-    # Build page → (chapter_title, chapter_number) map so each chunk gets
-    # the correct chapter, not just the first Title in the entire PDF.
-    chapter_map = _build_chapter_map(elements)
+    # Build page → (chapter_title, chapter_number) map.
+    # Uses authoritative ToC data when available; falls back to Title scanning.
+    chapter_map = _build_chapter_map(elements, toc_chapters)
 
     preprocessed = _preprocessor.preprocess(elements)
     chunks       = _chunker.chunk(preprocessed)
@@ -273,10 +442,18 @@ def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = T
     elements = partition_document(str(pdf_path))
     logger.info("  [stage 1/4] partition: %.1fs", time.time() - t0)
 
+    # Extract authoritative chapter list from ToC page before building docs
+    toc_chapters = _extract_toc_chapters(elements)
+    if toc_chapters:
+        logger.info("  ToC found: %s", [t for t, _ in toc_chapters])
+    else:
+        logger.info("  No ToC detected — chapter names will come from Title elements")
+
     t0 = time.time()
     docs = build_documents(
         elements, class_name, subject, pdf_path.name,
         generate_questions=generate_questions,
+        toc_chapters=toc_chapters,
     )
     logger.info("  [stage 2-5/4] preprocess+chunk+enrich+postprocess: %.1fs → %d docs",
                 time.time() - t0, len(docs))
@@ -285,8 +462,14 @@ def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = T
     store_documents(docs)
     logger.info("  [stage 6/4] embed+store: %.1fs", time.time() - t0)
 
-    chapters = _extract_chapters(docs)
-    upsert_chapters(class_name, subject, chapters)
+    # Use ToC chapters (title + page_start) if available; else derive from chunk metadata
+    if toc_chapters:
+        chapter_titles  = [t for t, _ in toc_chapters]
+        chapter_pages   = [p for _, p in toc_chapters]
+    else:
+        chapter_titles  = _extract_chapters(docs)
+        chapter_pages   = [0] * len(chapter_titles)
+    upsert_chapters(class_name, subject, chapter_titles, page_starts=chapter_pages)
     log_ingestion(class_name, subject, pdf_path.name, len(docs), file_hash)
 
     t0 = time.time()
@@ -295,7 +478,7 @@ def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = T
         upsert_pdf_images(class_name, subject, pdf_path.name, images)
         logger.info("  [images] stored %d images (PyMuPDF) in %.1fs", len(images), time.time() - t0)
 
-    logger.info("  %d chunks, %d chapters — total %.1fs", len(docs), len(chapters), time.time() - t_start)
+    logger.info("  %d chunks, %d chapters — total %.1fs", len(docs), len(chapter_titles), time.time() - t_start)
     return len(docs)
 
 

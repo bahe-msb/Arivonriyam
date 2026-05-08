@@ -41,8 +41,12 @@ def init_db() -> None:
                     subject       TEXT NOT NULL,
                     chapter       TEXT NOT NULL,
                     chapter_order INTEGER DEFAULT 0,
+                    page_start    INTEGER DEFAULT 0,
                     UNIQUE(class_name, subject, chapter)
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE manifest ADD COLUMN IF NOT EXISTS page_start INTEGER DEFAULT 0
             """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_manifest_lookup
@@ -94,7 +98,14 @@ def log_ingestion(
         conn.commit()
 
 
-def upsert_chapters(class_name: str, subject: str, chapters: List[str]) -> None:
+def upsert_chapters(
+    class_name: str,
+    subject: str,
+    chapters: List[str],
+    page_starts: List[int] | None = None,
+) -> None:
+    if page_starts is None:
+        page_starts = [0] * len(chapters)
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -102,10 +113,13 @@ def upsert_chapters(class_name: str, subject: str, chapters: List[str]) -> None:
                 (class_name, subject),
             )
             cur.executemany(
-                """INSERT INTO manifest (class_name, subject, chapter, chapter_order)
-                   VALUES (%s, %s, %s, %s)
+                """INSERT INTO manifest (class_name, subject, chapter, chapter_order, page_start)
+                   VALUES (%s, %s, %s, %s, %s)
                    ON CONFLICT (class_name, subject, chapter) DO NOTHING""",
-                [(class_name, subject, ch, i) for i, ch in enumerate(chapters)],
+                [
+                    (class_name, subject, ch, i, page_starts[i] if i < len(page_starts) else 0)
+                    for i, ch in enumerate(chapters)
+                ],
             )
         conn.commit()
 

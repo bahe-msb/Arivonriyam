@@ -18,15 +18,21 @@
     pickedClassId = id;
     // Restore previously selected topic for this class if it still exists
     const saved = reteachTopics.getSelectedTopic(id);
-    picked = saved && reteachTopics.get(id).some((t) => t.id === saved.id) ? saved : null;
+    picked =
+      saved &&
+      !reteachTopics.isCompleted(saved.id) &&
+      reteachTopics.get(id).some((t) => t.id === saved.id)
+        ? saved
+        : null;
   }
 
   function select(t: ReteachTopic): void {
+    if (reteachTopics.isCompleted(t.id)) return;
     picked = picked?.id === t.id ? null : t;
   }
 
   function proceed(): void {
-    if (!picked || pickedClassId === null) return;
+    if (!picked || pickedClassId === null || reteachTopics.isCompleted(picked.id)) return;
     activeClass.set(pickedClassId);
     reteachTopics.selectTopic(picked, pickedClassId);
     goto(resolve("/student/socratic"));
@@ -152,8 +158,9 @@
               {@const accent = cls?.color ?? "#6B94E7"}
               <button
                 type="button"
+                disabled={done}
                 onclick={() => select(t)}
-                class="flex shrink-0 cursor-pointer flex-col rounded-3xl p-7 text-left transition-all duration-200 hover:-translate-y-1"
+                class={`flex shrink-0 flex-col rounded-3xl p-7 text-left transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-60 ${done ? "" : "cursor-pointer hover:-translate-y-1"}`}
                 style="
                   width:260px;
                   min-height:280px;
