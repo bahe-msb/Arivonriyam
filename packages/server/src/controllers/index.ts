@@ -2,6 +2,7 @@ export * from "./alerts.controller";
 export * from "./health.controller";
 export * from "./lesson.controller";
 export * from "./rag.controller";
+export * from "./reteach.controller";
 export * from "./report.controller";
 export * from "./school.controller";
 export * from "./socratic.controller";

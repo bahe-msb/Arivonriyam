@@ -1,37 +1,56 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { resolve } from "$app/paths";
+  import { page } from "$app/state";
   import { ArrowRight, BookOpen, Pencil } from "lucide-svelte";
   import { Button, Card } from "@shadcn";
-  import { Pill } from "@components";
+  import { DateNav, Pill } from "@components";
   import { CLASSES } from "@mocks";
   import { activeClass, reteachTopics } from "@stores";
   import type { ReteachTopic } from "@stores";
 
-  let pickedClassId = $state<number | null>(null);
+  void reteachTopics.load();
+  const readOnly = $derived(reteachTopics.readOnly);
+
+  function getInitialClassId(): number | null {
+    const classParam = page.url.searchParams.get("class");
+    if (classParam === null) return null;
+
+    const classId = Number(classParam);
+    return Number.isInteger(classId) && CLASSES.some((cls) => cls.id === classId) ? classId : null;
+  }
+
+  function getSavedTopic(id: number): ReteachTopic | null {
+    const saved = reteachTopics.getSelectedTopic(id);
+    return saved &&
+      !reteachTopics.isCompleted(saved.id) &&
+      reteachTopics.get(id).some((topic) => topic.id === saved.id)
+      ? saved
+      : null;
+  }
+
+  const initialClassId = getInitialClassId();
+  let pickedClassId = $state<number | null>(initialClassId);
   const cls = $derived(CLASSES.find((c) => c.id === pickedClassId));
   const topics = $derived(pickedClassId !== null ? reteachTopics.get(pickedClassId) : []);
 
-  let picked = $state<ReteachTopic | null>(null);
+  let picked = $state<ReteachTopic | null>(
+    initialClassId !== null ? getSavedTopic(initialClassId) : null,
+  );
 
   function selectClass(id: number): void {
     pickedClassId = id;
-    // Restore previously selected topic for this class if it still exists
-    const saved = reteachTopics.getSelectedTopic(id);
-    picked =
-      saved &&
-      !reteachTopics.isCompleted(saved.id) &&
-      reteachTopics.get(id).some((t) => t.id === saved.id)
-        ? saved
-        : null;
+    picked = getSavedTopic(id);
   }
 
   function select(t: ReteachTopic): void {
+    if (readOnly) return;
     if (reteachTopics.isCompleted(t.id)) return;
     picked = picked?.id === t.id ? null : t;
   }
 
   function proceed(): void {
+    if (readOnly) return;
     if (!picked || pickedClassId === null || reteachTopics.isCompleted(picked.id)) return;
     activeClass.set(pickedClassId);
     reteachTopics.selectTopic(picked, pickedClassId);
@@ -50,17 +69,30 @@
       <div class="page-title mt-1">Topic Picker</div>
       <div class="page-subtitle">Select a class, then choose a topic. Summary and MCQs follow the uploaded textbook language.</div>
     </div>
-    <div class="flex flex-wrap items-center gap-2">
-      <Pill tone="success">
-        <span class="bg-success-500 size-1.5 rounded-full animate-pulse"></span>
-        Local AI ready
-      </Pill>
-      <Pill tone="cobalt">Tamil or English follows the textbook PDF</Pill>
-      <Button variant="primary" disabled={!picked || pickedClassId === null} onclick={proceed}>
-        Start session <ArrowRight class="size-3.5" />
-      </Button>
+    <div class="flex flex-wrap items-center justify-end gap-2">
+      <DateNav
+        label="Day"
+        value={reteachTopics.currentDate}
+        onChange={(d) => void reteachTopics.setDate(d)}
+      />
+      <div class="flex items-center gap-2">
+        <Pill tone="cobalt">Tamil or English follows the textbook PDF</Pill>
+        <Button
+          variant="primary"
+          disabled={!picked || pickedClassId === null || readOnly}
+          onclick={proceed}
+        >
+          Start session <ArrowRight class="size-3.5" />
+        </Button>
+      </div>
     </div>
   </div>
+
+  {#if readOnly}
+    <div class="shrink-0 rounded-2xl border border-[#f3d49a] bg-[#fff8ea] px-4 py-2.5 text-[12px] text-[#9a6708]">
+      Viewing past day — read only. Switch to Today to start a session.
+    </div>
+  {/if}
 
   <!-- Class selector -->
   <div class="flex shrink-0 flex-wrap gap-2">

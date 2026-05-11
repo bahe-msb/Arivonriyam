@@ -5,11 +5,15 @@ import tailwindcss from "@tailwindcss/vite";
 export default defineConfig({
   plugins: [tailwindcss(), sveltekit()],
   server: {
+    host: "0.0.0.0",
     proxy: {
       "/api": {
         target: "http://localhost:9012",
         changeOrigin: true,
       },
     },
+  },
+  preview: {
+    host: "0.0.0.0",
   },
 });

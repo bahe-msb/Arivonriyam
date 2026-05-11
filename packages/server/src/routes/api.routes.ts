@@ -4,6 +4,7 @@ import {
   getHealth,
   getLessonChapters,
   getLessonSubjects,
+  getReteachState,
   getTodayPlans,
   getTestStt,
   getSchoolConfig,
@@ -13,6 +14,7 @@ import {
   postSocraticAlertSuggestion,
   postSocraticPreview,
   postLessonBlueprint,
+  postReteachState,
   postSavePlan,
   postSocraticSummarize,
   postSchoolConfig,
@@ -28,6 +30,7 @@ export function createApiRouter(): Router {
 
   // Health
   router.get("/health", getHealth);
+  router.get("/api/health", getHealth);
 
   // School setup
   router.get("/api/school/config", getSchoolConfig);
@@ -38,6 +41,10 @@ export function createApiRouter(): Router {
   // Alerts
   router.get("/api/alerts", getAlerts);
   router.post("/api/alerts/session", postAlertsSession);
+
+  // Reteach state
+  router.get("/api/reteach/state", getReteachState);
+  router.post("/api/reteach/state", postReteachState);
 
   // Report
   router.get("/api/report/performance", getReportPerformance);

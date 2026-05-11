@@ -8,6 +8,7 @@
     CheckCircle2,
     AlertCircle,
   } from "lucide-svelte";
+  import { untrack } from "svelte";
   import { Button, Card, Input, Select } from "@shadcn";
 
   import { Block, PageHeader, Pill } from "@components";
@@ -17,81 +18,243 @@
   type SubjectOption = { id: string; label: string };
   type BlueprintBlock = { phase: string; title: string; durationMin: number; body: string };
   type Blueprint = { title: string; blocks: BlueprintBlock[] };
+  type ClassSelection = { subject: string; duration: string };
+  type BlueprintDraft = {
+    classId: number;
+    className: string;
+    subject: string;
+    subjectLabel: string;
+    chapter: string;
+    duration: string;
+    durationMin: number;
+    blueprint: Blueprint;
+    saveSuccess: boolean;
+  };
+  type ConflictState = { selectionKey: string; classId: number; chapter: string };
+
+  const DEFAULT_DURATION = "45m";
 
   let cls = $state(3);
   let subject = $state("");
   let chapter = $state("");
-  let duration = $state("45m");
+  let duration = $state(DEFAULT_DURATION);
 
   let subjects = $state<SubjectOption[]>([]);
   let chapters = $state<string[]>([]);
-  let subjectsLoading = $state(false);
-  let chaptersLoading = $state(false);
-
-  let blueprint = $state<Blueprint | null>(null);
-  let generating = $state(false);
-  let error = $state("");
-
-  let saving = $state(false);
-  let saveSuccess = $state(false);
-  let showConflictDialog = $state(false);
-  let conflictChapter = $state("");
+  let subjectsByClass = $state<Record<number, SubjectOption[]>>({});
+  let classSelections = $state<Record<number, ClassSelection>>({});
+  let chapterSelections = $state<Record<string, string>>({});
+  let chaptersByLookup = $state<Record<string, string[]>>({});
+  let draftsBySelection = $state<Record<string, BlueprintDraft>>({});
+  let generatingBySelection = $state<Record<string, boolean>>({});
+  let errorsBySelection = $state<Record<string, string>>({});
+  let subjectsLoadingByClass = $state<Record<number, boolean>>({});
+  let chaptersLoadingByLookup = $state<Record<string, boolean>>({});
+  let savingSelectionKey = $state<string | null>(null);
+  let conflict = $state<ConflictState | null>(null);
 
   const durations = ["30m", "40m", "45m", "50m"];
-  const className = $derived(`class_${cls}`);
+  const getClassName = (classId: number): string => `class_${classId}`;
+  const getChapterLookupKey = (classId: number, targetSubject: string): string =>
+    `${getClassName(classId)}::${targetSubject}`;
+  const getSelectionKey = (
+    classId: number,
+    targetSubject: string,
+    targetChapter: string,
+    targetDuration: string,
+  ): string => `${getClassName(classId)}::${targetSubject}::${targetChapter.trim()}::${targetDuration}`;
+
+  const getClassSelection = (classId: number): ClassSelection =>
+    classSelections[classId] ?? { subject: "", duration: DEFAULT_DURATION };
+
+  function setClassSelection(classId: number, patch: Partial<ClassSelection>): ClassSelection {
+    const current = getClassSelection(classId);
+    const next = { ...current, ...patch };
+
+    if (current.subject === next.subject && current.duration === next.duration) {
+      return current;
+    }
+
+    classSelections = { ...classSelections, [classId]: next };
+    return next;
+  }
+
+  const getChapterSelection = (classId: number, targetSubject: string): string =>
+    chapterSelections[getChapterLookupKey(classId, targetSubject)] ?? "";
+
+  function setChapterSelection(classId: number, targetSubject: string, value: string): void {
+    if (!targetSubject) return;
+
+    const lookupKey = getChapterLookupKey(classId, targetSubject);
+    if ((chapterSelections[lookupKey] ?? "") === value) return;
+
+    chapterSelections = {
+      ...chapterSelections,
+      [lookupKey]: value,
+    };
+  }
+
+  const getCachedChapters = (classId: number, targetSubject: string): string[] =>
+    chaptersByLookup[getChapterLookupKey(classId, targetSubject)] ?? [];
+
+  function restoreClassState(classId: number): void {
+    const nextSubjects = subjectsByClass[classId] ?? [];
+    const nextSelection = getClassSelection(classId);
+    const nextSubject = nextSelection.subject || nextSubjects[0]?.id || "";
+    const nextChapters = getCachedChapters(classId, nextSubject);
+    const nextChapter = getChapterSelection(classId, nextSubject) || nextChapters[0] || "";
+
+    subjects = nextSubjects;
+    subject = nextSubject;
+    duration = nextSelection.duration;
+    chapters = nextChapters;
+    chapter = nextChapter;
+  }
+
+  function switchClass(nextClassId: number): void {
+    if (nextClassId === cls) return;
+
+    conflict = null;
+    setClassSelection(cls, { subject, duration });
+    setChapterSelection(cls, subject, chapter);
+
+    cls = nextClassId;
+    restoreClassState(nextClassId);
+  }
+
+  function setSubjectForCurrentClass(nextSubject: string): void {
+    if (nextSubject === subject) return;
+
+    conflict = null;
+    setChapterSelection(cls, subject, chapter);
+    subject = nextSubject;
+    setClassSelection(cls, { subject: nextSubject, duration });
+
+    const nextChapters = getCachedChapters(cls, nextSubject);
+    chapters = nextChapters;
+    chapter = getChapterSelection(cls, nextSubject) || nextChapters[0] || "";
+  }
+
+  function setDurationForCurrentClass(nextDuration: string): void {
+    conflict = null;
+    duration = nextDuration;
+    setClassSelection(cls, { subject, duration: nextDuration });
+  }
+
+  function setChapterForCurrentClass(nextChapter: string): void {
+    conflict = null;
+    chapter = nextChapter;
+    setChapterSelection(cls, subject, nextChapter);
+  }
+
+  const className = $derived(getClassName(cls));
+  const chapterLookupKey = $derived(getChapterLookupKey(cls, subject));
+  const currentSelectionKey = $derived(getSelectionKey(cls, subject, chapter, duration));
+  const currentDraft = $derived(draftsBySelection[currentSelectionKey] ?? null);
+  const blueprint = $derived(currentDraft?.blueprint ?? null);
   const subjectLabel = $derived(subjects.find((s) => s.id === subject)?.label ?? "");
+  const activeSubjectLabel = $derived(currentDraft?.subjectLabel ?? subjectLabel);
   const durationMin = $derived(parseInt(duration, 10));
   const hasChips = $derived(chapters.length > 0);
+  const subjectsLoading = $derived(subjectsLoadingByClass[cls] ?? false);
+  const chaptersLoading = $derived(chaptersLoadingByLookup[chapterLookupKey] ?? false);
+  const generating = $derived(generatingBySelection[currentSelectionKey] ?? false);
+  const error = $derived(errorsBySelection[currentSelectionKey] ?? "");
+  const saving = $derived(savingSelectionKey === currentSelectionKey);
+  const saveSuccess = $derived(currentDraft?.saveSuccess ?? false);
 
   const phaseToTone = (phase: string): "cobalt" | "saffron" =>
     ["warm_up", "wrap_up", "check"].includes(phase) ? "saffron" : "cobalt";
 
-  async function loadSubjects(target: string): Promise<void> {
-    subjectsLoading = true;
-    error = "";
+  async function loadSubjects(targetClassId: number): Promise<void> {
+    const targetClassName = getClassName(targetClassId);
+    subjectsLoadingByClass = { ...subjectsLoadingByClass, [targetClassId]: true };
     try {
-      const res = await fetch(`/api/lesson/subjects?class=${encodeURIComponent(target)}`);
+      const res = await fetch(`/api/lesson/subjects?class=${encodeURIComponent(targetClassName)}`);
       const data = await res.json();
-      subjects = Array.isArray(data.subjects) ? data.subjects : [];
-      if (!subjects.find((s) => s.id === subject)) {
-        subject = subjects[0]?.id ?? "";
+      const nextSubjects = Array.isArray(data.subjects) ? data.subjects : [];
+      subjectsByClass = { ...subjectsByClass, [targetClassId]: nextSubjects };
+
+      const existingSelection = getClassSelection(targetClassId);
+      const nextSubject =
+        nextSubjects.find((option: SubjectOption) => option.id === existingSelection.subject)?.id ||
+        nextSubjects[0]?.id ||
+        "";
+
+      setClassSelection(targetClassId, { subject: nextSubject });
+
+      if (targetClassId === cls) {
+        subjects = nextSubjects;
+        if (subject !== nextSubject) {
+          subject = nextSubject;
+          const nextChapters = getCachedChapters(targetClassId, nextSubject);
+          chapters = nextChapters;
+          chapter = getChapterSelection(targetClassId, nextSubject) || nextChapters[0] || "";
+        } else if (!nextSubject) {
+          chapters = [];
+          chapter = "";
+        }
       }
     } catch {
-      subjects = [];
+      if (targetClassId === cls) {
+        subjects = subjectsByClass[targetClassId] ?? [];
+      }
     } finally {
-      subjectsLoading = false;
+      subjectsLoadingByClass = { ...subjectsLoadingByClass, [targetClassId]: false };
     }
   }
 
-  async function loadChapters(targetClass: string, targetSubject: string): Promise<void> {
+  async function loadChapters(targetClassId: number, targetSubject: string): Promise<void> {
+    const lookupKey = getChapterLookupKey(targetClassId, targetSubject);
     if (!targetSubject) {
-      chapters = [];
-      chapter = "";
+      chaptersByLookup = { ...chaptersByLookup, [lookupKey]: [] };
+      if (targetClassId === cls) {
+        chapters = [];
+        chapter = "";
+      }
       return;
     }
-    chaptersLoading = true;
+
+    chaptersLoadingByLookup = { ...chaptersLoadingByLookup, [lookupKey]: true };
     try {
       const res = await fetch(
-        `/api/lesson/chapters?class=${encodeURIComponent(targetClass)}` +
+        `/api/lesson/chapters?class=${encodeURIComponent(getClassName(targetClassId))}` +
           `&subject=${encodeURIComponent(targetSubject)}`,
       );
       const data = await res.json();
-      chapters = Array.isArray(data.chapters) ? data.chapters : [];
-      if (!chapters.includes(chapter)) {
-        chapter = chapters[0] ?? "";
+      const nextChapters = Array.isArray(data.chapters) ? data.chapters : [];
+      chaptersByLookup = { ...chaptersByLookup, [lookupKey]: nextChapters };
+
+      const existingChapter = getChapterSelection(targetClassId, targetSubject);
+      const nextChapter =
+        nextChapters.length === 0
+          ? existingChapter
+          : nextChapters.includes(existingChapter)
+            ? existingChapter
+            : nextChapters[0] || "";
+
+      setChapterSelection(targetClassId, targetSubject, nextChapter);
+
+      if (targetClassId === cls && targetSubject === subject) {
+        chapters = nextChapters;
+        if (chapter !== nextChapter) {
+          chapter = nextChapter;
+        }
       }
-    } catch {
-      chapters = [];
     } finally {
-      chaptersLoading = false;
+      chaptersLoadingByLookup = { ...chaptersLoadingByLookup, [lookupKey]: false };
     }
   }
 
   async function generate(): Promise<void> {
     if (!subject || !chapter.trim()) return;
-    generating = true;
-    error = "";
-    saveSuccess = false;
+
+    conflict = null;
+    const selectionKey = getSelectionKey(cls, subject, chapter, duration);
+    const selectedSubjectLabel = subjectLabel;
+
+    generatingBySelection = { ...generatingBySelection, [selectionKey]: true };
+    errorsBySelection = { ...errorsBySelection, [selectionKey]: "" };
     try {
       const res = await fetch("/api/lesson/blueprint", {
         method: "POST",
@@ -100,24 +263,42 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? "Generation failed.");
-      blueprint = data.blueprint as Blueprint;
+
+      draftsBySelection = {
+        ...draftsBySelection,
+        [selectionKey]: {
+          classId: cls,
+          className,
+          subject,
+          subjectLabel: selectedSubjectLabel,
+          chapter,
+          duration,
+          durationMin,
+          blueprint: data.blueprint as Blueprint,
+          saveSuccess: false,
+        },
+      };
     } catch (e) {
-      error = e instanceof Error ? e.message : "Generation failed.";
+      errorsBySelection = {
+        ...errorsBySelection,
+        [selectionKey]: e instanceof Error ? e.message : "Generation failed.",
+      };
     } finally {
-      generating = false;
+      generatingBySelection = { ...generatingBySelection, [selectionKey]: false };
     }
   }
 
   function exportBlueprint(): void {
-    if (!blueprint) return;
+    if (!currentDraft) return;
+
     const lines = [
       "LESSON BLUEPRINT",
       "================",
-      `${subjectLabel} · Class ${cls} · ${duration}`,
-      `Chapter: ${blueprint.title}`,
+      `${currentDraft.subjectLabel} · Class ${currentDraft.classId} · ${currentDraft.duration}`,
+      `Chapter: ${currentDraft.blueprint.title}`,
       `Date: ${new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })}`,
       "",
-      ...blueprint.blocks.flatMap((b) => [
+      ...currentDraft.blueprint.blocks.flatMap((b) => [
         `[ ${b.phase.toUpperCase().replace("_", "-")} ]${b.durationMin > 0 ? `  ${b.durationMin} min` : ""}`,
         b.title,
         b.body,
@@ -128,42 +309,73 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `lesson-class${cls}-${subject}-${blueprint.title.replace(/\s+/g, "-").toLowerCase()}.txt`;
+    a.download = `lesson-class${currentDraft.classId}-${currentDraft.subject}-${currentDraft.blueprint.title.replace(/\s+/g, "-").toLowerCase()}.txt`;
     a.click();
     URL.revokeObjectURL(url);
   }
 
-  async function doSave(overwrite: boolean): Promise<void> {
-    if (!blueprint) return;
-    saving = true;
-    showConflictDialog = false;
+  async function doSave(overwrite: boolean, selectionKey = currentSelectionKey): Promise<void> {
+    const draft = draftsBySelection[selectionKey];
+    if (!draft) return;
+
+    savingSelectionKey = selectionKey;
+    conflict = null;
     try {
       const res = await fetch("/api/lesson/plan/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ class: className, subject, subjectLabel, chapter, durationMin, blueprint, overwrite }),
+        body: JSON.stringify({
+          class: draft.className,
+          subject: draft.subject,
+          subjectLabel: draft.subjectLabel,
+          chapter: draft.chapter,
+          durationMin: draft.durationMin,
+          blueprint: draft.blueprint,
+          overwrite,
+        }),
       });
       const data = await res.json();
       if (res.status === 409 && data.conflict) {
-        conflictChapter = data.existingChapter ?? chapter;
-        showConflictDialog = true;
+        conflict = {
+          selectionKey,
+          classId: draft.classId,
+          chapter: data.existingChapter ?? draft.chapter,
+        };
         return;
       }
       if (!res.ok) throw new Error(data?.error ?? "Save failed.");
-      saveSuccess = true;
+
+      draftsBySelection = {
+        ...draftsBySelection,
+        [selectionKey]: {
+          ...draft,
+          saveSuccess: true,
+        },
+      };
     } catch (e) {
-      error = e instanceof Error ? e.message : "Could not save plan.";
+      errorsBySelection = {
+        ...errorsBySelection,
+        [selectionKey]: e instanceof Error ? e.message : "Could not save plan.",
+      };
     } finally {
-      saving = false;
+      savingSelectionKey = null;
     }
   }
 
-  $effect(() => { void loadSubjects(className); });
-  $effect(() => { void loadChapters(className, subject); });
+  $effect(() => {
+    const targetClassId = cls;
+    void untrack(() => loadSubjects(targetClassId));
+  });
+
+  $effect(() => {
+    const targetClassId = cls;
+    const targetSubject = subject;
+    void untrack(() => loadChapters(targetClassId, targetSubject));
+  });
 </script>
 
 <!-- Conflict / overwrite dialog -->
-{#if showConflictDialog}
+{#if conflict}
   <div
     class="fixed inset-0 z-50 grid place-items-center bg-black/40 backdrop-blur-[2px]"
     role="dialog"
@@ -172,13 +384,15 @@
     <div class="bg-white mx-4 w-full max-w-sm rounded-2xl p-6 shadow-2xl">
       <div class="text-ink mb-1.5 text-[17px] font-semibold">Replace today's plan?</div>
       <div class="text-text-secondary mb-5 text-[13px] leading-relaxed">
-        Class {cls} already has a saved plan for today
-        {#if conflictChapter}(<b>{conflictChapter}</b>){/if}.
+        Class {conflict.classId} already has a saved plan for today
+        {#if conflict.chapter}(<b>{conflict.chapter}</b>){/if}.
         Do you want to replace it?
       </div>
       <div class="flex justify-end gap-2">
-        <Button variant="secondary" onclick={() => (showConflictDialog = false)}>Cancel</Button>
-        <Button variant="primary" onclick={() => doSave(true)}>Replace</Button>
+        <Button variant="secondary" onclick={() => (conflict = null)}>Cancel</Button>
+        <Button variant="primary" onclick={() => conflict && doSave(true, conflict.selectionKey)}>
+          Replace
+        </Button>
       </div>
     </div>
   </div>
@@ -194,13 +408,15 @@
     subtitle="Pick a class, subject, and chapter. The local AI drafts a blueprint sized to your period."
   >
     {#snippet actions()}
-      <Button variant="secondary" onclick={exportBlueprint} disabled={!blueprint}>
-        <Download class="size-3.5" /> Export
-      </Button>
+      {#if currentDraft}
+        <Button variant="secondary" onclick={exportBlueprint}>
+          <Download class="size-3.5" /> Export
+        </Button>
+      {/if}
       <Button
         variant="primary"
         onclick={() => doSave(false)}
-        disabled={!blueprint || saving || saveSuccess}
+        disabled={!currentDraft || saving || saveSuccess}
       >
         {#if saving}
           <Loader2 class="size-3.5 animate-spin" /> Saving…
@@ -225,7 +441,7 @@
           {#each CLASSES as c (c.id)}
             <button
               type="button"
-              onclick={() => (cls = c.id)}
+              onclick={() => switchClass(c.id)}
               class="cursor-pointer rounded-full border px-3 py-1.5 text-[11px] transition-colors"
               style={cls === c.id
                 ? `border-color: ${c.color}; background: ${c.color}1a; color: ${c.color}; font-weight: 600;`
@@ -239,11 +455,11 @@
         <div class="grid grid-cols-2 gap-3">
           <div>
             <div class="label-eyebrow mb-1.5">Subject</div>
-            <Select.Root type="single" bind:value={subject}>
+            <Select.Root type="single" value={subject} onValueChange={setSubjectForCurrentClass}>
               <Select.Trigger>
                 {#if subjectsLoading}Loading…
                 {:else if subjects.length === 0}No subjects
-                {:else}{subjectLabel || "Pick a subject"}{/if}
+                {:else}{activeSubjectLabel || "Pick a subject"}{/if}
               </Select.Trigger>
               <Select.Content>
                 {#each subjects as s (s.id)}
@@ -254,7 +470,7 @@
           </div>
           <div>
             <div class="label-eyebrow mb-1.5">Duration</div>
-            <Select.Root type="single" bind:value={duration}>
+            <Select.Root type="single" value={duration} onValueChange={setDurationForCurrentClass}>
               <Select.Trigger>{duration}</Select.Trigger>
               <Select.Content>
                 {#each durations as d (d)}
@@ -277,12 +493,16 @@
           <div class="text-text-secondary text-[12px]">Loading chapters…</div>
         {:else if !subject}
           <div class="text-text-secondary text-[12px]">Pick a subject first.</div>
-        {:else if hasChips}
-          <div class="flex flex-wrap gap-1.5">
+        {:else}
+          <div class="text-text-secondary text-[12px]">No chapters found in the vector store.</div>
+        {/if}
+
+        {#if hasChips}
+          <div class="mt-0 flex flex-wrap gap-1.5">
             {#each chapters as ch (ch)}
               <button
                 type="button"
-                onclick={() => (chapter = ch)}
+                onclick={() => setChapterForCurrentClass(ch)}
                 class={cn(
                   "cursor-pointer rounded-full border px-2.5 py-1 text-[11px] transition-colors",
                   chapter === ch
@@ -294,13 +514,19 @@
               </button>
             {/each}
           </div>
-        {:else}
-          <!-- No chapters from manifest: allow manual entry -->
-          <div class="text-text-secondary mb-2 text-[12px]">
-            No chapters found in the vector store. Type a chapter name manually.
-          </div>
-          <Input bind:value={chapter} placeholder="Chapter name…" />
         {/if}
+
+        <div class="mt-4 space-y-2.5">
+          <div class="label-eyebrow">Paste chapter / topic text</div>
+          <div class="text-text-secondary text-[12px] leading-relaxed">
+            If the correct chapter is missing above, paste the chapter or topic text here. Blueprint generation will use this text for retrieval.
+          </div>
+          <Input
+            value={chapter}
+            oninput={(event) => setChapterForCurrentClass(event.currentTarget.value)}
+            placeholder="Paste or type chapter / topic text…"
+          />
+        </div>
       </div>
 
       <!-- Fixed bottom: generate button -->
@@ -330,7 +556,7 @@
         <div class="flex items-start justify-between gap-4">
           <div>
             <div class="label-eyebrow">
-              {subjectLabel || "Subject"} · Class {cls} · {duration}
+              {activeSubjectLabel || "Subject"} · Class {cls} · {duration}
             </div>
             <div
               class="text-ink mt-1.5 text-[22px] leading-[1.2] font-semibold tracking-[-0.015em] md:text-[26px]"
@@ -338,8 +564,8 @@
               {blueprint?.title || chapter || "Your lesson title"}
             </div>
             <div class="mt-2.5 flex flex-wrap gap-2">
-              {#if subjectLabel}
-                <Pill tone="saffron">{subjectLabel} · Class {cls}</Pill>
+              {#if activeSubjectLabel}
+                <Pill tone="saffron">{activeSubjectLabel} · Class {cls}</Pill>
               {/if}
               {#if blueprint}
                 <Pill tone="cobalt">{blueprint.blocks.length} phases</Pill>

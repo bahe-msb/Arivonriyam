@@ -15,6 +15,9 @@ const config = {
       precompress: false,
       strict: true,
     }),
+    serviceWorker: {
+      register: false,
+    },
     // Barrel-only aliases. Each alias resolves to a folder whose `index.ts`
     // is the single public surface. Subpath imports (e.g. "@shadcn/button")
     // are intentionally not configured — everything flows through the barrel.

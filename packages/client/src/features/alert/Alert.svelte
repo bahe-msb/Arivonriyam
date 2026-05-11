@@ -2,13 +2,9 @@
   import { goto } from "$app/navigation";
   import {
     AlertTriangle,
-    ArrowLeft,
     ArrowRight,
     BookOpen,
-    CalendarDays,
     CheckCircle2,
-    ChevronLeft,
-    ChevronRight,
     Filter,
     Heart,
     Lightbulb,
@@ -18,7 +14,7 @@
   } from "lucide-svelte";
   import { Button, Card, Sheet } from "@shadcn";
 
-  import { Page, PageHeader, Pill } from "@components";
+  import { DateNav, Page, PageHeader, Pill } from "@components";
   import { CLASSES } from "@mocks";
   import { activeClass, type SessionAlertRecord } from "@stores";
 
@@ -56,8 +52,6 @@
   }
 
   let selectedDate = $state(todayKey());
-  const isToday = $derived(selectedDate === todayKey());
-  const canGoForward = $derived(selectedDate < todayKey());
 
   // ── Load records from API for selected date ───────────────────────
   type ApiAlertRecord = {
@@ -369,31 +363,7 @@
 
   <!-- ── Date navigation ───────────────────────────────────────── -->
   <div class="mb-5 flex items-center gap-3">
-    <button
-      type="button"
-      onclick={() => { selectedDate = offsetDate(selectedDate, -1); }}
-      class="flex items-center gap-1 rounded-lg border border-border-default bg-white px-3 py-1.5 text-[12px] font-medium transition-colors hover:bg-gray-50"
-    >
-      <ChevronLeft class="size-3.5" /> Prev day
-    </button>
-
-    <div class="flex items-center gap-2 rounded-lg border border-border-default bg-white px-4 py-1.5">
-      <CalendarDays class="size-3.5 text-text-secondary" />
-      <span class="text-[13px] font-semibold">{formatDateLabel(selectedDate)}</span>
-      {#if !isToday}
-        <span class="text-[11px] text-text-secondary">{selectedDate}</span>
-      {/if}
-    </div>
-
-    <button
-      type="button"
-      onclick={() => { selectedDate = offsetDate(selectedDate, 1); }}
-      disabled={!canGoForward}
-      class="flex items-center gap-1 rounded-lg border border-border-default bg-white px-3 py-1.5 text-[12px] font-medium transition-colors hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
-    >
-      Next day <ChevronRight class="size-3.5" />
-    </button>
-
+    <DateNav label="Day" value={selectedDate} onChange={(d) => (selectedDate = d)} />
     {#if apiLoading}
       <span class="text-[11px] text-text-secondary">Loading…</span>
     {/if}

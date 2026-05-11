@@ -1,33 +1,49 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
+  import { resolve } from "$app/paths";
   import { page } from "$app/state";
   import { onMount } from "svelte";
   import type { Snippet } from "svelte";
   import { Sidebar } from "@shadcn";
-  import { AppSidebar, TopBar } from "@components";
-  import { schoolConfig } from "@stores";
+  import { AppSidebar, ServerReachabilityBanner, TopBar } from "@components";
+  import { reteachTopics, schoolConfig, sessionAlerts, startReachabilityMonitoring } from "@stores";
   import "../app.css";
 
   type Props = { children?: Snippet };
   let { children }: Props = $props();
 
-  const STUDENT_ONLY_BREAKPOINT = 768;
+  const STUDENT_ONLY_BREAKPOINT = 835;
   const STUDENT_ONLY_PATH = "/student/socratic";
 
-  let isStudentOnlyViewport = $state(
-    typeof window !== "undefined" && window.innerWidth < STUDENT_ONLY_BREAKPOINT,
-  );
+  function isStudentOnlyDevice(): boolean {
+    if (typeof window === "undefined") return false;
+
+    const isPhoneLikeViewport = window.innerWidth < STUDENT_ONLY_BREAKPOINT;
+    const isTouchTabletViewport =
+      navigator.maxTouchPoints > 1 &&
+      Math.min(window.innerWidth, window.innerHeight) <= STUDENT_ONLY_BREAKPOINT;
+
+    return isPhoneLikeViewport || isTouchTabletViewport;
+  }
+
+  let isStudentOnlyViewport = $state(isStudentOnlyDevice());
 
   function syncViewport(): void {
-    if (typeof window === "undefined") return;
-    isStudentOnlyViewport = window.innerWidth < STUDENT_ONLY_BREAKPOINT;
+    isStudentOnlyViewport = isStudentOnlyDevice();
   }
 
   onMount(() => {
     syncViewport();
+    const stopReachabilityMonitoring = startReachabilityMonitoring();
     window.addEventListener("resize", syncViewport);
     void schoolConfig.load();
-    return () => window.removeEventListener("resize", syncViewport);
+    void reteachTopics.load();
+    void sessionAlerts.load();
+
+    return () => {
+      stopReachabilityMonitoring();
+      window.removeEventListener("resize", syncViewport);
+    };
   });
 
   $effect(() => {
@@ -35,7 +51,7 @@
 
     const currentPath = page.url.pathname;
     if (currentPath !== STUDENT_ONLY_PATH) {
-      void goto(STUDENT_ONLY_PATH, {
+      void goto(resolve(STUDENT_ONLY_PATH), {
         replaceState: true,
         noScroll: true,
         keepFocus: true,
@@ -63,3 +79,5 @@
     </div>
   </Sidebar.Provider>
 {/if}
+
+<ServerReachabilityBanner />

@@ -53,5 +53,13 @@ export async function initPgDb(): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_session_alerts_date       ON session_alerts(session_date);
     CREATE INDEX IF NOT EXISTS idx_session_alerts_class_date ON session_alerts(class_id, session_date);
+
+    CREATE TABLE IF NOT EXISTS reteach_state_daily (
+      session_date                      DATE PRIMARY KEY,
+      topics_by_class                   JSONB NOT NULL DEFAULT '{}'::jsonb,
+      selected_topic_ids_by_class       JSONB NOT NULL DEFAULT '{}'::jsonb,
+      completed_topic_ids               JSONB NOT NULL DEFAULT '[]'::jsonb,
+      updated_at                        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 }

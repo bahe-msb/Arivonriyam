@@ -1,7 +1,7 @@
 """RAG pipeline CLI.
 
 Commands:
-  ingest [--force]                       Ingest all PDFs → pgvector + PostgreSQL
+    ingest [--force] [--class class_X]     Ingest all PDFs or one class → pgvector + PostgreSQL
   retrieve --class X --subject Y         Chapter-wise retrieval → JSON stdout
            --chapter Z [--top-k N]
   summarize --class X --subject Y        Topic summarization → JSON stdout
@@ -26,6 +26,8 @@ if __name__ == "__main__":
     # ingest
     p_ingest = sub.add_parser("ingest")
     p_ingest.add_argument("--force", action="store_true")
+    p_ingest.add_argument("--class", dest="class_name",
+                          help="Only ingest PDFs under one class folder, e.g. class_4")
     p_ingest.add_argument("--no-questions", action="store_true",
                           help="Skip Ollama question generation (faster, no LLM calls during ingest)")
 
@@ -66,7 +68,11 @@ if __name__ == "__main__":
 
     if args.cmd == "ingest":
         from ingest import run_ingestion
-        run_ingestion(force=args.force, generate_questions=not args.no_questions)
+        run_ingestion(
+            force=args.force,
+            generate_questions=not args.no_questions,
+            class_name=args.class_name,
+        )
 
     elif args.cmd == "retrieve":
         from retrieve import run_chapter_retrieve

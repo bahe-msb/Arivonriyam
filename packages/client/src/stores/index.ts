@@ -1,4 +1,5 @@
 export { activeClass } from "./active-class.svelte.js";
+export { reachability, startReachabilityMonitoring } from "./reachability.js";
 export { reteachTopics } from "./reteach-topics.svelte.js";
 export { schoolConfig, pickEmoji } from "./school-config.svelte.js";
 export { sessionAlerts } from "./session-alerts.svelte.js";

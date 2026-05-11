@@ -3,9 +3,11 @@
   import { resolve } from "$app/paths";
   import { ArrowLeft, Plus, X, Send, BookOpen, Pencil } from "lucide-svelte";
   import { Button, Card, Input } from "@shadcn";
-  import { Page, PageHeader, Pill } from "@components";
+  import { DateNav, Page, PageHeader, Pill } from "@components";
   import { CLASSES } from "@mocks";
   import { reteachTopics } from "@stores";
+
+  void reteachTopics.load();
 
   type SubjectOption = { id: string; label: string };
 
@@ -28,6 +30,8 @@
   const totalCount = $derived(classTopics.length);
   const canAdd = $derived(totalCount < 3);
   const canSend = $derived(CLASSES.some((c) => reteachTopics.hasTopics(c.id)));
+  const readOnly = $derived(reteachTopics.readOnly);
+  const canEdit = $derived(canAdd && !readOnly);
 
   async function loadSubjects(classId: number): Promise<void> {
     subjectsLoading = true;
@@ -61,7 +65,7 @@
   }
 
   function addTopic(topic: string, source: "standard" | "custom"): void {
-    if (!topic.trim() || !activeClass || !activeSubject || !canAdd) return;
+    if (!topic.trim() || !activeClass || !activeSubject || !canAdd || readOnly) return;
     reteachTopics.add(activeClass, {
       id: uid(),
       subject: activeSubject,
@@ -80,14 +84,29 @@
     subtitle="Select a class, pick a subject, then add up to 3 topics per class (textbook topic or custom web topic). AI summary and MCQs follow the uploaded textbook PDF language, including Tamil and English."
   >
     {#snippet actions()}
-      <Button variant="secondary" onclick={() => goto(resolve("/lesson"))}>
-        <ArrowLeft class="size-3.5" /> Back to plan
-      </Button>
-      <Button variant="primary" disabled={!canSend} onclick={() => goto(resolve("/handoff"))}>
-        Send to handoff <Send class="size-3.5" />
-      </Button>
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <DateNav
+          label="Day"
+          value={reteachTopics.currentDate}
+          onChange={(d) => void reteachTopics.setDate(d)}
+        />
+        <div class="flex items-center gap-2">
+          <Button variant="secondary" onclick={() => goto(resolve("/lesson"))}>
+            <ArrowLeft class="size-3.5" /> Back to plan
+          </Button>
+          <Button variant="primary" disabled={!canSend} onclick={() => goto(resolve("/handoff"))}>
+            Send to handoff <Send class="size-3.5" />
+          </Button>
+        </div>
+      </div>
     {/snippet}
   </PageHeader>
+
+  {#if readOnly}
+    <div class="mb-4 rounded-2xl border border-[#f3d49a] bg-[#fff8ea] px-4 py-2.5 text-[12px] text-[#9a6708]">
+      Viewing past day — read only. Switch to Today to add or remove topics.
+    </div>
+  {/if}
 
   <div class="grid grid-cols-[160px_200px_1fr] items-start gap-4">
     <!-- Col 1: Classes -->
@@ -192,13 +211,13 @@
               <Input
                 bind:value={standardDraft}
                 placeholder="e.g. Parts of a plant"
-                disabled={!canAdd}
+                disabled={!canEdit}
                 onkeydown={(e: KeyboardEvent) => e.key === "Enter" && addTopic(standardDraft, "standard")}
               />
               <Button
                 variant="primary"
                 onclick={() => addTopic(standardDraft, "standard")}
-                disabled={!canAdd || !standardDraft.trim()}
+                disabled={!canEdit || !standardDraft.trim()}
               >
                 <Plus class="size-3.5" />
               </Button>
@@ -208,14 +227,16 @@
             {#each subjectTopics.filter((t) => t.source === "standard") as t (t.id)}
               <div class="flex items-center gap-2 rounded-lg border border-border-default bg-gray-50 px-3 py-2">
                 <div class="min-w-0 flex-1 text-[12px] font-medium">{t.topic}</div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onclick={() => reteachTopics.remove(activeClass!, t.id)}
-                  aria-label="Remove"
-                >
-                  <X class="size-3.25" />
-                </Button>
+                {#if !readOnly}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onclick={() => reteachTopics.remove(activeClass!, t.id)}
+                    aria-label="Remove"
+                  >
+                    <X class="size-3.25" />
+                  </Button>
+                {/if}
               </div>
             {/each}
           </Card>
@@ -224,7 +245,7 @@
           <Card class="flex flex-col gap-3 p-4">
             <div class="flex items-center gap-1.5">
               <Pencil class="size-3.5 text-text-secondary" />
-              <div class="text-[13px] font-semibold">Custom topic (web + class-level)</div>
+              <div class="text-[13px] font-semibold">Custom topic (class-level)</div>
             </div>
             <div class="text-[11px] text-text-secondary">
               Add a topic beyond the textbook. AI uses web notes and explains only at the selected class level (up to Class 5), then asks MCQs.
@@ -236,13 +257,13 @@
               <Input
                 bind:value={customDraft}
                 placeholder="e.g. Narrate a story about…"
-                disabled={!canAdd}
+                disabled={!canEdit}
                 onkeydown={(e: KeyboardEvent) => e.key === "Enter" && addTopic(customDraft, "custom")}
               />
               <Button
                 variant="primary"
                 onclick={() => addTopic(customDraft, "custom")}
-                disabled={!canAdd || !customDraft.trim()}
+                disabled={!canEdit || !customDraft.trim()}
               >
                 <Plus class="size-3.5" />
               </Button>
@@ -252,14 +273,16 @@
             {#each subjectTopics.filter((t) => t.source === "custom") as t (t.id)}
               <div class="flex items-center gap-2 rounded-lg border border-cobalt-100 bg-cobalt-25 px-3 py-2">
                 <div class="min-w-0 flex-1 text-[12px] font-medium">{t.topic}</div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onclick={() => reteachTopics.remove(activeClass!, t.id)}
-                  aria-label="Remove"
-                >
-                  <X class="size-3.25" />
-                </Button>
+                {#if !readOnly}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onclick={() => reteachTopics.remove(activeClass!, t.id)}
+                    aria-label="Remove"
+                  >
+                    <X class="size-3.25" />
+                  </Button>
+                {/if}
               </div>
             {/each}
           </Card>

@@ -26,6 +26,24 @@ export interface SessionAlertRecord {
 
 const STORAGE_KEY = "arivonriyam.session-alerts.v1";
 
+type ApiAlertRecord = {
+  id: string;
+  session_id: string;
+  class_id: number;
+  class_name: string;
+  student_id: string;
+  student_name: string;
+  student_emoji: string;
+  topic: string;
+  subject: string;
+  total_questions: number;
+  correct_count: number;
+  incorrect_count: number;
+  score: number;
+  missed_questions: unknown;
+  created_at: string;
+};
+
 function isAlertMiss(value: unknown): value is SessionAlertMiss {
   if (!value || typeof value !== "object") return false;
 
@@ -65,37 +83,59 @@ function isAlertRecord(value: unknown): value is SessionAlertRecord {
 
 class SessionAlertsStore {
   records = $state<SessionAlertRecord[]>([]);
+  loaded = $state(false);
+  loading = $state(false);
 
-  constructor() {
+  private clearLegacyStorage(): void {
     if (typeof window === "undefined") return;
-
-    this.records = this.read();
-    window.addEventListener("storage", this.handleStorage);
+    window.localStorage.removeItem(STORAGE_KEY);
   }
 
-  private handleStorage = (event: StorageEvent): void => {
-    if (event.key !== STORAGE_KEY) return;
-    this.records = this.read();
-  };
+  private todayKey(): string {
+    return new Date().toISOString().split("T")[0];
+  }
 
-  private read(): SessionAlertRecord[] {
-    if (typeof window === "undefined") return [];
+  private normalizeApiRecord(record: ApiAlertRecord): SessionAlertRecord {
+    return {
+      id: record.id,
+      sessionId: record.session_id,
+      classId: record.class_id,
+      className: record.class_name,
+      studentId: record.student_id,
+      studentName: record.student_name,
+      studentEmoji: record.student_emoji,
+      topic: record.topic,
+      subject: record.subject,
+      totalQuestions: record.total_questions,
+      correctCount: record.correct_count,
+      incorrectCount: record.incorrect_count,
+      score: record.score,
+      missedQuestions: Array.isArray(record.missed_questions)
+        ? record.missed_questions.filter(isAlertMiss)
+        : [],
+      createdAt: record.created_at,
+    };
+  }
+
+  async load(date = this.todayKey(), force = false): Promise<void> {
+    if (this.loading) return;
+    if (this.loaded && !force && date === this.todayKey()) return;
+
+    this.loading = true;
+    this.clearLegacyStorage();
 
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return [];
-
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter(isAlertRecord);
+      const response = await fetch(`/api/alerts?date=${encodeURIComponent(date)}`);
+      const data = (await response.json()) as { alerts?: ApiAlertRecord[] };
+      this.records = Array.isArray(data.alerts)
+        ? data.alerts.map((record) => this.normalizeApiRecord(record)).filter(isAlertRecord)
+        : [];
     } catch {
-      return [];
+      this.records = [];
+    } finally {
+      this.loaded = true;
+      this.loading = false;
     }
-  }
-
-  private persist(): void {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(this.records));
   }
 
   private async syncToServer(sessionId: string, records: SessionAlertRecord[]): Promise<void> {
@@ -106,7 +146,7 @@ class SessionAlertsStore {
         body: JSON.stringify({ sessionId, records }),
       });
     } catch {
-      // Non-fatal — local copy is authoritative for the current session
+      // Non-fatal — keep the in-memory snapshot and retry on next session update.
     }
   }
 
@@ -120,7 +160,6 @@ class SessionAlertsStore {
       return right.incorrectCount - left.incorrectCount;
     });
 
-    this.persist();
     void this.syncToServer(sessionId, fresh);
   }
 

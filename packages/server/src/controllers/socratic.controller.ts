@@ -35,28 +35,6 @@ interface SummaryShape {
   exercise_chunks?: Array<{ text: string; page: number }>;
 }
 
-interface WikiSearchResponse {
-  query?: {
-    search?: Array<{ title?: string }>;
-  };
-}
-
-interface WikiSummaryResponse {
-  title?: string;
-  extract?: string;
-  content_urls?: {
-    desktop?: {
-      page?: string;
-    };
-  };
-}
-
-interface WebSnippet {
-  title: string;
-  summary: string;
-  url: string;
-}
-
 interface PreviewCard {
   title: string;
   caption: string;
@@ -86,6 +64,16 @@ interface AlertSuggestionShape {
   encouragement: string;
 }
 
+interface QuestionBankRequest {
+  topic: string;
+  subject: string;
+  questionCount: number;
+  classLevel: number;
+  lang: SupportedLanguage;
+  summaryLines: string[];
+  exerciseChunks?: Array<{ text: string; page: number }>;
+}
+
 type SupportedLanguage = "en" | "ta";
 
 const QUESTIONS_PER_STUDENT = 6;
@@ -93,7 +81,85 @@ const MIN_SUMMARY_WORDS = 260;
 const DEFAULT_CLASS_LEVEL = 3;
 const MAX_CLASS_LEVEL = 5;
 const MAX_PREVIEW_CARDS = 3;
-const WEB_FETCH_TIMEOUT_MS = 8_000;
+const MAX_QUESTION_BANK_SIZE = 24;
+const MAX_QUESTION_CONTEXT_FACTS = 24;
+const MAX_QUESTION_OPTION_WORDS = 6;
+const QUESTION_GENERATION_BATCH_SIZE = 6;
+const QUESTION_GENERATION_MAX_ROUNDS = 8;
+const QUESTION_DUPLICATE_SIMILARITY = 0.55;
+const QUESTION_KEYWORD_STOPWORDS_EN = new Set([
+  "about",
+  "after",
+  "before",
+  "class",
+  "correct",
+  "does",
+  "explain",
+  "fact",
+  "from",
+  "how",
+  "into",
+  "lesson",
+  "mcq",
+  "many",
+  "option",
+  "question",
+  "round",
+  "short",
+  "should",
+  "student",
+  "students",
+  "subject",
+  "summary",
+  "teacher",
+  "textbook",
+  "topic",
+  "used",
+  "using",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "with",
+]);
+const QUESTION_KEYWORD_STOPWORDS_TA = new Set([
+  "இங்கு",
+  "இது",
+  "இன்று",
+  "இப்போது",
+  "எந்த",
+  "எந்தெந்த",
+  "எப்படி",
+  "எப்போது",
+  "எது",
+  "என்ன",
+  "என்னென்ன",
+  "யார்",
+  "யாரை",
+  "உள்ள",
+  "கேள்வி",
+  "சிறிய",
+  "சுற்று",
+  "தலைப்பு",
+  "தேர்வு",
+  "நம்",
+  "நாம்",
+  "பற்றி",
+  "பதில்",
+  "பாடம்",
+  "பாடத்தில்",
+  "மாணவர்",
+  "மாணவர்கள்",
+  "வழிகளில்",
+  "வழியில்",
+  "வகுப்பு",
+  "விருப்பம்",
+  "சரியான",
+  "சுருக்கம்",
+  "ஆசிரியர்",
+]);
 
 /**
  * POST /api/socratic/summarize
@@ -142,11 +208,12 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
       Math.min(12, Number.isFinite(studentCount) ? Math.floor(Number(studentCount)) : 4),
     );
     const totalQuestionCount = safeStudentCount * QUESTIONS_PER_STUDENT;
+    const questionBankCount = Math.min(MAX_QUESTION_BANK_SIZE, totalQuestionCount);
 
     let effective: SummaryShape | null = null;
 
     if (sourceMode === "custom") {
-      // Custom topics are summarized using child-safe web notes + class-level constraints.
+      // Custom topics stay local-only and rely on the configured LLM plus class-level constraints.
       effective = await _buildCustomTopicSummary(topic, subject, classLevel, targetLanguage);
     } else {
       // Curriculum topics must stay textbook-grounded.
@@ -221,16 +288,15 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
     effective = _tightenSummaryOpening(effective, topic, subject, targetLanguage);
 
     const lines = _toLines(effective);
-    const questions = await _buildQuestionBank(
+    const questions = await _buildQuestionBank({
       topic,
       subject,
-      lines,
-      totalQuestionCount,
+      questionCount: questionBankCount,
       classLevel,
-      sourceMode,
-      targetLanguage,
-      effective.exercise_chunks ?? [],
-    );
+      lang: targetLanguage,
+      summaryLines: lines,
+      exerciseChunks: effective.exercise_chunks ?? [],
+    });
 
     res.json({
       ...effective,
@@ -367,14 +433,45 @@ export async function postSocraticAlertSuggestion(req: Request, res: Response): 
   }
 }
 
+function _countScripts(text: string): { tamil: number; latin: number } {
+  return {
+    tamil: [...text].filter((char) => char >= "\u0B80" && char <= "\u0BFF").length,
+    latin: [...text].filter((char) => /[A-Za-z]/.test(char)).length,
+  };
+}
+
 function _detectLanguage(text: string): SupportedLanguage {
   const sample = text.trim();
   if (!sample) return "en";
 
-  const tamilChars = [...sample].filter((char) => char >= "\u0B80" && char <= "\u0BFF").length;
-  const latinChars = [...sample].filter((char) => /[A-Za-z]/.test(char)).length;
+  const { tamil: tamilChars, latin: latinChars } = _countScripts(sample);
+  const total = tamilChars + latinChars;
+  if (total === 0) return "en";
 
-  return tamilChars >= Math.max(12, Math.floor(latinChars / 2)) ? "ta" : "en";
+  const tamilRatio = tamilChars / total;
+  if (tamilChars > 0 && (latinChars === 0 || tamilRatio >= 0.55)) {
+    return "ta";
+  }
+
+  return "en";
+}
+
+function _normalizeChunkLanguage(chunk: RetrieverChunk): SupportedLanguage | null {
+  const rawLanguage = typeof chunk.language === "string" ? chunk.language.trim().toLowerCase() : "";
+  if (rawLanguage === "ta") return "ta";
+  if (rawLanguage === "en") return "en";
+
+  const text = chunk.text || "";
+  const { tamil: tamilChars, latin: latinChars } = _countScripts(text);
+  if (rawLanguage === "bilingual") {
+    if (tamilChars > 0 && (latinChars === 0 || tamilChars >= latinChars)) {
+      return "ta";
+    }
+    if (latinChars > 0) return "en";
+  }
+
+  if (!text.trim()) return null;
+  return _detectLanguage(text);
 }
 
 function _pickLanguageFromChunks(chunks: RetrieverChunk[]): SupportedLanguage | null {
@@ -382,12 +479,8 @@ function _pickLanguageFromChunks(chunks: RetrieverChunk[]): SupportedLanguage | 
 
   const counts = chunks.reduce(
     (acc, chunk) => {
-      const rawLanguage =
-        typeof chunk.language === "string" ? chunk.language.trim().toLowerCase() : "";
-      const language =
-        rawLanguage === "ta" || rawLanguage === "en"
-          ? (rawLanguage as SupportedLanguage)
-          : _detectLanguage(chunk.text || "");
+      const language = _normalizeChunkLanguage(chunk);
+      if (!language) return acc;
       acc[language] += 1;
       return acc;
     },
@@ -427,16 +520,6 @@ async function _buildCustomTopicSummary(
   classLevel: number,
   lang: SupportedLanguage,
 ): Promise<SummaryShape> {
-  // Fetch web snippets in parallel — used as optional enrichment only.
-  const snippets = await _fetchWebSnippets(topic, lang).catch(() => [] as WebSnippet[]);
-  const webContext =
-    snippets.length > 0
-      ? snippets
-          .map((s, i) => `[${i + 1}] ${s.title}: ${s.summary}`)
-          .join("\n")
-          .slice(0, 1200)
-      : "";
-
   const prompt =
     lang === "ta"
       ? [
@@ -445,7 +528,6 @@ async function _buildCustomTopicSummary(
           `கற்றல் நிலை: வகுப்பு ${classLevel}.`,
           `தலைப்பு: ${topic}`,
           `பாடம்: ${subject}`,
-          ...(webContext ? ["", "கூடுதல் குறிப்புகள்:", webContext] : []),
           "",
           `"${topic}" பற்றி வகுப்பு ${classLevel} மாணவர்களுக்கு ஏற்ற எளிய விளக்கம் தயார் செய்யவும்.`,
           "உங்கள் சொந்த அறிவை பயன்படுத்தவும். அன்பான ஆசிரியர் நடையில் எழுதவும்.",
@@ -464,7 +546,6 @@ async function _buildCustomTopicSummary(
           `Target learners: Class ${classLevel} (India, Class 1-5).`,
           `Topic: ${topic}`,
           `Subject: ${subject}`,
-          ...(webContext ? ["", "Additional context:", webContext] : []),
           "",
           `Explain "${topic}" for Class ${classLevel} students using your own knowledge.`,
           "Use a warm Indian classroom-teacher tone. Give simple home or school examples.",
@@ -490,7 +571,7 @@ async function _buildCustomTopicSummary(
       return {
         ...normalized,
         word_count: _countWords(lines),
-        chunks_used: snippets.length,
+        chunks_used: 0,
       };
     }
   } catch (error) {
@@ -510,7 +591,6 @@ async function _buildCustomTopicSummary(
             "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
             "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
             "வீடு அல்லது பள்ளி உதாரணங்கள் கொடுக்கவும்.",
-            ...(webContext ? ["", "கூடுதல் குறிப்புகள்:", webContext] : []),
           ].join("\n")
         : [
             `You are a primary school teacher in India. Explain "${topic}" (${subject}) to Class ${classLevel} students.`,
@@ -519,7 +599,6 @@ async function _buildCustomTopicSummary(
             "Do not ask the students questions. Do not use question marks.",
             "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
             "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
-            ...(webContext ? ["", "Additional context:", webContext] : []),
           ].join("\n");
 
     const raw =
@@ -533,7 +612,7 @@ async function _buildCustomTopicSummary(
       return {
         ...shape,
         word_count: _countWords(lines),
-        chunks_used: snippets.length,
+        chunks_used: 0,
       };
     }
   } catch (error) {
@@ -552,118 +631,315 @@ async function _buildCustomTopicSummary(
   );
 }
 
-async function _buildQuestionBank(
-  topic: string,
-  subject: string,
-  lines: string[],
-  questionCount: number,
-  classLevel: number,
-  source: string,
-  lang: SupportedLanguage,
-  exerciseChunks: Array<{ text: string; page: number }> = [],
-): Promise<SocraticQuestion[]> {
-  const summaryText = lines.join("\n\n").slice(0, 6000);
-  const exerciseText = exerciseChunks
-    .map((e, i) => `[Exercise ${i + 1}, page ${e.page}]\n${e.text}`)
-    .join("\n\n")
-    .slice(0, 2000);
-  const exerciseNote = exerciseText
-    ? lang === "ta"
-      ? `\n\nபாடப்புத்தகப் பயிற்சிக் கேள்விகள் (இவற்றிலிருந்தும் MCQ உருவாக்கலாம்):\n${exerciseText}`
-      : `\n\nTextbook exercise questions (you may also create MCQs from these):\n${exerciseText}`
-    : "";
-  const prompt =
-    lang === "ta"
-      ? [
-          "தமிழில் மட்டும் பதிலளிக்கவும்.",
-          `நீங்கள் வகுப்பு ${classLevel} தொடக்கப்பள்ளி மாணவர்களுக்கான பாடத்திட்ட-சார்ந்த MCQ கேள்விகளை உருவாக்குகிறீர்கள்.`,
-          `தலைப்பு: ${topic}`,
-          `பாடம்: ${subject}`,
-          `Source mode: ${source}`,
-          "",
-          "முக்கியம்: கீழே உள்ள சுருக்கத்தில் உள்ள உண்மைகள், வரையறைகள், எடுத்துக்காட்டுகளை மட்டுமே பயன்படுத்தவும்.",
-          "உங்கள் சொந்த அறிவை சேர்க்காதீர்கள்.",
-          summaryText + exerciseNote,
-          "",
-          `மொத்தம் சரியாக ${questionCount} வேறுபட்ட, தரமான கேள்விகளை உருவாக்கவும்.`,
-          "",
-          "கேள்வி தர விதிகள்:",
-          "- ஒவ்வொரு கேள்வியும் சுருக்கத்தில் உள்ள ஒரு குறிப்பிட்ட உண்மை, வரையறை, அல்லது கருத்தை சோதிக்க வேண்டும்.",
-          "- கேள்வி வகைகள்: நினைவுபடுத்தல் (X என்றால் என்ன?), அடையாளம் காணுதல் (எது Y?), பயன்பாடு (A என்றால் என்ன நடக்கும்?)",
-          "- 'நாம் என்ன கற்றோம்?' அல்லது 'முக்கிய கருத்து என்ன?' போன்ற பொதுவான கேள்விகள் வேண்டாம்.",
-          "- கற்றல் நடைமுறை பற்றிய meta கேள்விகள் வேண்டாம்.",
-          "- தவறான விருப்பங்கள் நம்பகமான தவறுகளாக இருக்க வேண்டும் (பொதுவான தவறான புரிதல்கள்).",
-          "- ஒவ்வொரு கேள்வியும் சுருக்கமாகவும் குழந்தைகள் புரியும் வகையிலும் இருக்க வேண்டும்.",
-          "- பாடப்புத்தக பயிற்சிகள் இருந்தால், அவற்றை MCQ வடிவமாக மாற்றவும்.",
-          "",
-          "ஒவ்வொரு கேள்விக்கும்:",
-          "- q: சுருக்கத்தில் உள்ள ஒரு குறிப்பிட்ட உண்மையை சோதிக்கும் தெளிவான கேள்வி",
-          "- options: சரியாக 4 குறுகிய விருப்பங்கள் ('மேற்கூறிய அனைத்தும்' வேண்டாம்)",
-          "- answerIndex: சரியான விடையின் index (0 முதல் 3)",
-          "- explain: சரியான விடை ஏன் என்று பாடத்தில் இருந்து காரணம்",
-          "",
-          "JSON keys மட்டும் questions, q, options, answerIndex, explain ஆகவே இருக்க வேண்டும்.",
-          "Return ONLY valid JSON.",
-          '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
-        ].join("\n")
-      : [
-          "Respond only in English.",
-          `You are creating curriculum-aligned MCQ questions for Class ${classLevel} primary school students.`,
-          `Topic: ${topic}`,
-          `Subject: ${subject}`,
-          `Source mode: ${source}`,
-          "",
-          "IMPORTANT: Base ALL questions directly on the factual content below. Do NOT invent facts.",
-          "Use only ideas, definitions, examples, and facts that appear in this summary:",
-          summaryText + exerciseNote,
-          "",
-          `Create exactly ${questionCount} distinct, high-quality questions.`,
-          "",
-          "BANNED question patterns (NEVER use these):",
-          `- "Which option matches today's summary on ${topic}?" — this is a meta question`,
-          '- "What is the main idea?" — too vague',
-          '- "What did we learn today?" — meta question about the session',
-          '- "Today we are going to start..." — this is a statement, not a question',
-          "- Any question about the teaching process, language of instruction, or session format",
-          "- Any question where the options are statements about what the lesson covers",
-          "",
-          "GOOD question patterns (use these):",
-          `- "What is [specific term from the text]?" — tests factual recall`,
-          `- "How many [specific thing] are mentioned in [context]?" — tests comprehension`,
-          `- "Which of these is an example of [concept]?" — tests identification`,
-          `- "If [scenario from text], what happens?" — tests application`,
-          "",
-          "Question quality rules:",
-          "- Every question MUST test a specific fact, definition, concept, or relationship from the summary content.",
-          "- Question types: recall (what is X?), identification (which one is Y?), application (if A then what?), comparison.",
-          "- Do NOT ask about teaching methods, learning activities, the session, or the summary itself.",
-          "- Each question must have ONE clearly correct answer — wrong options must be plausible but definitively wrong.",
-          "- Keep language simple and age-appropriate (max 18 words per question).",
-          "- Wrong options should be common misconceptions or related-but-incorrect facts from the same domain.",
-          "- If textbook exercise questions are provided, adapt them into MCQ format directly.",
-          "- Vary difficulty: mix easy recall with slightly harder application questions.",
-          "",
-          "For each question provide:",
-          "- q: one clear question testing a specific fact from the summary",
-          "- options: exactly 4 short, concrete options (NOT sentences — just the answer words/phrase)",
-          "- answerIndex: index of the correct option (0 to 3)",
-          "- explain: one sentence explaining WHY the correct answer is right, referencing the fact from the text",
-          "",
-          "Return ONLY valid JSON in this exact shape:",
-          '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
-        ].join("\n");
+function _countTextWords(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
+}
 
-  try {
-    const generated = await generateLlmJson<{ questions: SocraticQuestion[] }>(prompt);
-    const normalized = _normalizeQuestions(generated.questions, questionCount);
-    if (normalized.length >= questionCount) {
-      return normalized.slice(0, questionCount);
-    }
-  } catch {
-    // Fall through to static fallback.
+function _compactQuestionFact(text: string, lang: SupportedLanguage): string {
+  const cleaned = _sanitizeSummaryText(text.replace(/\s+/g, " ").trim(), lang);
+  if (!cleaned) return "";
+
+  const firstSentence = cleaned.split(/(?<=[.!?।])\s+/)[0]?.trim() ?? cleaned;
+  const words = firstSentence.split(/\s+/).filter(Boolean);
+  if (words.length <= 24) return firstSentence;
+  return `${words.slice(0, 24).join(" ")}...`;
+}
+
+function _buildQuestionFacts(
+  summaryLines: string[],
+  exerciseChunks: Array<{ text: string; page: number }>,
+  lang: SupportedLanguage,
+): string[] {
+  const sources = [...exerciseChunks.map((chunk) => chunk.text), ...summaryLines];
+
+  const weakFactPattern =
+    lang === "ta"
+      ? /mcq|கேள்வி|சுற்று|விருப்பம்|தொடங்கலாம்|தேர்வு|வணக்கம்|அறிமுக|தொடக்கம்|அமர்வு|எப்படி இருக்க|பாடத்தின் பொதுவான/i
+      : /mcq|question round|tap one option|summary|lesson|classroom process|practice round|introduction|opening line|how are you/i;
+
+  const facts: string[] = [];
+  for (const source of sources) {
+    const fact = _compactQuestionFact(source, lang);
+    if (!fact || fact.length < 18 || weakFactPattern.test(fact)) continue;
+    if (facts.some((existing) => existing.toLowerCase() === fact.toLowerCase())) continue;
+    facts.push(fact);
+    if (facts.length >= MAX_QUESTION_CONTEXT_FACTS) break;
   }
 
-  return _fallbackQuestions(topic, subject, questionCount, lines, classLevel, lang);
+  return facts;
+}
+
+function _collectQuestionKeywords(
+  topic: string,
+  questionFacts: string[],
+  lang: SupportedLanguage,
+): string[] {
+  const stopwords = lang === "ta" ? QUESTION_KEYWORD_STOPWORDS_TA : QUESTION_KEYWORD_STOPWORDS_EN;
+  const minLength = lang === "ta" ? 3 : 4;
+  const tokens =
+    `${topic} ${questionFacts.join(" ")}`.toLowerCase().match(/[a-z]+|[\u0B80-\u0BFF]+/g) ?? [];
+
+  const keywords: string[] = [];
+  for (const token of tokens) {
+    if (token.length < minLength || stopwords.has(token)) continue;
+    if (keywords.includes(token)) continue;
+    keywords.push(token);
+    if (keywords.length >= 18) break;
+  }
+
+  return keywords;
+}
+
+function _normalizeQuestionTokens(text: string, lang: SupportedLanguage): string[] {
+  const stopwords = lang === "ta" ? QUESTION_KEYWORD_STOPWORDS_TA : QUESTION_KEYWORD_STOPWORDS_EN;
+  const minLength = lang === "ta" ? 2 : 3;
+
+  return (text.toLowerCase().match(/[a-z0-9]+|[\u0B80-\u0BFF]+/g) ?? [])
+    .map((token) => {
+      if (lang === "en" && token.length > 4 && token.endsWith("s")) {
+        return token.slice(0, -1);
+      }
+      return token;
+    })
+    .filter((token) => token.length >= minLength && !stopwords.has(token));
+}
+
+function _questionSimilarity(leftText: string, rightText: string, lang: SupportedLanguage): number {
+  const leftTokens = new Set(_normalizeQuestionTokens(leftText, lang));
+  const rightTokens = new Set(_normalizeQuestionTokens(rightText, lang));
+
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) overlap += 1;
+  }
+
+  return overlap / new Set([...leftTokens, ...rightTokens]).size;
+}
+
+function _normalizedAnswerSignature(question: SocraticQuestion, lang: SupportedLanguage): string {
+  return _normalizeQuestionTokens(question.options[question.answerIndex] ?? "", lang).join(" ");
+}
+
+function _isNearDuplicateQuestion(
+  question: SocraticQuestion,
+  existing: SocraticQuestion[],
+  lang: SupportedLanguage,
+): boolean {
+  return existing.some((candidate) => {
+    if (candidate.q.trim().toLowerCase() === question.q.trim().toLowerCase()) {
+      return true;
+    }
+
+    const stemSimilarity = _questionSimilarity(question.q, candidate.q, lang);
+    if (stemSimilarity >= QUESTION_DUPLICATE_SIMILARITY) {
+      return true;
+    }
+
+    const answerSimilarity = _questionSimilarity(
+      question.options[question.answerIndex] ?? "",
+      candidate.options[candidate.answerIndex] ?? "",
+      lang,
+    );
+    const sameAnswerSignature =
+      _normalizedAnswerSignature(candidate, lang) === _normalizedAnswerSignature(question, lang);
+
+    if (sameAnswerSignature && stemSimilarity >= 0.34) {
+      return true;
+    }
+
+    return answerSimilarity >= 0.6 && stemSimilarity >= 0.2;
+  });
+}
+
+function _mergeQuestions(
+  existing: SocraticQuestion[],
+  incoming: SocraticQuestion[],
+  limit: number,
+  lang: SupportedLanguage,
+): SocraticQuestion[] {
+  const merged = [...existing];
+  for (const question of incoming) {
+    if (_isNearDuplicateQuestion(question, merged, lang)) continue;
+    merged.push(question);
+    if (merged.length >= limit) break;
+  }
+  return merged;
+}
+
+function _buildQuestionPrompt(
+  input: QuestionBankRequest,
+  questionFacts: string[],
+  anchorWords: string[],
+  existingQuestions: SocraticQuestion[],
+  batchSize: number,
+): string {
+  const factsBlock =
+    questionFacts.length > 0
+      ? questionFacts.map((fact, idx) => `${idx + 1}. ${fact}`).join("\n")
+      : input.lang === "ta"
+        ? `${input.topic} பற்றிய உறுதியான தகவல்களை மட்டும் கேள்வியாக மாற்றவும்.`
+        : `Stay tightly focused on ${input.topic} only.`;
+
+  const anchorsBlock = anchorWords.length > 0 ? anchorWords.join(", ") : input.topic;
+  const usedQuestionsBlock =
+    existingQuestions.length > 0
+      ? existingQuestions
+          .slice(-8)
+          .map((question, idx) => `${idx + 1}. ${question.q}`)
+          .join("\n")
+      : input.lang === "ta"
+        ? "இன்னும் எதுவும் பயன்படுத்தப்படவில்லை."
+        : "None yet.";
+
+  return input.lang === "ta"
+    ? [
+        "தமிழில் மட்டும் பதிலளிக்கவும்.",
+        `நீங்கள் வகுப்பு ${input.classLevel} ${input.subject} ஆசிரியர்.`,
+        `தலைப்பு: ${input.topic}`,
+        "",
+        "கீழே உள்ள topic facts-ஐ மட்டும் பயன்படுத்தவும்:",
+        factsBlock,
+        `Anchor words: ${anchorsBlock}`,
+        "",
+        "ஏற்கனவே பயன்படுத்திய கேள்வி கருத்துகள். இவற்றை மீண்டும் அல்லது வேறு வடிவில் கேட்க வேண்டாம்:",
+        usedQuestionsBlock,
+        "",
+        "விதிகள்:",
+        `- இந்த batch-க்கு ${batchSize} MCQ மட்டும் உருவாக்கவும்.`,
+        "- மேலே உள்ள facts-இல் இல்லாத தகவலை உருவாக்க வேண்டாம்.",
+        "- ஒவ்வொரு கேள்வியும் தலைப்பின் ஒரு தெளிவான உண்மை, பகுதி, வேலை, உதாரணம், வரிசை, காரணம் அல்லது விளைவைச் சோதிக்க வேண்டும்.",
+        "- பாடம், சுருக்கம், வகுப்பு நடைமுறை, அல்லது பொதுவான subject பற்றி கேள்வி கேட்க வேண்டாம்.",
+        "- ஒவ்வொரு கேள்வியும் வேறு fact அல்லது வேறு reasoning angle-ஐ பயன்படுத்த வேண்டும்.",
+        "- முதல் கேள்விகள் எளிதாகவும், பின்னைய கேள்விகள் சிந்திக்க வைக்கும் வகையிலும் இருக்கட்டும்.",
+        "- ஒவ்வொரு கேள்விக்கும் 4 விருப்பங்கள் மட்டும்; 1 சரியான பதில் மட்டும்.",
+        "- விருப்பங்கள் குறுகிய சொற்கள் அல்லது சிறு சொற்றொடர்கள் மட்டும்; முழு வாக்கியங்கள் வேண்டாம்.",
+        "- தவறான விருப்பங்கள் இதே topic-இல் வரும் நம்பகமான குழப்பங்கள் ஆக இருக்க வேண்டும்.",
+        "- 'all of the above', 'none of the above', 'இந்த topic தொடர்பில்லை', 'skip' போன்ற பொதுவான fillers வேண்டாம்.",
+        "- explain ஒரு குறுகிய வாக்கியமாக சரியான பதில் ஏன் சரி என்பதைச் சொல்ல வேண்டும்.",
+        "- ஒரே கேள்வி கருத்தை மீண்டும் மீண்டும் பயன்படுத்த வேண்டாம்.",
+        "",
+        "Return ONLY valid JSON in this exact shape:",
+        '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
+      ].join("\n")
+    : [
+        "Respond only in English.",
+        `You are writing a topic-locked MCQ bank for Class ${input.classLevel} ${input.subject}.`,
+        `Topic: ${input.topic}`,
+        "",
+        "Use ONLY these topic facts:",
+        factsBlock,
+        `Anchor words: ${anchorsBlock}`,
+        "",
+        "Already used question ideas. Do not repeat or paraphrase any of these:",
+        usedQuestionsBlock,
+        "",
+        "Rules:",
+        `- Create exactly ${batchSize} MCQs for this batch.`,
+        "- Use only the facts above. If a detail is not supported there, do not invent it.",
+        "- Every question must test a concrete topic fact, part, function, sequence, example, cause, or effect.",
+        "- Do not ask about the lesson, summary, classroom process, or the subject in general.",
+        "- Each question must use a different fact or a clearly different reasoning angle from the previous questions.",
+        "- Start with easier recall questions and move toward simple reasoning.",
+        "- Each question must have exactly 4 options and exactly 1 correct answer.",
+        "- Options must be short words or short phrases, never full sentences.",
+        "- Wrong options must be plausible confusions from the same topic.",
+        "- Never use fillers such as all of the above, none of the above, this topic is unrelated, skip, or not in the lesson.",
+        "- explain must be one short sentence that states why the correct answer is right using the topic fact.",
+        "- Do not repeat the same question idea or the same correct answer when avoidable.",
+        "",
+        "Return ONLY valid JSON in this exact shape:",
+        '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
+      ].join("\n");
+}
+
+async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQuestion[]> {
+  const questionFacts = _buildQuestionFacts(
+    input.summaryLines,
+    input.exerciseChunks ?? [],
+    input.lang,
+  );
+  const targetCount = Math.max(
+    QUESTIONS_PER_STUDENT,
+    Math.min(input.questionCount, MAX_QUESTION_BANK_SIZE),
+  );
+  const groundingKeywords = _collectQuestionKeywords(input.topic, questionFacts, input.lang);
+  let collected: SocraticQuestion[] = [];
+  const maxRounds = Math.max(
+    2,
+    Math.min(
+      QUESTION_GENERATION_MAX_ROUNDS,
+      Math.ceil(targetCount / QUESTION_GENERATION_BATCH_SIZE) + 2,
+    ),
+  );
+
+  for (let round = 0; round < maxRounds && collected.length < targetCount; round += 1) {
+    const batchSize = Math.min(QUESTION_GENERATION_BATCH_SIZE, targetCount - collected.length);
+    const prompt = _buildQuestionPrompt(
+      { ...input, questionCount: targetCount },
+      questionFacts,
+      groundingKeywords,
+      collected,
+      batchSize,
+    );
+
+    try {
+      const generated = await generateLlmJson<{ questions: SocraticQuestion[] }>(prompt);
+      const normalized = _normalizeQuestions(generated.questions, batchSize, input.lang);
+      collected = _mergeQuestions(collected, normalized, targetCount, input.lang);
+      if (collected.length >= targetCount) {
+        return collected.slice(0, targetCount);
+      }
+      if (normalized.length > 0) continue;
+    } catch {
+      // Retry this batch once with plain text generation in case JSON mode is brittle.
+    }
+
+    try {
+      const raw =
+        input.lang === "ta"
+          ? await generateTamilResponse(prompt)
+          : await generateLlmResponse(prompt);
+      const parsed = _parseQuestionEnvelope(raw);
+      if (parsed) {
+        const normalized = _normalizeQuestions(parsed.questions, batchSize, input.lang);
+        collected = _mergeQuestions(collected, normalized, targetCount, input.lang);
+        if (collected.length >= targetCount) {
+          return collected.slice(0, targetCount);
+        }
+      }
+    } catch {
+      // Fall through to the stricter fallback prompt.
+    }
+  }
+
+  return await _fallbackQuestions(
+    { ...input, questionCount: targetCount },
+    questionFacts,
+    groundingKeywords,
+    collected,
+  );
+}
+
+function _parseQuestionEnvelope(raw: string): { questions: unknown } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : trimmed;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+
+  try {
+    const parsed = JSON.parse(candidate.slice(start, end + 1)) as { questions?: unknown };
+    return parsed && typeof parsed === "object" && "questions" in parsed
+      ? { questions: parsed.questions }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function _extractClassLevel(className: string): number {
@@ -672,60 +948,6 @@ function _extractClassLevel(className: string): number {
   const value = Number(match[1]);
   if (!Number.isFinite(value)) return DEFAULT_CLASS_LEVEL;
   return Math.max(1, Math.min(MAX_CLASS_LEVEL, Math.floor(value)));
-}
-
-async function _fetchWebSnippets(topic: string, lang: SupportedLanguage): Promise<WebSnippet[]> {
-  const trimmed = topic.trim();
-  if (!trimmed) return [];
-
-  const wikiHost = lang === "ta" ? "ta.wikipedia.org" : "en.wikipedia.org";
-
-  const searchUrl = `https://${wikiHost}/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(trimmed)}&srlimit=4&utf8=1&format=json&origin=*`;
-
-  let search: WikiSearchResponse | null = null;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
-    const response = await fetch(searchUrl, { signal: controller.signal });
-    clearTimeout(timeout);
-    if (response.ok) {
-      search = (await response.json()) as WikiSearchResponse;
-    }
-  } catch {
-    return [];
-  }
-
-  const titles = (search?.query?.search ?? [])
-    .map((item) => (typeof item.title === "string" ? item.title.trim() : ""))
-    .filter(Boolean)
-    .slice(0, 3);
-
-  const snippets: WebSnippet[] = [];
-  for (const title of titles) {
-    const slug = encodeURIComponent(title.replace(/\s+/g, "_"));
-    const summaryUrl = `https://${wikiHost}/api/rest_v1/page/summary/${slug}`;
-
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
-      const response = await fetch(summaryUrl, { signal: controller.signal });
-      clearTimeout(timeout);
-      if (!response.ok) continue;
-      const data = (await response.json()) as WikiSummaryResponse;
-      const summary = typeof data.extract === "string" ? data.extract.trim() : "";
-      if (!summary) continue;
-
-      snippets.push({
-        title: data.title?.trim() || title,
-        summary,
-        url: data.content_urls?.desktop?.page || `https://${wikiHost}/wiki/${slug}`,
-      });
-    } catch {
-      // Ignore failed snippet and continue.
-    }
-  }
-
-  return snippets;
 }
 
 function _sanitizeSummaryText(text: string, lang: SupportedLanguage): string {
@@ -922,7 +1144,7 @@ function _buildPreviewCards(
 }
 
 function _fallbackPreviewCards(topic: string, subject: string, sourceMode: string): PreviewCard[] {
-  const sourceCue = sourceMode === "custom" ? "Web notes" : "Textbook cue";
+  const sourceCue = sourceMode === "custom" ? "Local notes" : "Textbook cue";
 
   return [
     {
@@ -1110,8 +1332,23 @@ function _countWords(lines: string[]): number {
   return lines.join(" ").trim().split(/\s+/).filter(Boolean).length;
 }
 
-function _normalizeQuestions(raw: unknown, expectedCount: number): SocraticQuestion[] {
+function _hasWeakMcqOption(option: string): boolean {
+  return (
+    _countTextWords(option) > MAX_QUESTION_OPTION_WORDS ||
+    /all of the above|none of the above|both a and b|both a & b|this topic is unrelated|skip|not in the lesson|today.?s summary/i.test(
+      option,
+    )
+  );
+}
+
+function _normalizeQuestions(
+  raw: unknown,
+  expectedCount: number,
+  lang: SupportedLanguage,
+): SocraticQuestion[] {
   if (!Array.isArray(raw)) return [];
+
+  const deduped: SocraticQuestion[] = [];
 
   return raw
     .map((q): SocraticQuestion | null => {
@@ -1128,7 +1365,7 @@ function _normalizeQuestions(raw: unknown, expectedCount: number): SocraticQuest
         )
         .slice(0, 4);
 
-      if (!question || options.length !== 4) return null;
+      if (!question || options.length !== 4 || options.some(_hasWeakMcqOption)) return null;
 
       let answerIndex =
         typeof rec.answerIndex === "number" && Number.isInteger(rec.answerIndex)
@@ -1167,6 +1404,11 @@ function _normalizeQuestions(raw: unknown, expectedCount: number): SocraticQuest
     })
     .filter((q): q is SocraticQuestion => q !== null)
     .filter((q) => !_isMetaQuestion(q))
+    .filter((q) => {
+      if (_isNearDuplicateQuestion(q, deduped, lang)) return false;
+      deduped.push(q);
+      return true;
+    })
     .slice(0, expectedCount);
 }
 
@@ -1176,118 +1418,53 @@ function _isMetaQuestion(q: SocraticQuestion): boolean {
   const optionsLower = q.options.map((o) => o.toLowerCase()).join(" ");
   // Meta patterns: questions about the lesson/summary itself
   if (
-    /which option matches|today.?s summary|what did we learn|main idea of (the|this) (lesson|summary)|what is this (lesson|topic) about/i.test(
+    /which option matches|today.?s summary|what did we learn|main idea of (the|this) (lesson|summary)|what is this (lesson|topic) about|introduction|opening line|how are you|general start of the lesson/i.test(
       lower,
+    )
+  )
+    return true;
+  if (
+    /இன்றைய சுருக்கம்|இந்தப் பாடம் என்ன|பாடத்தின் பொதுவான தொடக்கம்|அறிமுக|தொடக்கம்|அமர்வு|எப்படி இருக்கீங்க|எப்படி இருக்கிறீர்கள்|வணக்கம்/i.test(
+      q.q,
     )
   )
     return true;
   // Options that are statements about the lesson
   if (
-    /today we are going to|this topic should be|are needed for this topic|is unrelated to/i.test(
+    /today we are going to|this topic should be|are needed for this topic|is unrelated to|introduction|opening speech/i.test(
       optionsLower,
     )
   )
     return true;
+  if (/அறிமுக உரை|தொடக்க உரை|பாடத்தின் தொடக்கம்|அமர்வு தொடக்கம்/i.test(q.options.join(" "))) {
+    return true;
+  }
   return false;
 }
 
-function _fallbackQuestions(
-  topic: string,
-  subject: string,
-  count: number,
-  lines: string[],
-  classLevel: number,
-  lang: SupportedLanguage,
-): SocraticQuestion[] {
-  const facts = _extractFacts(lines, Math.max(6, Math.min(18, count + 4)));
-  const starterFact =
-    lang === "ta"
-      ? `${topic} வகுப்பு ${classLevel} மாணவர்களுக்கு எளிய மொழியில் கற்பிக்கப்படுகிறது.`
-      : `${topic} is taught in simple language for Class ${classLevel}.`;
-  const questionStems =
-    lang === "ta"
-      ? ([
-          `இன்றைய ${topic} சுருக்கத்துடன் பொருந்துவது எது?`,
-          `பாடத்தின் படி ${topic} குறித்து சரியானது எது?`,
-          `இந்த ${subject} சுருக்கத்திலிருந்து சரியான தகவலைத் தேர்ந்தெடு.`,
-          `இன்று நாம் ${topic} பற்றி கற்ற கூற்று எது?`,
-        ] as const)
-      : ([
-          `Which option matches today's summary on ${topic}?`,
-          `According to the lesson, what is true about ${topic}?`,
-          `Pick the correct fact from this ${subject} summary.`,
-          `Which statement did we learn today about ${topic}?`,
-        ] as const);
+async function _fallbackQuestions(
+  input: QuestionBankRequest,
+  questionFacts: string[] = [],
+  groundingKeywords: string[] = [],
+  existing: SocraticQuestion[] = [],
+): Promise<SocraticQuestion[]> {
+  const remaining = Math.max(1, input.questionCount - existing.length);
+  const prompt = _buildQuestionPrompt(input, questionFacts, groundingKeywords, existing, remaining);
 
-  const questions: SocraticQuestion[] = [];
-  for (let i = 0; i < count; i += 1) {
-    const fact = facts[i % facts.length] ?? starterFact;
-    const correct = _shortenForOption(fact);
-    const wrong =
-      lang === "ta"
-        ? [
-            `${topic} என்பது ${subject} பாடத்துடன் தொடர்பில்லாதது.`,
-            `இந்தத் தலைப்பை வகுப்பு ${classLevel} மாணவர்கள் கற்க வேண்டாம்.`,
-            `இந்தத் தலைப்புக்கு கல்லூரி நிலை விவரங்கள் மட்டும் தேவை.`,
-          ]
-        : [
-            `${topic} is unrelated to ${subject}.`,
-            `This topic should be skipped for Class ${classLevel}.`,
-            `Only advanced college details are needed for this topic.`,
-          ];
-
-    const { options, answerIndex } = _buildOptions(correct, wrong, i, lang);
-    questions.push({
-      q: questionStems[i % questionStems.length],
-      options,
-      answerIndex,
-      explain:
-        lang === "ta"
-          ? "இந்த விருப்பம் இன்றைய சுருக்கத்துடன் நேராகப் பொருந்துகிறது."
-          : "This option directly matches today's summary.",
-    });
+  try {
+    const raw =
+      input.lang === "ta" ? await generateTamilResponse(prompt) : await generateLlmResponse(prompt);
+    const parsed = _parseQuestionEnvelope(raw);
+    if (parsed) {
+      const normalized = _normalizeQuestions(parsed.questions, remaining, input.lang);
+      const merged = _mergeQuestions(existing, normalized, input.questionCount, input.lang);
+      if (merged.length > 0) return merged.slice(0, input.questionCount);
+    }
+  } catch {
+    // LLM unavailable — return empty so upstream can surface a proper error.
   }
 
-  return questions;
-}
-
-function _extractFacts(lines: string[], limit: number): string[] {
-  return lines
-    .flatMap((line) => line.split(/(?<=[.!?])\s+/))
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter((line) => {
-      const words = line.split(/\s+/).filter(Boolean).length;
-      return words >= 6 && words <= 22;
-    })
-    .filter(
-      (line, idx, arr) =>
-        arr.findIndex((value) => value.toLowerCase() === line.toLowerCase()) === idx,
-    )
-    .slice(0, limit);
-}
-
-function _shortenForOption(text: string): string {
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length <= 14) return text;
-  return `${words.slice(0, 14).join(" ")}.`;
-}
-
-function _buildOptions(
-  correct: string,
-  distractors: readonly string[],
-  seed: number,
-  lang: SupportedLanguage = "en",
-): { options: string[]; answerIndex: number } {
-  const options = distractors.slice(0, 3).map((value) => value.trim());
-  while (options.length < 3) {
-    options.push(
-      lang === "ta" ? "பாடத்தில் போதுமான தகவல் இல்லை." : "Not enough lesson context available.",
-    );
-  }
-
-  const answerIndex = seed % 4;
-  options.splice(answerIndex, 0, correct.trim());
-  return { options, answerIndex };
+  return existing.slice(0, input.questionCount);
 }
 
 function _extractKeyPoints(

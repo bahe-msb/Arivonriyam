@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { resolve } from "$app/paths";
-  import { onDestroy, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import {
     ArrowRight,
     RotateCcw,
@@ -77,7 +77,10 @@
   const QUESTIONS_PER_STUDENT = 6;
   const PROGRESS_SEGMENTS = 6;
   const AUTO_ADVANCE_MS = 5000;
-  const SUMMARY_FETCH_TIMEOUT_MS = 180000;
+  const TABLET_STUDENT_BREAKPOINT = 835;
+  const SUMMARY_FETCH_TIMEOUT_MS = 360000;
+  const SUMMARY_SEGMENT_WORD_LIMIT = 18;
+  const SUMMARY_SEGMENT_SENTENCE_LIMIT = 2;
   type SocraticStudent = { id: string; name: string; emoji: string };
 
   const FALLBACK_EMOJIS = ["🦁", "🌻", "🦚", "🌙"];
@@ -116,10 +119,22 @@
   let submittedOption = $state<number | null>(null);
   let lastCorrect = $state(true);
   let feedbackTitle = $state("");
+  let useTabletStudentShell = $state(false);
   let feedbackDetail = $state("");
+
+  function syncTabletStudentShell(): void {
+    if (typeof window === "undefined") return;
+
+    useTabletStudentShell =
+      navigator.maxTouchPoints > 1 &&
+      window.innerWidth >= 768 &&
+      Math.min(window.innerWidth, window.innerHeight) <= TABLET_STUDENT_BREAKPOINT;
+  }
 
   let summaryLines = $state<string[]>([]);
   let summaryIdx = $state(0);
+  let speakingSummaryLineIdx = $state<number | null>(null);
+  let summarySpeechCharIdx = $state(0);
   let summaryLoading = $state(false);
   let summaryError = $state("");
   let sessionLanguage = $state<"en" | "ta">("en");
@@ -203,6 +218,116 @@
     return tamilChars >= Math.max(6, Math.floor(latinChars / 2)) ? "ta" : "en";
   }
 
+  function countWords(text: string): number {
+    return text.split(/\s+/).filter(Boolean).length;
+  }
+
+  function chunkSummaryByWords(text: string, wordLimit = SUMMARY_SEGMENT_WORD_LIMIT): string[] {
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length <= wordLimit) return [text];
+
+    const segments: string[] = [];
+    for (let start = 0; start < words.length; start += wordLimit) {
+      segments.push(words.slice(start, start + wordLimit).join(" "));
+    }
+
+    return segments;
+  }
+
+  function splitSummaryLine(line: string): string[] {
+    const trimmed = line.replace(/\s+/g, " ").trim();
+    if (!trimmed) return [];
+    if (isDialogueLine(trimmed)) return [trimmed];
+
+    const sentences = trimmed
+      .split(/(?<=[.!?।])\s+/)
+      .map((part) => part.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+
+    if (sentences.length <= 1) {
+      return chunkSummaryByWords(trimmed);
+    }
+
+    const segments: string[] = [];
+    let pending = "";
+    let pendingWordCount = 0;
+    let pendingSentenceCount = 0;
+
+    const flush = () => {
+      if (!pending) return;
+      segments.push(pending);
+      pending = "";
+      pendingWordCount = 0;
+      pendingSentenceCount = 0;
+    };
+
+    for (const sentence of sentences) {
+      const sentenceWordCount = countWords(sentence);
+      if (sentenceWordCount > SUMMARY_SEGMENT_WORD_LIMIT + 4) {
+        flush();
+        segments.push(...chunkSummaryByWords(sentence));
+        continue;
+      }
+
+      const wouldOverflowWords = pendingWordCount + sentenceWordCount > SUMMARY_SEGMENT_WORD_LIMIT;
+      const wouldOverflowSentences = pendingSentenceCount >= SUMMARY_SEGMENT_SENTENCE_LIMIT;
+
+      if (pending && (wouldOverflowWords || wouldOverflowSentences)) {
+        flush();
+      }
+
+      pending = pending ? `${pending} ${sentence}` : sentence;
+      pendingWordCount += sentenceWordCount;
+      pendingSentenceCount += 1;
+    }
+
+    flush();
+    return segments.length > 0 ? segments : chunkSummaryByWords(trimmed);
+  }
+
+  function normalizeSummaryLines(raw: string[]): string[] {
+    return raw.flatMap((line) => splitSummaryLine(line)).filter(Boolean);
+  }
+
+  function resetSummarySpeechHighlight(): void {
+    speakingSummaryLineIdx = null;
+    summarySpeechCharIdx = 0;
+  }
+
+  function getSummaryHighlightParts(
+    line: string,
+    index: number,
+  ): { before: string; active: string; after: string } | null {
+    if (phase !== "summarizing" || summaryIdx !== index || speakingSummaryLineIdx !== index) {
+      return null;
+    }
+
+    const text = line.trim();
+    if (!text) return null;
+
+    let cursor = Math.max(0, Math.min(summarySpeechCharIdx, text.length));
+    while (cursor < text.length && /\s/.test(text[cursor] ?? "")) {
+      cursor += 1;
+    }
+    if (cursor >= text.length) return null;
+
+    let start = cursor;
+    while (start > 0 && !/\s/.test(text[start - 1] ?? "")) {
+      start -= 1;
+    }
+
+    let end = cursor;
+    while (end < text.length && !/\s/.test(text[end] ?? "")) {
+      end += 1;
+    }
+
+    return {
+      before: text.slice(0, start),
+      active: text.slice(start, end),
+      after: text.slice(end),
+    };
+  }
+
   function fallbackLines(): string[] {
     if (sessionLanguage === "ta") {
       return [
@@ -221,72 +346,149 @@
     ];
   }
 
+  function questionSignature(question: SessionQuestion): string {
+    return question.q.trim().toLowerCase();
+  }
+
+  function mergeUniqueQuestions(
+    primary: SessionQuestion[],
+    secondary: SessionQuestion[],
+    limit: number,
+  ): SessionQuestion[] {
+    const merged: SessionQuestion[] = [];
+    const seen = new Set<string>();
+
+    for (const question of [...primary, ...secondary]) {
+      const signature = questionSignature(question);
+      if (!signature || seen.has(signature)) continue;
+      seen.add(signature);
+      merged.push(question);
+      if (merged.length >= limit) break;
+    }
+
+    return merged;
+  }
+
+  function fallbackFactCue(text: string, wordLimit = 12): string {
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length <= wordLimit) return text;
+
+    const headCount = Math.ceil(wordLimit / 2);
+    const tailCount = Math.max(2, wordLimit - headCount - 1);
+    return `${words.slice(0, headCount).join(" ")} ... ${words.slice(-tailCount).join(" ")}`;
+  }
+
   function fallbackQuestions(count: number): SessionQuestion[] {
     const topicName = topic?.topic ?? "this topic";
     const subjectName = topic?.subject ?? "Science";
+    const summaryFactPool = summaryLines
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .filter((line) => countWords(line) >= 5)
+      .filter(
+        (line) =>
+          !/question|option|tap|round|summary|session|mcq|கேள்வி|விருப்பம்|தொடு|சுருக்கம்|அமர்வு/i.test(
+            line,
+          ),
+      )
+      .filter(
+        (line, idx, arr) => arr.findIndex((value) => value.toLowerCase() === line.toLowerCase()) === idx,
+      );
+
     if (sessionLanguage === "ta") {
       const facts = [
+        ...summaryFactPool,
         `${topicName} எளிய ${subjectName} மொழியில் விளக்கப்படுகிறது.`,
         `${topicName} அன்றாட உதாரணங்கள் மூலம் கற்றுக்கொள்ளப்படுகிறது.`,
         `${topicName} கேள்விகளுக்கு ஒரு சரியான பதிலைத் தேர்ந்தெடுத்து விடை அளிக்க வேண்டும்.`,
         `${topicName} புரிதல் பாடத்தில் உள்ள தகவலைச் சேர்த்து யோசிக்கும் போது மேம்படும்.`,
         `${topicName} இளம் கற்றவர்களுக்கு படிப்படியாக மறுபார்வை செய்யப்படுகிறது.`,
         `${topicName} கேள்வியில் பதிலைத் தேர்வதற்கு முன் எல்லா விருப்பங்களையும் படிக்க வேண்டும்.`,
-      ];
+      ].filter(
+        (fact, idx, arr) => arr.findIndex((value) => value.toLowerCase() === fact.toLowerCase()) === idx,
+      );
 
-      const questionStems = [
-        `இன்றைய ${topicName} சுருக்கத்துடன் பொருந்துவது எது?`,
-        `பாடத்தின் படி ${topicName} குறித்து சரியானது எது?`,
-        `இந்த ${subjectName} அமர்விலிருந்து சரியான தகவலைத் தேர்ந்தெடு.`,
-        `${topicName} பற்றி சரியான கூற்று எது?`,
+      const questionTemplates = [
+        (cue: string) => `"${cue}" என்ற பாடக் குறிக்குறியுடன் பொருந்துவது எது?`,
+        (cue: string) => `${topicName} பற்றி "${cue}" என்ற தகவலுக்கு சரியான விடை எது?`,
+        (cue: string) => `இந்த ${subjectName} தலைப்பில் "${cue}" எனில் சரியான கூற்று எது?`,
+        (cue: string) => `${topicName} பாடத்தில் "${cue}" குறிக்கும் தகவல் எது?`,
+      ] as const;
+
+      const genericWrongs = [
+        `${topicName} என்பது ${subjectName} பாடத்தின் பகுதி அல்ல.`,
+        `${topicName} கேள்விகளை வகுப்பில் தவிர்க்க வேண்டும்.`,
+        `${topicName} கேள்விக்கு பதில் அளிக்க விருப்பங்களைப் படிக்கத் தேவையில்லை.`,
+        `${topicName} பற்றி யோசிக்காமல் எந்த விடையையும் தேர்ந்தெடுக்கலாம்.`,
       ] as const;
 
       return Array.from({ length: count }, (_, idx) => {
         const correct = facts[idx % facts.length];
-        const wrong = [
-          `${topicName} என்பது ${subjectName} பாடத்தின் பகுதி அல்ல.`,
-          `${topicName} கேள்விகளை வகுப்பில் தவிர்க்க வேண்டும்.`,
-          `${topicName} கேள்விக்கு பதில் அளிக்க விருப்பங்களைப் படிக்கத் தேவையில்லை.`,
-        ];
+        const template = questionTemplates[Math.floor(idx / Math.max(1, facts.length)) % questionTemplates.length];
+        const cue = fallbackFactCue(correct);
+        const wrong = facts
+          .filter((fact) => fact.toLowerCase() !== correct.toLowerCase())
+          .slice(idx % Math.max(1, facts.length), (idx % Math.max(1, facts.length)) + 3);
+
+        while (wrong.length < 3) {
+          const fallbackWrong = genericWrongs[(idx + wrong.length) % genericWrongs.length];
+          if (!wrong.includes(fallbackWrong)) wrong.push(fallbackWrong);
+        }
+
         const { options, answerIndex } = buildOptions(correct, wrong, idx);
         return {
-          q: questionStems[idx % questionStems.length],
+          q: template(cue),
           options,
           answerIndex,
-          explain: "இந்த விருப்பம் இன்றைய சுருக்கத்துடன் பொருந்துகிறது.",
+          explain: "இந்த விடை பாடத்தில் வந்த சரியான தகவலுடன் பொருந்துகிறது.",
         };
       });
     }
 
     const facts = [
+      ...summaryFactPool,
       `${topicName} is explained in simple ${subjectName} language.`,
       `${topicName} is learned through examples from daily life.`,
       `${topicName} questions are answered by choosing one correct option.`,
       `${topicName} understanding improves when we match answers with lesson facts.`,
       `${topicName} is revised step by step for young learners.`,
       `Students should read all options before choosing the answer in ${topicName}.`,
-    ];
+    ].filter(
+      (fact, idx, arr) => arr.findIndex((value) => value.toLowerCase() === fact.toLowerCase()) === idx,
+    );
 
-    const questionStems = [
-      `Which option matches today's summary about ${topicName}?`,
-      `According to the lesson, what is true about ${topicName}?`,
-      `Pick the correct fact from this ${subjectName} session.`,
-      `Which statement about ${topicName} is correct?`,
+    const questionTemplates = [
+      (cue: string) => `Which answer matches this lesson clue about ${topicName}: "${cue}"?`,
+      (cue: string) => `According to the ${subjectName} lesson on ${topicName}, which statement fits "${cue}"?`,
+      (cue: string) => `Choose the correct idea linked to this ${topicName} clue: "${cue}".`,
+      (cue: string) => `Which statement stays true for ${topicName} when the lesson says "${cue}"?`,
+    ] as const;
+
+    const genericWrongs = [
+      `${topicName} is not part of ${subjectName}.`,
+      `Students should skip ${topicName} questions in class.`,
+      `${topicName} can be answered without reading options.`,
+      `${topicName} does not need any lesson facts to answer correctly.`,
     ] as const;
 
     return Array.from({ length: count }, (_, idx) => {
       const correct = facts[idx % facts.length];
-      const wrong = [
-        `${topicName} is not part of ${subjectName}.`,
-        `Students should skip ${topicName} questions in class.`,
-        `${topicName} can be answered without reading options.`,
-      ];
+      const template = questionTemplates[Math.floor(idx / Math.max(1, facts.length)) % questionTemplates.length];
+      const cue = fallbackFactCue(correct);
+      const wrong = facts
+        .filter((fact) => fact.toLowerCase() !== correct.toLowerCase())
+        .slice(idx % Math.max(1, facts.length), (idx % Math.max(1, facts.length)) + 3);
+
+      while (wrong.length < 3) {
+        const fallbackWrong = genericWrongs[(idx + wrong.length) % genericWrongs.length];
+        if (!wrong.includes(fallbackWrong)) wrong.push(fallbackWrong);
+      }
+
       const { options, answerIndex } = buildOptions(correct, wrong, idx);
       return {
-        q: questionStems[idx % questionStems.length],
+        q: template(cue),
         options,
         answerIndex,
-        explain: "This option matches today's summary.",
+        explain: "This answer matches the lesson detail for the topic.",
       };
     });
   }
@@ -306,7 +508,7 @@
       return [
         {
           title: "தலைப்பு தொடக்கம்",
-          badge: topic?.source === "custom" ? "Web notes" : "Textbook cue",
+          badge: topic?.source === "custom" ? "Local notes" : "Textbook cue",
           caption: `${topic?.topic ?? "இந்த தலைப்பு"} எளிய ${topic?.subject ?? "அறிவியல்"} சொற்களில் தயாராகிறது.`,
         },
         {
@@ -325,7 +527,7 @@
     return [
       {
         title: "Topic start",
-        badge: topic?.source === "custom" ? "Web notes" : "Textbook cue",
+        badge: topic?.source === "custom" ? "Local notes" : "Textbook cue",
         caption: `We are preparing ${topic?.topic ?? "this topic"} in simple ${topic?.subject ?? "Science"} words.`,
       },
       {
@@ -549,28 +751,26 @@
     const safeStudents = Math.max(1, students.length);
     const totalTurns = safeStudents * QUESTIONS_PER_STUDENT;
 
-    const uniqueBank = questionBank.filter(
-      (question, idx, arr) =>
-        arr.findIndex((value) => value.q.trim().toLowerCase() === question.q.trim().toLowerCase()) === idx,
-    );
+    const uniqueBank = mergeUniqueQuestions(questionBank, [], totalTurns);
+    const sourceBank =
+      uniqueBank.length >= totalTurns
+        ? uniqueBank.slice(0, totalTurns)
+        : mergeUniqueQuestions(uniqueBank, fallbackQuestions(totalTurns), totalTurns);
 
-    const mergedBank = [...uniqueBank];
-    for (const fallback of fallbackQuestions(totalTurns + 4)) {
-      const exists = mergedBank.some(
-        (question) => question.q.trim().toLowerCase() === fallback.q.trim().toLowerCase(),
-      );
-      if (!exists) mergedBank.push(fallback);
-      if (mergedBank.length >= totalTurns) break;
-    }
-
-    if (mergedBank.length === 0) return [];
+    if (sourceBank.length < totalTurns) return [];
 
     const turns: SessionTurn[] = [];
-    for (let turn = 0; turn < totalTurns; turn += 1) {
-      turns.push({
-        ...mergedBank[turn % mergedBank.length],
-        student: turn % safeStudents,
-      });
+    for (let round = 0; round < QUESTIONS_PER_STUDENT; round += 1) {
+      for (let student = 0; student < safeStudents; student += 1) {
+        const bankIndex = student * QUESTIONS_PER_STUDENT + round;
+        const question = sourceBank[bankIndex];
+        if (!question) return [];
+
+        turns.push({
+          ...question,
+          student,
+        });
+      }
     }
 
     return turns;
@@ -668,6 +868,7 @@
   function stopSummaryPlayback(): void {
     summaryRunId += 1;
     clearSummaryFlowTimer();
+    resetSummarySpeechHighlight();
     stopSpeech();
   }
 
@@ -745,25 +946,36 @@
     if (runId !== summaryRunId) return;
 
     if (summaryLines.length === 0) {
+      resetSummarySpeechHighlight();
       phase = "session";
       return;
     }
 
     const nextIdx = Math.min(idx, summaryLines.length - 1);
     summaryIdx = nextIdx;
+    speakingSummaryLineIdx = nextIdx;
+    summarySpeechCharIdx = 0;
     void scrollSummaryToLine(nextIdx);
 
     const isLastLine = nextIdx >= summaryLines.length - 1;
     const line = summaryLines[nextIdx] ?? "";
 
     // Wait for TTS to finish speaking the line before advancing
-    void speakAsync(line, sessionLanguage).then(() => {
+    void speakAsync(line, sessionLanguage, {
+      addPauses: false,
+      onBoundary: (charIndex) => {
+        if (runId !== summaryRunId || phase !== "summarizing" || summaryIdx !== nextIdx) return;
+        summarySpeechCharIdx = charIndex;
+      },
+    }).then(() => {
       if (runId !== summaryRunId || phase !== "summarizing") return;
+      summarySpeechCharIdx = line.length;
 
       // Longer pause between lines for natural flow and comprehension
       summaryFlowTimer = setTimeout(() => {
         if (runId !== summaryRunId || phase !== "summarizing") return;
         if (isLastLine) {
+          resetSummarySpeechHighlight();
           phase = "session";
           return;
         }
@@ -805,9 +1017,11 @@
       if (response.ok) {
         const data = (await response.json()) as SummarizeResponse;
         sessionLanguage = normalizeLanguage(data.language);
-        const lines = Array.isArray(data.lines)
+        const lines = normalizeSummaryLines(
+          Array.isArray(data.lines)
           ? data.lines.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
-          : [];
+          : [],
+        );
         const normalizedPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
 
         if (topic?.source === "custom") {
@@ -815,14 +1029,14 @@
             summaryError = typeof data.error === "string" && data.error.trim()
               ? data.error
               : customTopicLoadErrorMessage();
-            summaryLines = [summaryError];
+            summaryLines = normalizeSummaryLines([summaryError]);
             questionPlan = [];
           } else {
             summaryLines = lines;
             questionPlan = normalizedPlan;
           }
         } else {
-          summaryLines = lines.length > 0 ? lines : fallbackLines();
+          summaryLines = lines.length > 0 ? lines : normalizeSummaryLines(fallbackLines());
           questionPlan = normalizedPlan;
           if (questionPlan.length === 0) {
             questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
@@ -840,14 +1054,14 @@
         summaryError = apiError;
 
         if (topic?.source === "custom") {
-          summaryLines = [apiError || customTopicLoadErrorMessage()];
+          summaryLines = normalizeSummaryLines([apiError || customTopicLoadErrorMessage()]);
           summaryImages = [];
           questionPlan = [];
         } else {
-          summaryLines = [
+          summaryLines = normalizeSummaryLines([
             apiError,
             "Choose an exact textbook topic from the class section and try again.",
-          ];
+          ]);
           questionPlan = [];
         }
       }
@@ -862,14 +1076,14 @@
           ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
           : "Network issue while loading summary.";
       if (topic?.source === "custom") {
-        summaryLines = [summaryError || customTopicLoadErrorMessage()];
+        summaryLines = normalizeSummaryLines([summaryError || customTopicLoadErrorMessage()]);
         summaryImages = [];
         questionPlan = [];
       } else {
-        summaryLines = [
+        summaryLines = normalizeSummaryLines([
           "Could not load textbook chunks for this class topic.",
           "Select the exact chapter topic name and retry.",
-        ];
+        ]);
         questionPlan = [];
       }
     }
@@ -883,6 +1097,7 @@
   }
 
   async function startSession(): Promise<void> {
+    if (reteachTopics.readOnly) return;
     clearAutoAdvanceTimer();
     clearMcqTimer();
     stopSummaryPlayback();
@@ -1033,30 +1248,56 @@
   }
 
   /** Speak text and return a promise that resolves when utterance finishes. */
-  function speakAsync(text: string, lang: "en" | "ta" = "en"): Promise<void> {
+  function speakAsync(
+    text: string,
+    lang: "en" | "ta" = "en",
+    options: {
+      addPauses?: boolean;
+      onBoundary?: (charIndex: number) => void;
+      fallbackMs?: number;
+    } = {},
+  ): Promise<void> {
     return new Promise((resolve) => {
       const clean = stripEmojis(text);
       if (typeof speechSynthesis === "undefined" || !clean) {
         resolve();
         return;
       }
+
+      let settled = false;
+      let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (fallbackTimer !== null) {
+          clearTimeout(fallbackTimer);
+        }
+        resolve();
+      };
+
       speechSynthesis.cancel();
       // Add natural pauses: insert brief pauses after commas and periods
-      const withPauses = clean
-        .replace(/([,;])\s*/g, "$1 ... ")
-        .replace(/([.!?])\s+/g, "$1 ... ");
-      const utt = new SpeechSynthesisUtterance(withPauses);
+      const spokenText =
+        options.addPauses === false
+          ? clean
+          : clean.replace(/([,;])\s*/g, "$1 ... ").replace(/([.!?])\s+/g, "$1 ... ");
+      const utt = new SpeechSynthesisUtterance(spokenText);
       utt.lang = lang === "ta" ? "ta-IN" : "en-IN";
       const voice = _pickVoice(lang);
       if (voice) utt.voice = voice;
       utt.rate = lang === "ta" ? 0.72 : 0.78;
       utt.pitch = 1.05;
-      utt.onend = () => resolve();
-      utt.onerror = () => resolve();
+      utt.onboundary = (event) => {
+        if (typeof event.charIndex !== "number") return;
+        options.onBoundary?.(Math.max(0, Math.min(clean.length, event.charIndex)));
+      };
+      utt.onend = finish;
+      utt.onerror = finish;
       speechSynthesis.speak(utt);
       // Safety net: if onend never fires (some browsers), resolve after max duration
-      const maxMs = Math.max(4000, clean.split(/\s+/).length * 800);
-      setTimeout(() => resolve(), maxMs);
+      const maxMs =
+        options.fallbackMs ?? Math.max(8000, spokenText.split(/\s+/).length * 1000 + 3000);
+      fallbackTimer = setTimeout(finish, maxMs);
     });
   }
 
@@ -1168,14 +1409,30 @@
           ? `தவறான பதில். சரியான விடை: ${correctOpt}. ${currentQ.explain}`
           : `Not quite. The correct answer is: ${correctOpt}. ${currentQ.explain}`;
       }
-      void speakAsync(msg, sessionLanguage).then(() => {
+      void speakAsync(msg, sessionLanguage, {
+        fallbackMs: Math.max(15000, stripEmojis(msg).split(/\s+/).length * 1300 + 5000),
+      }).then(() => {
         if (phase === "session" && answerPhase === "feedback") {
+          if (qIdx >= questionPlan.length - 1) {
+            next();
+            return;
+          }
+
           autoAdvanceTimer = setTimeout(() => {
             if (phase === "session" && answerPhase === "feedback") next();
           }, 1500);
         }
       });
     }
+  });
+
+  onMount(() => {
+    syncTabletStudentShell();
+    window.addEventListener("resize", syncTabletStudentShell);
+
+    return () => {
+      window.removeEventListener("resize", syncTabletStudentShell);
+    };
   });
 
   onDestroy(() => {
@@ -1189,29 +1446,42 @@
 <!-- ═══════════════════════════════════════════════════
      DESKTOP (md+): full viewport layout
      ═══════════════════════════════════════════════════ -->
-<div class="hidden md:flex h-full flex-col overflow-hidden px-8 py-5 gap-4">
+<div
+  class={useTabletStudentShell
+    ? "fixed inset-0 z-50 flex flex-col overflow-hidden"
+    : "hidden h-full flex-col gap-4 overflow-hidden px-8 py-5 md:flex"}
+>
 
-  <div class="mb-2 flex shrink-0 flex-col gap-4 md:flex-row md:items-end md:justify-between">
-    <div>
-      <div class="label-eyebrow text-saffron-600">
-        Student view · MCQ reteach · {cls?.name ?? "Class"}
+  {#if !useTabletStudentShell}
+    <div class="mb-2 flex shrink-0 flex-col gap-4 md:flex-row md:items-end md:justify-between">
+      <div>
+        <div class="label-eyebrow text-saffron-600">
+          Student view · MCQ reteach · {cls?.name ?? "Class"}
+        </div>
+        <div class="page-title mt-1">Choose one option for every question</div>
       </div>
-      <div class="page-title mt-1">Choose one option for every question</div>
+      <div class="flex flex-wrap items-center gap-2">
+        <Pill tone="cobalt">Question {progressStep} of {totalQuestionCount}</Pill>
+        <Pill tone="success">Language · {headerLanguageLabel}</Pill>
+        <Button variant="secondary" onclick={() => goto(resolve("/alert"))}>
+          See teacher alert <ArrowRight class="size-3.5" />
+        </Button>
+      </div>
     </div>
-    <div class="flex flex-wrap items-center gap-2">
-      <Pill tone="cobalt">Question {progressStep} of {totalQuestionCount}</Pill>
-      <Pill tone="success">Language · {headerLanguageLabel}</Pill>
-      <Button variant="secondary" onclick={() => goto(resolve("/alert"))}>
-        See teacher alert <ArrowRight class="size-3.5" />
-      </Button>
-    </div>
-  </div>
+  {/if}
 
   <div
-    class="min-h-0 flex-1 rounded-[28px] p-3.5"
-    style="background:#0b0d14; box-shadow:0 40px 80px -30px rgba(13,17,29,0.45),0 0 0 1px #1b1d28 inset;"
+    class={useTabletStudentShell ? "min-h-0 flex-1 overflow-hidden" : "min-h-0 flex-1 rounded-[28px] p-3.5"}
+    style={useTabletStudentShell
+      ? ""
+      : "background:#0b0d14; box-shadow:0 40px 80px -30px rgba(13,17,29,0.45),0 0 0 1px #1b1d28 inset;"}
   >
-    <div class="flex h-full w-full flex-col overflow-hidden rounded-2xl" style="background:var(--ivory);">
+    <div
+      class={useTabletStudentShell
+        ? "flex h-full w-full flex-col overflow-hidden"
+        : "flex h-full w-full flex-col overflow-hidden rounded-2xl"}
+      style="background:var(--ivory);"
+    >
 
       <div
         class="flex shrink-0 items-center gap-3 border-b px-5 py-3"
@@ -1492,6 +1762,7 @@
                   {#each visibleSummaryLines as line, i (i)}
                     {@const tone = getSummaryLineTone(line, i)}
                     {@const dialogue = isDialogueLine(line)}
+                    {@const summaryHighlight = getSummaryHighlightParts(line, i)}
                     <div
                       class="relative mb-4 pl-1"
                     >
@@ -1534,7 +1805,18 @@
                               {tone.label}
                             </div>
                           </div>
-                          {enrichWithEmojis(line)}
+                          {#if summaryHighlight}
+                            <span style="opacity:0.46;">{summaryHighlight.before}</span>
+                            <span
+                              class="rounded-lg px-1 py-0.5"
+                              style="background:{accent}24; box-shadow:0 0 0 1px {accent}18;"
+                            >
+                              {summaryHighlight.active}
+                            </span>
+                            <span>{summaryHighlight.after}</span>
+                          {:else}
+                            {enrichWithEmojis(line)}
+                          {/if}
                         </div>
                       {/if}
                     </div>
@@ -1587,24 +1869,6 @@
               <div class="flex flex-wrap items-center justify-center gap-2.5">
                 <Pill tone="cobalt">{totalQuestionCount} of {totalQuestionCount} questions done</Pill>
                 <Pill tone="success">Round {QUESTIONS_PER_STUDENT} of {QUESTIONS_PER_STUDENT}</Pill>
-              </div>
-              <div class="mt-2 flex flex-wrap items-center justify-center gap-3">
-                <button
-                  type="button"
-                  onclick={() => goto(resolve("/alert"))}
-                  class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
-                  style="background:{accent};"
-                >
-                  Open alerts <ArrowRight class="size-4" />
-                </button>
-                <button
-                  type="button"
-                  onclick={() => goto(resolve("/student/topic"))}
-                  class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold"
-                  style="background:{accent}12; color:{accent};"
-                >
-                  Pick another topic
-                </button>
               </div>
             </div>
 
@@ -1768,7 +2032,7 @@
               Summary
             </div>
             <div class="shrink-0 text-[13px] font-semibold" style="color:var(--ink);">
-              {topic?.source === "custom" ? "Custom topic (web + class-level)" : "Class topic (textbook)"}
+              {topic?.source === "custom" ? "Custom topic (class-level)" : "Class topic (textbook)"}
             </div>
             <div class="mt-1 shrink-0 text-[11px]" style="color:var(--text-secondary);">
               This summary stays visible while answering MCQs.
@@ -1818,6 +2082,7 @@
                 <div class="text-[12px] leading-[1.7]" style="color:var(--text-body);">
                   {#each visibleSummaryLines as line, i (i)}
                     {@const dialogue = isDialogueLine(line)}
+                    {@const summaryHighlight = getSummaryHighlightParts(line, i)}
                     {#if dialogue}
                       <div class="my-1.5 rounded-lg px-2.5 py-1.5 text-[11px]" style="background:{dialogue.side === 'left' ? '#f0f7ff' : '#f0fdf4'};">
                         <span class="font-bold" style="color:{dialogue.side === 'left' ? '#2569c7' : '#15803d'};">{dialogue.speaker}:</span>
@@ -1828,7 +2093,18 @@
                         class="mb-1.5"
                         style="color:{phase === 'summarizing' && summaryIdx === i ? 'var(--ink)' : phase === 'summarizing' && i < summaryIdx ? '#999' : 'var(--text-body)'}; font-weight:{phase === 'summarizing' && summaryIdx === i ? 500 : 400};"
                       >
-                        {enrichWithEmojis(line)}
+                        {#if summaryHighlight}
+                          <span style="opacity:0.46;">{summaryHighlight.before}</span>
+                          <span
+                            class="rounded px-1 py-0.5"
+                            style="background:{accent}24; box-shadow:0 0 0 1px {accent}18;"
+                          >
+                            {summaryHighlight.active}
+                          </span>
+                          <span>{summaryHighlight.after}</span>
+                        {:else}
+                          {enrichWithEmojis(line)}
+                        {/if}
                       </p>
                     {/if}
                   {/each}
@@ -1960,18 +2236,18 @@
           type="button"
           onclick={startOver}
           class="flex cursor-pointer items-center gap-1.5 text-[12px] transition-opacity hover:opacity-60"
-          style="color:var(--text-secondary);"
+          style="color:#ef4444;"
         >
           <RotateCcw class="size-3" /> Restart
         </button>
-        <button
+        <!-- <button
           type="button"
           onclick={() => goto(resolve("/alert"))}
           class="flex cursor-pointer items-center gap-1.5 text-[12px] font-medium transition-opacity hover:opacity-70"
           style="color:#ef4444;"
         >
           <Phone class="size-3" /> Call teacher
-        </button>
+        </button> -->
       </div>
 
     </div>
@@ -2173,6 +2449,7 @@
           {#each visibleSummaryLines as line, i (i)}
             {@const tone = getSummaryLineTone(line, i)}
             {@const dialogue = isDialogueLine(line)}
+            {@const summaryHighlight = getSummaryHighlightParts(line, i)}
             <div
               class="relative mb-4 pl-1 text-left"
             >
@@ -2215,7 +2492,18 @@
                       {tone.label}
                     </div>
                   </div>
-                  {enrichWithEmojis(line)}
+                  {#if summaryHighlight}
+                    <span style="opacity:0.46;">{summaryHighlight.before}</span>
+                    <span
+                      class="rounded-lg px-1 py-0.5"
+                      style="background:{accent}24; box-shadow:0 0 0 1px {accent}18;"
+                    >
+                      {summaryHighlight.active}
+                    </span>
+                    <span>{summaryHighlight.after}</span>
+                  {:else}
+                    {enrichWithEmojis(line)}
+                  {/if}
                 </div>
               {/if}
             </div>
@@ -2242,7 +2530,7 @@
       </div>
       <div class="text-[28px] font-semibold leading-tight">Session complete</div>
       <div class="max-w-sm text-[15px] leading-[1.7]" style="color:rgba(255,255,255,0.68);">
-        {totalQuestionCount} questions are finished. The round has stopped, and {struggleCount} student{struggleCount === 1 ? "" : "s"} can now be reviewed in alerts.
+        {totalQuestionCount} questions are finished. The round has stopped, and {struggleCount} student{struggleCount === 1 ? "" : "s"} may need a closer look.
       </div>
       <div class="flex flex-wrap items-center justify-center gap-2.5">
         <div class="rounded-full px-3 py-1.5 text-[12px] font-semibold" style="background:white; color:{accent};">
@@ -2252,22 +2540,6 @@
           Round {QUESTIONS_PER_STUDENT} of {QUESTIONS_PER_STUDENT}
         </div>
       </div>
-      <button
-        type="button"
-        onclick={() => goto(resolve("/alert"))}
-        class="mt-2 flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold text-white"
-        style="background:{accent};"
-      >
-        Open alerts <ArrowRight class="size-4" />
-      </button>
-      <button
-        type="button"
-        onclick={() => goto(resolve("/student/topic"))}
-        class="flex cursor-pointer items-center gap-2 rounded-2xl px-6 py-3 text-[14px] font-semibold"
-        style="background:white; color:{accent};"
-      >
-        Pick another topic
-      </button>
     </div>
 
   {:else}

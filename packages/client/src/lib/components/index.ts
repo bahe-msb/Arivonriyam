@@ -12,5 +12,7 @@ export { default as Block } from "./Block.svelte";
 export { default as ModeToggle } from "./ModeToggle.svelte";
 export { default as Page } from "./Page.svelte";
 export { default as PageHeader } from "./PageHeader.svelte";
+export { default as ServerReachabilityBanner } from "./ServerReachabilityBanner.svelte";
 export { default as TopBar } from "./TopBar.svelte";
 export { default as AppSidebar } from "./AppSidebar.svelte";
+export { default as DateNav } from "./DateNav.svelte";

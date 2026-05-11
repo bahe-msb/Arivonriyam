@@ -10,3 +10,5 @@ export * as Sidebar from "./sidebar/index.js";
 export * as Tabs from "./tabs/index.js";
 export * as Select from "./select/index.js";
 export * as Sheet from "./sheet/index.js";
+export * as Popover from "./popover/index.js";
+export { Calendar } from "./calendar/index.js";

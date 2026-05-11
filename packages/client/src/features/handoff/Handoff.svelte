@@ -3,13 +3,30 @@
   import { Wifi, Lock, Users, Tablet as TabletIcon, ArrowRight, Heart, AlertCircle } from "lucide-svelte";
   import { Button, Card } from "@shadcn";
 
-  import { Page, PageHeader, Pill } from "@components";
+  import { DateNav, Page, PageHeader, Pill } from "@components";
   import { CLASSES, type ClassInfo } from "@mocks";
   import { activeClass, reteachTopics } from "@stores";
 
+  void reteachTopics.load();
+  const readOnly = $derived(reteachTopics.readOnly);
+  const pairedTabletCount = $derived(CLASSES.length);
+  const activeHandoff = $derived.by(() => {
+    const cls = CLASSES.find((candidate) => candidate.id === activeClass.id);
+    if (!cls) return null;
+
+    const selectedTopic = reteachTopics.getSelectedTopic(cls.id);
+    if (!selectedTopic || reteachTopics.isCompleted(selectedTopic.id)) return null;
+
+    return {
+      cls,
+      topic: selectedTopic.topic,
+    };
+  });
+
   function doHandoff(cls: ClassInfo): void {
+    if (readOnly) return;
     activeClass.set(cls.id);
-    goto("/student/topic");
+    goto(`/student/topic?class=${cls.id}`);
   }
 </script>
 
@@ -20,23 +37,56 @@
     subtitle="One tap locks the tablet to that class's reteach topics. Children can't wander into another class's screen."
   >
     {#snippet actions()}
-      <Pill tone="success"><Wifi class="size-3" /> 4 tablets paired</Pill>
-      <Pill tone="cobalt"><Lock class="size-3" /> Kiosk lock ready</Pill>
+      <DateNav
+        label="Day"
+        value={reteachTopics.currentDate}
+        onChange={(d) => void reteachTopics.setDate(d)}
+      />
+      <Pill tone="success"><Wifi class="size-3" /> {pairedTabletCount} tablets paired</Pill>
+      {#if activeHandoff}
+        <Pill tone="cobalt">
+          <Lock class="size-3" />
+          Active handoff: {activeHandoff.cls.name}
+        </Pill>
+      {:else}
+        <Pill tone="default">
+          <Lock class="size-3" />
+          No active tablet handoff
+        </Pill>
+      {/if}
     {/snippet}
   </PageHeader>
+
+  {#if readOnly}
+    <div class="mb-4 rounded-2xl border border-[#f3d49a] bg-[#fff8ea] px-4 py-2.5 text-[12px] text-[#9a6708]">
+      Viewing past day — tablet handoff is disabled. Switch to Today to send a tablet.
+    </div>
+  {/if}
 
   <div class="grid grid-cols-1 gap-4.5 sm:grid-cols-2 lg:grid-cols-3">
     {#each CLASSES as cls (cls.id)}
       {@const topics = reteachTopics.get(cls.id)}
       {@const hasTopics = topics.length > 0}
-      <Card hover class="overflow-hidden p-0">
+      {@const isActive = activeHandoff?.cls.id === cls.id}
+      <Card
+        hover
+        class="overflow-hidden p-0 transition-all"
+        style={isActive
+          ? `box-shadow:0 18px 42px -24px ${cls.color}, 0 0 0 2px ${cls.color};`
+          : ""}
+      >
         <div
           class="border-border-default border-b px-5 pt-5 pb-4"
-          style="background: {cls.color}18;"
+          style="background: {cls.color}{isActive ? '24' : '18'};"
         >
           <div class="flex items-start justify-between">
             <div>
-              <div class="text-[18px] font-semibold">{cls.name}</div>
+              <div class="flex items-center gap-2">
+                <div class="text-[18px] font-semibold">{cls.name}</div>
+                {#if isActive}
+                  <Pill tone="cobalt"><Lock class="size-2.75" /> Active</Pill>
+                {/if}
+              </div>
               <div class="text-text-secondary ta text-[12px]">{cls.ta}</div>
             </div>
             <div
@@ -72,16 +122,17 @@
               {cls.students} learners
             </span>
             <span class="text-text-secondary inline-flex items-center gap-1 text-[11px]">
-              <TabletIcon class="size-2.75" /> Tablet {cls.id}
+              <TabletIcon class="size-2.75" />
+              Tablet {cls.id}{isActive ? " · Active" : ""}
             </span>
           </div>
           <Button
             variant="primary"
             class="mt-3.5 w-full"
-            disabled={!hasTopics}
+            disabled={!hasTopics || readOnly}
             onclick={() => doHandoff(cls)}
           >
-            Hand tablet to {cls.name}
+            {isActive ? "Resume active tablet" : `Hand tablet to ${cls.name}`}
             <ArrowRight class="size-3.5" />
           </Button>
         </div>

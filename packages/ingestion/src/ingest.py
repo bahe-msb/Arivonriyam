@@ -482,11 +482,19 @@ def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = T
     return len(docs)
 
 
-def run_ingestion(force: bool = False, generate_questions: bool = False) -> None:
+def run_ingestion(
+    force: bool = False,
+    generate_questions: bool = False,
+    class_name: str | None = None,
+) -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")
     init_db()
-    logger.info("RAG Ingestion Pipeline (question_generation=%s)", generate_questions)
+    logger.info(
+        "RAG Ingestion Pipeline (question_generation=%s, class=%s)",
+        generate_questions,
+        class_name or "all",
+    )
     if generate_questions:
         logger.warning(
             "LLM question generation is ON — this adds ~10-60s per chunk via Ollama. "
@@ -494,8 +502,14 @@ def run_ingestion(force: bool = False, generate_questions: bool = False) -> None
         )
 
     pdfs = sorted(PDF_DIR.rglob("*.pdf"))
+    if class_name:
+        pdfs = [pdf for pdf in pdfs if pdf.parent.name == class_name]
+
     if not pdfs:
-        logger.warning("No PDFs found under %s", PDF_DIR)
+        if class_name:
+            logger.warning("No PDFs found under %s/%s", PDF_DIR, class_name)
+        else:
+            logger.warning("No PDFs found under %s", PDF_DIR)
         return
 
     total = 0

@@ -70,6 +70,7 @@ Example: `data/pdfs/class3/Science.pdf`
 ```sh
 cd packages/ingestion
 uv run python src/main.py ingest          # fast (no LLM question generation)
+uv run python src/main.py ingest --class class_4
 uv run python src/main.py ingest --force  # re-ingest even if unchanged
 ```
 

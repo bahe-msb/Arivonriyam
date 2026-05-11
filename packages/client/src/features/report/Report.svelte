@@ -2,7 +2,7 @@
   import { Printer, Download, ChevronDown, ChevronUp } from "lucide-svelte";
   import { Button, Card, Tabs } from "@shadcn";
 
-  import { Page, PageHeader, Pill, StatCard } from "@components";
+  import { DateNav, Page, PageHeader, Pill, StatCard } from "@components";
   import { CLASSES } from "@mocks";
   import Gazette from "./Gazette.svelte";
 
@@ -43,13 +43,18 @@
   };
 
   // ── Date ──────────────────────────────────────────────────────────
-  const date = new Date().toLocaleDateString("en-IN", {
-    weekday: "long",
-    day: "numeric",
-    month: "long",
-    year: "numeric",
-  });
-  const dateKey = new Date().toISOString().split("T")[0];
+  function todayKey(): string {
+    return new Date().toISOString().split("T")[0];
+  }
+  let dateKey = $state<string>(todayKey());
+  const date = $derived(
+    new Date(dateKey + "T00:00:00").toLocaleDateString("en-IN", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    }),
+  );
 
   // ── Mode state ────────────────────────────────────────────────────
   let mode = $state<string>("dashboard");
@@ -59,10 +64,10 @@
   let data = $state<PerformanceData | null>(null);
   let loading = $state(false);
 
-  async function loadData(p: string): Promise<void> {
+  async function loadData(p: string, d: string): Promise<void> {
     loading = true;
     try {
-      const res = await fetch(`/api/report/performance?period=${p}&date=${dateKey}`);
+      const res = await fetch(`/api/report/performance?period=${p}&date=${d}`);
       data = (await res.json()) as PerformanceData;
     } catch {
       data = null;
@@ -72,7 +77,7 @@
   }
 
   $effect(() => {
-    void loadData(period);
+    void loadData(period, dateKey);
   });
 
   // ── Derived summary stats ─────────────────────────────────────────
@@ -148,6 +153,9 @@
       subtitle="Submitted to the Block Education Officer each evening. Signed with your teacher ID."
     >
       {#snippet actions()}
+        <div class="no-print">
+          <DateNav label="Day" value={dateKey} onChange={(d) => (dateKey = d)} />
+        </div>
         <Tabs.List class="no-print">
           <Tabs.Trigger value="dashboard">Dashboard</Tabs.Trigger>
           <Tabs.Trigger value="gazette">Gazette</Tabs.Trigger>
