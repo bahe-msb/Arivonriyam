@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { Printer, Download, ChevronDown, ChevronUp } from "lucide-svelte";
+  import { Download, ChevronDown, ChevronUp } from "lucide-svelte";
   import { Button, Card, Tabs } from "@shadcn";
 
   import { DateNav, Page, PageHeader, Pill, StatCard } from "@components";
   import { CLASSES } from "@mocks";
+  import { schoolConfig } from "@stores";
   import Gazette from "./Gazette.svelte";
 
   // ── Types ─────────────────────────────────────────────────────────
@@ -21,6 +22,7 @@
   type ClassRow = {
     class_id: number;
     class_name: string;
+    student_names?: string[];
     students_present: number;
     reteach_sessions: number;
     struggling_count: number;
@@ -63,6 +65,7 @@
   // ── Data fetching ─────────────────────────────────────────────────
   let data = $state<PerformanceData | null>(null);
   let loading = $state(false);
+  let downloading = $state(false);
 
   async function loadData(p: string, d: string): Promise<void> {
     loading = true;
@@ -85,6 +88,7 @@
   const totalReteach  = $derived(data?.totals.total_reteach ?? 0);
   const avgScore      = $derived(data?.totals.avg_score ?? 0);
   const classesTaught = $derived(data?.byClass.length ?? 0);
+  const schoolName    = $derived(schoolConfig.config.school_name.trim() || "school");
 
   // ── Per-class expanded state ──────────────────────────────────────
   let expandedClassId = $state<number | null>(null);
@@ -124,9 +128,204 @@
     return "bg-warn-500";
   }
 
-  // ── Print ─────────────────────────────────────────────────────────
-  function printReport(): void {
-    window.print();
+  function studentNamesForRow(row: ClassRow): string[] {
+    return row.student_names?.filter((name): name is string => name.trim().length > 0) ?? [];
+  }
+
+  function formatStudentNames(row: ClassRow): string {
+    const names = studentNamesForRow(row);
+    return names.length > 0 ? names.join(", ") : "—";
+  }
+
+  function remarkForRow(row: ClassRow): string {
+    return row.struggling_count > 0 ? "Follow-up required" : "Satisfactory";
+  }
+
+  function slugify(value: string): string {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
+
+  function buildSummaryText(): string {
+    const rows = data?.byClass ?? [];
+    const totals = data?.totals;
+    const totalStudents = totals?.total_students ?? 0;
+    const totalReteach = totals?.total_reteach ?? 0;
+    const strugglingClasses = rows.filter((row) => row.struggling_count > 0);
+
+    if (totalStudents === 0) {
+      return "No Socratic sessions were recorded. Detailed per-class figures will appear here after sessions are completed.";
+    }
+
+    const classText = `${rows.length} class${rows.length === 1 ? "" : "es"}`;
+    const reteachText = `${totalReteach} reteach session${totalReteach === 1 ? "" : "s"} ${totalReteach === 1 ? "was" : "were"} conducted using the on-device educational assistant.`;
+    const strugglingText =
+      strugglingClasses.length > 0
+        ? strugglingClasses
+            .map((row) => {
+              const className = row.class_name || `Class ${row.class_id}`;
+              return `${row.struggling_count} student${row.struggling_count === 1 ? "" : "s"} in ${className} require${row.struggling_count === 1 ? "s" : ""} follow-up attention.`;
+            })
+            .join(" ")
+        : "All learners are progressing as expected.";
+
+    return `On this day, ${totalStudents} children engaged in Socratic sessions across ${classText}. ${reteachText} ${strugglingText} Detailed per-class figures follow.`;
+  }
+
+  async function downloadReport(): Promise<void> {
+    if (loading || downloading) return;
+
+    downloading = true;
+
+    try {
+      const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+        import("jspdf"),
+        import("jspdf-autotable"),
+      ]);
+
+      const config = schoolConfig.config;
+      const cleanSchoolName = config.school_name.trim() || "School";
+      const teacherName = config.teacher_name.trim() || "—";
+      const teacherId = config.teacher_id.trim();
+      const location = [config.location.trim(), config.state.trim()].filter(Boolean).join(", ");
+      const rows = data?.byClass ?? [];
+
+      const doc = new jsPDF({ unit: "pt", format: "a4" });
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const marginX = 42;
+      let cursorY = 54;
+
+      doc.setFont("times", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(161, 90, 0);
+      doc.text("DAILY REPORT", pageWidth / 2, cursorY, { align: "center" });
+
+      cursorY += 22;
+      doc.setFontSize(22);
+      doc.setTextColor(45, 36, 24);
+      doc.text(cleanSchoolName, pageWidth / 2, cursorY, { align: "center" });
+
+      cursorY += 18;
+      doc.setFont("times", "italic");
+      doc.setFontSize(13);
+      doc.setTextColor(110, 91, 67);
+      doc.text(date, pageWidth / 2, cursorY, { align: "center" });
+
+      cursorY += 18;
+      doc.setDrawColor(161, 90, 0);
+      doc.setLineWidth(1);
+      doc.line(marginX, cursorY, pageWidth - marginX, cursorY);
+
+      cursorY += 24;
+      doc.setFont("times", "normal");
+      doc.setFontSize(11.5);
+      doc.setTextColor(45, 36, 24);
+
+      const metadataLines = [
+        `School: ${cleanSchoolName}`,
+        location ? `Location: ${location}` : "",
+        `Teacher-in-charge: ${teacherName}`,
+      ].filter((line) => line.length > 0);
+
+      for (const line of metadataLines) {
+        doc.text(line, marginX, cursorY);
+        cursorY += 16;
+      }
+
+      cursorY += 6;
+      const summaryLines = doc.splitTextToSize(buildSummaryText(), pageWidth - marginX * 2);
+      doc.text(summaryLines, marginX, cursorY);
+      cursorY += summaryLines.length * 15 + 16;
+
+      autoTable(doc, {
+        startY: cursorY,
+        margin: { left: marginX, right: marginX },
+        head: [["Class", "Students", "Present", "Reteach", "Avg Score", "Completion", "Remarks"]],
+        body:
+          rows.length > 0
+            ? rows.map((row) => [
+                row.class_name || `Class ${row.class_id}`,
+                formatStudentNames(row),
+                String(row.students_present),
+                String(row.reteach_sessions),
+                `${row.avg_score}%`,
+                `${row.completion_pct}%`,
+                remarkForRow(row),
+              ])
+            : [["—", "—", "—", "—", "—", "—", "No session data yet for this date."]],
+        theme: "grid",
+        styles: {
+          font: "times",
+          fontSize: 10,
+          cellPadding: 6,
+          lineColor: [234, 223, 200],
+          lineWidth: 0.5,
+          textColor: [45, 36, 24],
+          overflow: "linebreak",
+          valign: "middle",
+        },
+        headStyles: {
+          fillColor: [251, 248, 240],
+          textColor: [161, 90, 0],
+          lineColor: [161, 90, 0],
+          lineWidth: 1,
+          fontStyle: "bold",
+        },
+        columnStyles: {
+          0: { cellWidth: 52 },
+          1: { cellWidth: 150 },
+          2: { cellWidth: 44, halign: "center" },
+          3: { cellWidth: 48, halign: "center" },
+          4: { cellWidth: 56, halign: "center" },
+          5: { cellWidth: 60, halign: "center" },
+          6: { cellWidth: 101 },
+        },
+      });
+
+      let footerY =
+        (doc as typeof doc & { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ??
+        cursorY;
+
+      footerY += 34;
+      if (footerY > pageHeight - 90) {
+        doc.addPage();
+        footerY = 72;
+      }
+
+      doc.setDrawColor(45, 36, 24);
+      doc.setLineWidth(0.8);
+      doc.line(marginX, footerY, marginX + 200, footerY);
+
+      doc.setFont("times", "normal");
+      doc.setFontSize(11);
+      doc.setTextColor(45, 36, 24);
+      doc.text(`Teacher-in-charge · ${teacherName}`, marginX, footerY + 16);
+
+      if (teacherId) {
+        doc.setFontSize(9.5);
+        doc.setTextColor(110, 91, 67);
+        doc.text(`Teacher ID: ${teacherId}`, marginX, footerY + 31);
+      }
+
+      const sealX = pageWidth - marginX - 34;
+      const sealY = footerY + 6;
+      doc.setDrawColor(161, 90, 0);
+      doc.circle(sealX, sealY, 30);
+      doc.setFont("times", "bold");
+      doc.setFontSize(8);
+      doc.setTextColor(161, 90, 0);
+      doc.text("VERIFIED", sealX, sealY - 6, { align: "center" });
+      doc.setFontSize(7);
+      doc.text("ARIVONRIYAM", sealX, sealY + 10, { align: "center" });
+
+      doc.save(`${slugify(schoolName) || "school"}-daily-report-${dateKey}.pdf`);
+    } finally {
+      downloading = false;
+    }
   }
 </script>
 
@@ -150,7 +349,7 @@
     <PageHeader
       eyebrow="End of day · automatically drafted"
       title="Daily report · {date}"
-      subtitle="Submitted to the Block Education Officer each evening. Signed with your teacher ID."
+      subtitle="Review the dashboard or download the formatted daily report with live classroom metrics."
     >
       {#snippet actions()}
         <div class="no-print">
@@ -158,13 +357,10 @@
         </div>
         <Tabs.List class="no-print">
           <Tabs.Trigger value="dashboard">Dashboard</Tabs.Trigger>
-          <Tabs.Trigger value="gazette">Gazette</Tabs.Trigger>
+          <Tabs.Trigger value="gazette">Daily Report</Tabs.Trigger>
         </Tabs.List>
-        <Button variant="secondary" class="no-print" onclick={printReport}>
-          <Printer class="size-3.5" /> Print
-        </Button>
-        <Button variant="primary" class="no-print">
-          <Download class="size-3.5" /> Submit to BEO
+        <Button variant="primary" class="no-print" onclick={downloadReport} disabled={loading || downloading}>
+          <Download class="size-3.5" /> {downloading ? "Preparing PDF..." : "Download PDF"}
         </Button>
       {/snippet}
     </PageHeader>

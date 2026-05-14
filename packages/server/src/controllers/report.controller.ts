@@ -4,9 +4,7 @@ import { getPgPool } from "../lib/pgdb";
 export async function getReportPerformance(req: Request, res: Response): Promise<void> {
   const period = typeof req.query.period === "string" ? req.query.period : "day";
   const date =
-    typeof req.query.date === "string"
-      ? req.query.date
-      : new Date().toISOString().split("T")[0];
+    typeof req.query.date === "string" ? req.query.date : new Date().toISOString().split("T")[0];
 
   const pool = getPgPool();
 
@@ -41,6 +39,11 @@ export async function getReportPerformance(req: Request, res: Response): Promise
     `SELECT
        class_id,
        class_name,
+       COALESCE(
+         ARRAY_AGG(DISTINCT student_name ORDER BY student_name)
+           FILTER (WHERE student_name IS NOT NULL AND student_name <> ''),
+         ARRAY[]::TEXT[]
+       )                                                            AS student_names,
        COUNT(DISTINCT student_id)::int                                AS students_present,
        COUNT(DISTINCT session_id)::int                                AS reteach_sessions,
        COUNT(CASE WHEN score < 60 THEN 1 END)::int                    AS struggling_count,
@@ -67,7 +70,12 @@ export async function getReportPerformance(req: Request, res: Response): Promise
     period,
     date,
     byClassSubject: byClassSubject.rows,
-    byClass: byClass.rows,
+    byClass: byClass.rows.map((row) => ({
+      ...row,
+      student_names: Array.isArray(row.student_names)
+        ? row.student_names.filter((name): name is string => typeof name === "string")
+        : [],
+    })),
     totals: totals.rows[0] ?? { total_students: 0, total_reteach: 0, avg_score: 0 },
   });
 }

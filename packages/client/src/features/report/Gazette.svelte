@@ -5,6 +5,7 @@
   type ClassRow = {
     class_id: number;
     class_name: string;
+    student_names?: string[];
     students_present: number;
     reteach_sessions: number;
     struggling_count: number;
@@ -21,10 +22,19 @@
   let { date, data }: Props = $props();
 
   const cfg = $derived(schoolConfig.config);
+  const schoolName = $derived(cfg.school_name.trim() || "School");
+  const locationLine = $derived(
+    [cfg.location.trim(), cfg.state.trim()].filter((value) => value.length > 0).join(", "),
+  );
   const rows = $derived(data?.byClass ?? []);
   const total = $derived(data?.totals.total_students ?? 0);
   const totalReteach = $derived(data?.totals.total_reteach ?? 0);
   const strugglingClasses = $derived(rows.filter((r) => r.struggling_count > 0));
+
+  function formatStudentNames(row: ClassRow): string {
+    const names = row.student_names?.filter((name) => name.trim().length > 0) ?? [];
+    return names.length > 0 ? names.join(", ") : "—";
+  }
 </script>
 
 <Card
@@ -33,28 +43,32 @@
 >
   <div class="mb-6 pb-4.5 text-center" style="border-bottom: 2px double var(--saffron-700);">
     <div class="text-saffron-700 text-[11px] font-semibold tracking-[0.24em] uppercase">
-      Government of Tamil Nadu
+      Daily Report
     </div>
-    <div class="ta text-ink mt-1 text-[22px] font-bold">தினசரி கற்றல் அறிக்கை</div>
-    <div class="text-text-secondary mt-0.5 text-[16px] font-medium italic">
-      Daily Learning Record
-    </div>
+    <div class="text-ink mt-1 text-[22px] font-bold">{schoolName}</div>
+    {#if locationLine}
+      <div class="text-text-secondary mt-0.5 text-[13px] font-medium">{locationLine}</div>
+    {/if}
+    <div class="text-text-secondary mt-1 text-[15px] font-medium italic">{date}</div>
   </div>
 
-  <div class="mb-5 flex flex-wrap justify-between gap-2 text-[12.5px]">
+  <div class="mb-5 flex flex-wrap justify-between gap-2 gap-y-1.5 text-[12.5px]">
     <div>
       <b>School:</b>
-      {cfg.school_name || "—"}
-      {#if cfg.location} · Block: {cfg.location}{/if}
+      {schoolName}
     </div>
+    {#if locationLine}
+      <div><b>Location:</b> {locationLine}</div>
+    {/if}
     <div><b>Date:</b> {date}</div>
+    <div><b>Teacher-in-charge:</b> {cfg.teacher_name || "—"}</div>
   </div>
 
   <p class="text-text-body text-[13.5px] leading-[1.8]">
     On this day,
     {#if total > 0}
       <b>{total} children</b> engaged in Socratic sessions across {rows.length} class{rows.length === 1 ? "" : "es"}.
-      {totalReteach} reteach session{totalReteach === 1 ? "" : "s"} were conducted using the on-device educational assistant.
+      {totalReteach} reteach session{totalReteach === 1 ? "" : "s"} {totalReteach === 1 ? "was" : "were"} conducted using the on-device educational assistant.
       {#if strugglingClasses.length > 0}
         {#each strugglingClasses as r (r.class_id)}
           {r.struggling_count} student{r.struggling_count === 1 ? "" : "s"} in {r.class_name} require{r.struggling_count === 1 ? "s" : ""} follow-up attention.
@@ -72,7 +86,7 @@
     <table class="mt-5 w-full border-collapse text-[12.5px]">
       <thead>
         <tr class="border-saffron-700 border-b-[1.5px]">
-          {#each ["Class", "Present", "Reteach", "Avg Score", "Completion", "Remarks"] as h (h)}
+          {#each ["Class", "Students", "Present", "Reteach", "Avg Score", "Completion", "Remarks"] as h (h)}
             <th class="px-2 py-2.5 text-left text-[11px] font-bold tracking-[0.06em] uppercase">
               {h}
             </th>
@@ -82,14 +96,15 @@
       <tbody>
         {#if rows.length === 0}
           <tr>
-            <td colspan="6" class="px-2 py-4 text-center text-[12px] text-text-secondary">
-              No session data yet for today.
+            <td colspan="7" class="px-2 py-4 text-center text-[12px] text-text-secondary">
+              No session data yet for this date.
             </td>
           </tr>
         {:else}
           {#each rows as r (r.class_id)}
             <tr class="border-clay-100 border-b">
-              <td class="px-2 py-2.5">Class {r.class_id}</td>
+              <td class="px-2 py-2.5">{r.class_name || `Class ${r.class_id}`}</td>
+              <td class="px-2 py-2.5 text-[11.5px] leading-5">{formatStudentNames(r)}</td>
               <td class="px-2 py-2.5">{r.students_present}</td>
               <td class="px-2 py-2.5">{r.reteach_sessions}</td>
               <td class="px-2 py-2.5">{r.avg_score}%</td>
