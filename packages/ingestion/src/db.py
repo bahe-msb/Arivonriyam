@@ -63,8 +63,12 @@ def init_db() -> None:
                     width       INTEGER NOT NULL DEFAULT 0,
                     height      INTEGER NOT NULL DEFAULT 0,
                     image_b64   TEXT NOT NULL,
+                    caption     TEXT DEFAULT '',
                     UNIQUE(class_name, subject, source_file, page_number, img_index)
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE pdf_images ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT ''
             """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_pdf_images_lookup
@@ -163,16 +167,18 @@ def upsert_pdf_images(
             )
             cur.executemany(
                 """INSERT INTO pdf_images
-                   (class_name, subject, source_file, page_number, img_index, width, height, image_b64)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   (class_name, subject, source_file, page_number, img_index, width, height, image_b64, caption)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (class_name, subject, source_file, page_number, img_index) DO UPDATE SET
                        image_b64 = EXCLUDED.image_b64,
                        width = EXCLUDED.width,
-                       height = EXCLUDED.height""",
+                       height = EXCLUDED.height,
+                       caption = EXCLUDED.caption""",
                 [
                     (class_name, subject, source_file,
                      img["page_number"], img["img_index"],
-                     img["width"], img["height"], img["image_b64"])
+                     img["width"], img["height"], img["image_b64"],
+                     img.get("caption", ""))
                     for img in images
                 ],
             )
@@ -192,7 +198,7 @@ def get_page_images(
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"""SELECT page_number, img_index, width, height, image_b64
+                f"""SELECT page_number, img_index, width, height, image_b64, caption
                     FROM pdf_images
                     WHERE class_name=%s AND subject=%s AND page_number IN ({placeholders})
                     ORDER BY (width * height) DESC
@@ -201,7 +207,7 @@ def get_page_images(
             )
             rows = cur.fetchall()
     return [
-        {"page_number": r[0], "img_index": r[1], "width": r[2], "height": r[3], "image_b64": r[4]}
+        {"page_number": r[0], "img_index": r[1], "width": r[2], "height": r[3], "image_b64": r[4], "caption": r[5] or ""}
         for r in rows
     ]
 

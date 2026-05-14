@@ -31,6 +31,7 @@ from retrieve import topic_retrieve
 LLM_MODEL = "gemma4:latest"
 _llm      = ChatOllama(model=LLM_MODEL, temperature=0.3, timeout=60)
 _llm_json = ChatOllama(model=LLM_MODEL, temperature=0.3, format="json", timeout=60)
+_llm_vision = ChatOllama(model=LLM_MODEL, temperature=0, timeout=45)
 
 # Element-type sort priority — definitions/formulas first, body last
 _ETYPE_PRIORITY = {
@@ -65,6 +66,14 @@ def _grade_guidance(level: int, lang: str) -> str:
             3: "அன்றாட வாழ்க்கை உதாரணங்கள். புதிய சொற்களை உடனே எளிமையாக விளக்கவும்.",
             4: "உதாரணங்கள், ஒப்புமைகள். இரண்டு அல்லது மூன்று புதிய சொற்கள் சரி; விளக்கம் அவசியம்.",
             5: "சிறிய ஆழமான விளக்கங்கள். வழிமுறை சொற்கள் சரி ஆனால் ஒவ்வொன்றையும் விளக்கவும்.",
+        }
+    elif lang == "te":
+        guides = {
+            1: "చాలా సులభమైన పదాలు. ఒక్కో వాక్యం 8 పదాలకు మించకూడదు. ఇంటి ఉదాహరణలు మాత్రమే వాడండి.",
+            2: "సులభమైన చిన్న వాక్యాలు. ఇల్లు లేదా పాఠశాల ఉదాహరణలు ఇవ్వండి.",
+            3: "రోజువారీ జీవిత ఉదాహరణలు ఇవ్వండి. కొత్త పదం వస్తే వెంటనే సులభంగా అర్థం చెప్పండి.",
+            4: "సరళమైన ఉపమానాలు వాడండి. 2-3 కొత్త పదాలు వాడొచ్చు, కానీ అర్థం చెప్పాలి.",
+            5: "కొంచెం లోతైన వివరణలు ఇవ్వవచ్చు. ప్రతి విషయపరమైన పదాన్ని అర్థంతో చెప్పాలి.",
         }
     else:
         guides = {
@@ -213,6 +222,77 @@ def _build_prompt_ta(
     ]))
 
 
+def _build_prompt_te(
+    class_name: str, subject: str, topic: str, source: str, context: str
+) -> str:
+    level = _class_level(class_name)
+    grade_note = _grade_guidance(level, "te")
+    has_image = "IMAGE CAPTION" in context
+    has_table = "TABLE" in context
+    has_formula = "FORMULA" in context
+
+    multimodal_notes = []
+    if has_image:
+        multimodal_notes.append(
+            "IMAGE CAPTION ఉంటే: ఆ చిత్రంలో పిల్లలు ఏమి చూస్తారో 1-2 వాక్యాల్లో వివరించండి."
+        )
+    if has_table:
+        multimodal_notes.append(
+            "TABLE ఉంటే: పట్టికగా రాయకండి; పిల్లలకు అర్థమయ్యే సరళమైన వాక్యాలుగా మార్చండి."
+        )
+    if has_formula:
+        multimodal_notes.append(
+            "FORMULA ఉంటే: రోజువారీ ఉదాహరణతో సులభంగా వివరించండి."
+        )
+
+    source_note = (
+        "ఇది ఉపాధ్యాయుడు ఎంపిక చేసిన ప్రత్యేక కార్యకలాపం."
+        if source == "custom"
+        else "ఇది పాఠ్యపుస్తక ఆధారిత పాఠం."
+    )
+
+    return "\n".join(filter(None, [
+        "మీరు పిల్లలను ప్రేమించే ఉత్సాహభరితమైన ప్రాథమిక పాఠశాల ఉపాధ్యాయులు.",
+        "పాఠ్యపుస్తకం లేదా chatbot లా కాదు, నిజమైన క్లాస్‌రూమ్ టీచర్‌లా మాట్లాడండి.",
+        f"మీ విద్యార్థులు తరగతి {level} ప్రాథమిక విద్యార్థులు.",
+        f"తరగతి: {class_name}  |  విషయం: {subject}  |  అంశం: {topic}",
+        source_note,
+        "",
+        f"విద్యార్థి స్థాయి: తరగతి {level}. {grade_note}",
+        "",
+        "రచనా నియమాలు (చాలా ముఖ్యం):",
+        "• నిరంతర, సహజ గద్యరూపంలో రాయండి.",
+        "• emojis ని వేరే లైన్లలో పెట్టకండి; వాక్యాల్లో సహజంగా వాడండి.",
+        "• ప్రతి పేరాలో 3-5 పూర్తి వాక్యాలు ఉండాలి.",
+        "• కథ చెబుతున్నట్టుగా అర్థమయ్యేలా చెప్పండి.",
+        "• కింద ఉన్న textbook excerpts మాత్రమే ఉపయోగించండి; బయట సమాచారం జోడించకండి.",
+        "• ఇల్లు, పాఠశాల, ప్రకృతి నుంచి సరళమైన ఉదాహరణలు ఇవ్వండి.",
+        *([f"• {note}" for note in multimodal_notes] if multimodal_notes else []),
+        "",
+        "TEXTBOOK EXCERPTS:",
+        "=" * 40,
+        context,
+        "=" * 40,
+        "",
+        "క్రింది JSON రూపంలో తెలుగులో ఉపాధ్యాయ పరిచయం రాయండి:",
+        "",
+        "intro   → అంశాన్ని నేరుగా ప్రారంభించే 1-2 ఆప్యాయ వాక్యాలు.",
+        "content → 3-4 పేరాలు; సులభమైన వివరణ, ఉపమానం, నిజజీవిత ఉదాహరణ ఉండాలి; పేరాలు \\n\\n తో విడగొట్టండి.",
+        "key_points → గుర్తుంచుకోవాల్సిన 3-4 చిన్న వాక్యాలు.",
+        "bridge → MCQ ప్రశ్నల రౌండ్‌కి సహజంగా తీసుకెళ్లే 1-2 వాక్యాలు.",
+        "",
+        "మొత్తం కనీసం 260 పదాలు (~2-3 నిమిషాల మాట్లాడటం).",
+        "",
+        "Return ONLY this JSON (no markdown fences):",
+        '{',
+        '  "intro":      "<ప్రారంభ వాక్యాలు>",',
+        '  "content":    "<3-4 పేరాలు, \\n\\n తో విభజించినవి>",',
+        '  "key_points": ["<పాయింట్ 1>", "<2>", "<3>", "<4>"],',
+        '  "bridge":     "<MCQ రౌండ్‌కు మార్పు వాక్యాలు>"',
+        '}',
+    ]))
+
+
 def _build_prompt_en(
     class_name: str, subject: str, topic: str, source: str, context: str
 ) -> str:
@@ -311,9 +391,10 @@ def _ensure_complete_sentences(text: str) -> str:
     """Add a period to any line that doesn't end with sentence-final punctuation."""
     lines = text.split("\n")
     fixed = []
+    sentence_endings = ".!?।"
     for line in lines:
         stripped = line.rstrip()
-        if stripped and not stripped[-1] in ".!?":
+        if stripped and stripped[-1] not in sentence_endings:
             stripped += "."
         fixed.append(stripped)
     return "\n".join(fixed)
@@ -330,6 +411,41 @@ def _build_multimodal_message(prompt: str, images: List[str]) -> HumanMessage:
             "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
         })
     return HumanMessage(content=content)
+
+
+def _diagram_caption_prompt(lang: str) -> str:
+    if lang == "ta":
+        return (
+            "இந்தப் பாடப்புத்தகப் படத்தை 1-2 எளிய தமிழ் வாக்கியங்களில் விளக்கவும். "
+            "படத்தில் என்ன தெரிகிறது, அது எந்தக் கல்விக் கருத்தை கற்பிக்கிறது என்பதை மட்டும் கூறவும்."
+        )
+    if lang == "te":
+        return (
+            "ఈ పాఠ్యపుస్తక చిత్రాన్ని 1-2 సరళమైన తెలుగు వాక్యాల్లో వివరించండి. "
+            "చిత్రంలో ఏమి కనిపిస్తోంది, అది ఏ విద్యా భావాన్ని తెలియజేస్తుందో మాత్రమే చెప్పండి."
+        )
+    return (
+        "Describe this textbook diagram in 1-2 simple sentences. "
+        "Say what is visible and the main educational concept it teaches."
+    )
+
+
+def _generate_diagram_captions(images: List[str], lang: str) -> List[str]:
+    captions: List[str] = []
+    if not images:
+        return captions
+
+    prompt = _diagram_caption_prompt(lang)
+    for b64 in images[:2]:
+        try:
+            raw = _llm_vision.invoke([_build_multimodal_message(prompt, [b64])]).content
+            caption = _ensure_complete_sentences(str(raw).replace("\n", " ").strip())
+            if caption:
+                captions.append(caption)
+        except Exception as e:
+            print(f"⚠️  diagram caption failed: {e}", file=sys.stderr)
+
+    return captions
 
 
 def generate_topic_summary(
@@ -357,10 +473,12 @@ def generate_topic_summary(
         msg = (
             f"'{topic}' பற்றிய பாடப்புத்தக தகவல் கிடைக்கவில்லை."
             if lang == "ta"
+            else f"'{topic}' గురించి పాఠ్యపుస్తక సమాచారం దొరకలేదు."
+            if lang == "te"
             else f"No textbook content found for '{topic}'."
         )
         return {"intro": msg, "content": "", "key_points": [], "bridge": "",
-                "word_count": 0, "chunks_used": 0}
+            "word_count": 0, "chunks_used": 0, "diagram_captions": []}
 
     # Collect images across all retrieved chunks (dedup by value)
     seen_b64: set[str] = set()
@@ -375,9 +493,13 @@ def generate_topic_summary(
     print(f"Images in summarization: {n_images}", file=sys.stderr)
 
     context = _context_block(good)
-    prompt = _build_prompt_ta(class_name, subject, topic, source, context) \
-        if lang == "ta" \
+    prompt = (
+        _build_prompt_ta(class_name, subject, topic, source, context)
+        if lang == "ta"
+        else _build_prompt_te(class_name, subject, topic, source, context)
+        if lang == "te"
         else _build_prompt_en(class_name, subject, topic, source, context)
+    )
 
     text_msg = HumanMessage(content=prompt)
     # Try multimodal first (only if there are images); fall back to text-only
@@ -423,6 +545,7 @@ def generate_topic_summary(
             "bridge":     "",
             "word_count": len(context.split()),
             "chunks_used": len(good),
+            "diagram_captions": [],
         }
 
     # Post-process: ensure no truncated sentences
@@ -434,6 +557,7 @@ def generate_topic_summary(
         for p in parsed.get("key_points", [])
         if isinstance(p, str) and p.strip()
     ]
+    diagram_captions = _generate_diagram_captions(all_images, lang)
 
     all_text = " ".join([intro_fixed, content_fixed, " ".join(key_points), bridge_fixed])
 
@@ -446,6 +570,7 @@ def generate_topic_summary(
         "chunks_used":  len(good),
         "images_count": n_images,
         "images_base64": all_images[:6],
+        "diagram_captions": diagram_captions,
         "exercise_chunks": [
             {"text": c["text"], "page": c.get("page", 0)}
             for c in good

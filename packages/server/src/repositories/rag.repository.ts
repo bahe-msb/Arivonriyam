@@ -34,6 +34,7 @@ export interface TopicSummary {
   word_count: number;
   chunks_used: number;
   images_base64?: string[];
+  diagram_captions?: string[];
   exercise_chunks?: Array<{ text: string; page: number }>;
 }
 

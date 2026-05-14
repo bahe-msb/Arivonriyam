@@ -18,3 +18,5 @@ chroma_db/*
 
 # Logs
 *.log
+
+/rag_benchmark_results.md

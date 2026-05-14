@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 _BASE = Path(__file__).parent.parent
 
 COLLECTION    = "mm_rag_pipeline"
-OCR_LANGUAGES = ["eng", "tam"]
+OCR_LANGUAGES = ["eng", "tam", "tel"]
 
 # Shared dedup hash set across the process lifetime
 _seen_hashes: set[str] = set()
@@ -127,6 +127,56 @@ def _extract_pdf_images(pdf_path: Path, min_px: int = 300, max_images: int = 30)
     return results
 
 
+def _caption_images(images: list[dict]) -> list[dict]:
+    """Send each extracted image to Gemma 4 vision and add a 'caption' field.
+
+    Runs after _extract_pdf_images so captions are stored alongside image_b64.
+    Falls back gracefully: if Ollama/Gemma is unavailable the image dict is
+    returned unchanged (caption remains '').
+    """
+    if not images:
+        return images
+
+    try:
+        from langchain_ollama import ChatOllama
+        from langchain_core.messages import HumanMessage
+        llm = ChatOllama(model="gemma4:latest", temperature=0, timeout=30)
+    except Exception as e:
+        logger.warning("Gemma 4 vision unavailable — skipping captions: %s", e)
+        return images
+
+    captioned: list[dict] = []
+    for img in images:
+        b64 = img.get("image_b64", "")
+        caption = ""
+        if b64:
+            try:
+                content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are captioning images extracted from a school textbook. "
+                            "Describe what this diagram or figure illustrates in one concise sentence "
+                            "that would help a student understand the educational concept it represents."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ]
+                caption = llm.invoke([HumanMessage(content=content)]).content.strip()
+            except Exception as e:
+                logger.warning(
+                    "Caption failed for page=%s img=%s: %s",
+                    img.get("page_number"), img.get("img_index"), e,
+                )
+        captioned.append({**img, "caption": caption})
+
+    logger.info("  Captioned %d images via Gemma 4 vision", len(captioned))
+    return captioned
+
+
 # ── stage 2–5: new pipeline ───────────────────────────────────────────────────
 _preprocessor = TextPreprocessor()
 _chunker      = SemanticChunker()
@@ -137,12 +187,25 @@ _chunker      = SemanticChunker()
 _TOC_MARKERS = frozenset({
     "பொருளடக்கம்", "பொருளடக்கம",
     "உள்ளடக்கம்", "உள்ளடக்கம",
+    "విషయసూచిక",
     "contents", "table of contents", "index",
 })
 
-_TITLE_COL_HINTS = {"unit", "chapter", "பாடத்தலைப்பு", "title", "lesson", "topic", "units", "name", "பாடம்"}
-_PAGE_COL_HINTS  = {"page", "பக்க", "pg", "page no", "p.no", "பக்க எண்", "பக்கம்"}
-_SNO_COL_HINTS   = {"s.no", "sno", "no", "வ.எண்", "வ. எண்", "#", "sl", "வ.எண", "sl.no"}
+_TITLE_COL_HINTS = {
+    "unit", "units", "chapter", "title", "lesson", "topic", "name",
+    "பாடத்தலைப்பு", "பாடம்",
+    "యూనిట్", "అధ్యాయం", "పాఠం", "విషయం", "పాఠ్యాంశం", "శీర్షిక",
+}
+_PAGE_COL_HINTS  = {
+    "page", "pg", "page no", "p.no",
+    "பக்க", "பக்கம்", "பக்க எண்",
+    "పేజీ", "పుట", "పేజీ సంఖ్య", "పుట సంఖ్య",
+}
+_SNO_COL_HINTS   = {
+    "s.no", "sno", "no", "#", "sl", "sl.no",
+    "வ.எண்", "வ. எண்", "வ.எண",
+    "క్ర.సం", "క్రసం", "క్ర.సంఖ్య", "క్రమసంఖ్య", "క్రమ సంఖ్య", "సం.నెం",
+}
 
 
 def _is_toc_marker(text: str) -> bool:
@@ -475,8 +538,9 @@ def ingest_pdf(pdf_path: Path, force: bool = False, generate_questions: bool = T
     t0 = time.time()
     images = _extract_pdf_images(pdf_path)
     if images:
+        images = _caption_images(images)
         upsert_pdf_images(class_name, subject, pdf_path.name, images)
-        logger.info("  [images] stored %d images (PyMuPDF) in %.1fs", len(images), time.time() - t0)
+        logger.info("  [images] stored %d images with captions (PyMuPDF) in %.1fs", len(images), time.time() - t0)
 
     logger.info("  %d chunks, %d chapters — total %.1fs", len(docs), len(chapter_titles), time.time() - t_start)
     return len(docs)

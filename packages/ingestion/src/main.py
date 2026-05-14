@@ -6,7 +6,7 @@ Commands:
            --chapter Z [--top-k N]
   summarize --class X --subject Y        Topic summarization → JSON stdout
             --topic Z [--source S]       (~2–3 min teacher intro)
-            [--lang ta|en] [--top-k N]
+            [--lang ta|te|en] [--top-k N]
   query <text>                           Interactive question → plain text
 """
 
@@ -50,7 +50,7 @@ if __name__ == "__main__":
     p_sum.add_argument("--subject", required=True)
     p_sum.add_argument("--topic", required=True)
     p_sum.add_argument("--source", default="curriculum")
-    p_sum.add_argument("--lang", default="ta", choices=["ta", "en"])
+    p_sum.add_argument("--lang", default="ta", choices=["ta", "te", "en"])
     p_sum.add_argument("--top-k", type=int, default=12)
 
     # query  (interactive, human-readable)

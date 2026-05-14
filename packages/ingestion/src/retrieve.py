@@ -21,6 +21,7 @@ from langchain_ollama import ChatOllama
 
 from retriever import HybridRetriever
 from utils.language_detect import detect_dominant_language
+from utils.text_utils import normalize_for_matching
 from db import get_page_images
 
 logger = logging.getLogger(__name__)
@@ -49,9 +50,20 @@ def _get_retriever() -> HybridRetriever:
 
 
 def _detect_language(text: str) -> str:
-    """Legacy helper — returns 'ta' or 'en' for backward compatibility."""
+    """Return coarse language code used for retrieval prompt routing."""
     lang = detect_dominant_language(text)
-    return "ta" if lang == "ta" else "en"
+    if lang == "ta":
+        return "ta"
+    if lang == "te":
+        return "te"
+    if lang == "bilingual":
+        tamil = sum(1 for ch in text if 0x0B80 <= ord(ch) <= 0x0BFF)
+        telugu = sum(1 for ch in text if 0x0C00 <= ord(ch) <= 0x0C7F)
+        if telugu > tamil and telugu > 0:
+            return "te"
+        if tamil > 0:
+            return "ta"
+    return "en"
 
 
 def _hyde_expand(query: str) -> str:
@@ -60,12 +72,21 @@ def _hyde_expand(query: str) -> str:
         return _hyde_cache[query]
 
     lang = _detect_language(query)
-    prompt = (
-        "கீழே உள்ள கேள்விக்கான சுருக்கமான, சாத்தியமான பதிலை அதே மொழியில் எழுதுங்கள். "
-        "சில விவரங்கள் இல்லாவிட்டாலும் பரவாயில்லை — இது வெக்டர் தேடலுக்காக மட்டும்." if lang == "ta"
-        else "Write a short, plausible answer to the question below in the same language. "
-             "Invent details if needed — this is only for vector retrieval."
-    )
+    if lang == "ta":
+        prompt = (
+            "கீழே உள்ள கேள்விக்கான சுருக்கமான, சாத்தியமான பதிலை அதே மொழியில் எழுதுங்கள். "
+            "சில விவரங்கள் இல்லாவிட்டாலும் பரவாயில்லை — இது வெக்டர் தேடலுக்காக மட்டும்."
+        )
+    elif lang == "te":
+        prompt = (
+            "క్రింద ఉన్న ప్రశ్నకు అదే భాషలో చిన్న, సాధ్యమైన సమాధానం రాయండి. "
+            "కొన్ని వివరాలు ఊహించి రాయవచ్చు — ఇది వెక్టర్ రిట్రీవల్ కోసం మాత్రమే."
+        )
+    else:
+        prompt = (
+            "Write a short, plausible answer to the question below in the same language. "
+            "Invent details if needed — this is only for vector retrieval."
+        )
     prompt = f"{prompt}\n\nQUESTION: {query}\n\nANSWER:"
     t0 = time.time()
     try:
@@ -78,7 +99,7 @@ def _hyde_expand(query: str) -> str:
         return query
 
 
-_CONTENT_MARKERS = ("content:", "Content:", "உள்ளடக்கம்:")
+_CONTENT_MARKERS = ("content:", "Content:", "உள்ளடக்கம்:", "విషయం:")
 
 
 def _strip_hyde_prefix(text: str) -> str:
@@ -119,9 +140,10 @@ def _doc_to_chunk(doc, score: float = 1.0) -> Dict[str, Any]:
         "page":          int(meta.get("page_number", 0)),
         "language":      language,
         "source_file":   meta.get("source_file", ""),
-        "tables_html":   [],
-        "images_base64": [],
-        "element_type":  meta.get("element_type", "body"),
+        "tables_html":    [],
+        "images_base64":  [],
+        "image_captions": [],
+        "element_type":   meta.get("element_type", "body"),
         "keywords":      [k for k in (meta.get("keywords") or "").split(",") if k],
     }
 
@@ -171,7 +193,11 @@ def chapter_retrieve(class_name: str, subject: str, chapter: str, top_k: int = 8
     logger.info("chapter_retrieve: class=%s subject=%s chapter=%r lang=%s top_k=%d",
                 class_name, subject, chapter, language, top_k)
     expanded = _hyde_expand(
-        f"{chapter} {subject}" if language == "en" else f"{chapter} {subject} பற்றிய பாடப்பகுதி"
+        f"{chapter} {subject}"
+        if language == "en"
+        else f"{chapter} {subject} பற்றிய பாடப்பகுதி"
+        if language == "ta"
+        else f"{chapter} {subject} గురించి పాఠ్య భాగం"
     )
     result = _search(expanded, class_name, subject, top_k)
     logger.info("chapter_retrieve done: %d chunks in %.1fs total", len(result), time.time() - t0)
@@ -189,6 +215,8 @@ def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 14) -
     expanded = _hyde_expand(
         f"{topic} பற்றி தொடக்கப்பள்ளி மாணவருக்கு எளிதாக விளக்கவும்."
         if language == "ta"
+        else f"{topic} ను ప్రాథమిక పాఠశాల విద్యార్థికి సులభంగా ఉదాహరణలతో వివరించండి."
+        if language == "te"
         else f"Explain {topic} clearly for a primary school student with examples."
     )
 
@@ -196,10 +224,10 @@ def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 14) -
 
     # Re-rank: chunks from a chapter whose title contains the topic keyword
     # are almost certainly on-topic — move them to the front.
-    topic_lower = topic.lower()
+    topic_lower = normalize_for_matching(topic)
     on_topic = [c for c in result
-                if topic_lower in (c.get("chapter") or "").lower()
-                or topic_lower in c.get("text", "").lower()[:120]]
+                if topic_lower in normalize_for_matching(c.get("chapter") or "")
+                or topic_lower in normalize_for_matching(c.get("text", "")[:160])]
     off_topic = [c for c in result if c not in on_topic]
     result = on_topic + off_topic
 
@@ -208,17 +236,21 @@ def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 14) -
     if on_topic:
         on_topic.sort(key=lambda c: c.get("page", 0))
 
-    # Attach extracted images for the pages covered by retrieved chunks
+    # Attach extracted images and their Gemma 4 vision captions for retrieved pages
     if result and class_name and subject:
         pages = list({c["page"] for c in result if c.get("page")})
         if pages:
             img_rows = get_page_images(class_name, subject, pages, limit=6)
             page_img_map: dict[int, list[str]] = {}
+            page_cap_map: dict[int, list[str]] = {}
             for row in img_rows:
-                page_img_map.setdefault(row["page_number"], []).append(row["image_b64"])
+                pg = row["page_number"]
+                page_img_map.setdefault(pg, []).append(row["image_b64"])
+                page_cap_map.setdefault(pg, []).append(row.get("caption", ""))
             for chunk in result:
                 pg = chunk.get("page", 0)
-                chunk["images_base64"] = page_img_map.get(pg, [])
+                chunk["images_base64"]  = page_img_map.get(pg, [])
+                chunk["image_captions"] = page_cap_map.get(pg, [])
 
     logger.info("topic_retrieve done: %d chunks in %.1fs total (on_topic=%d)",
                 len(result), time.time() - t0, len(on_topic))

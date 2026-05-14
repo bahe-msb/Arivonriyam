@@ -19,8 +19,11 @@ from rank_bm25 import BM25Okapi
 
 from embeddings import get_embedding_model
 from pgvec_store import get_vector_store
+from settings import get_pipeline_settings
+from utils.text_utils import clean, normalize_for_matching
 
 logger = logging.getLogger(__name__)
+_SETTINGS = get_pipeline_settings()
 
 _BASE = Path(__file__).parent.parent
 VEC_DB_PATH = _BASE / "data" / "vectors.db"
@@ -35,10 +38,22 @@ _VARIANT_MAP: dict[str, list[str]] = {
 }
 
 _RE_TOKENIZE = re.compile(r"\s+")
+_QUESTION_QUERY_TERMS = (
+    "என்ன",
+    "எது",
+    "எப்படி",
+    "விளக்க",
+    "explain",
+    "what",
+    "which",
+    "how",
+    "define",
+)
 
 
 def _tokenize(text: str) -> list[str]:
-    return [t for t in _RE_TOKENIZE.split(text.lower()) if t]
+    normalized = normalize_for_matching(text)
+    return [t for t in _RE_TOKENIZE.split(normalized) if t]
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -50,9 +65,14 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 def _rrf_fuse(
     dense_hits: list[tuple[Document, float]],
     sparse_hits: list[tuple[Document, float]],
-    k: int = 60,
+    k: int | None = None,
+    dense_weight: float | None = None,
+    sparse_weight: float | None = None,
 ) -> list[tuple[Document, float]]:
     """Reciprocal Rank Fusion — returns (Document, rrf_score) pairs."""
+    k = k or _SETTINGS.retrieval.rrf_k
+    dense_weight = dense_weight or _SETTINGS.retrieval.vector_weight
+    sparse_weight = sparse_weight or _SETTINGS.retrieval.bm25_weight
     rrf_scores: dict[str, float] = {}
     # Also track the best raw cosine score per chunk for downstream filtering
     cosine_scores: dict[str, float] = {}
@@ -60,13 +80,13 @@ def _rrf_fuse(
 
     for rank, (doc, raw_score) in enumerate(dense_hits):
         key = doc.metadata.get("chunk_hash", doc.page_content[:64])
-        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + dense_weight / (k + rank + 1)
         cosine_scores[key] = max(cosine_scores.get(key, 0.0), float(raw_score))
         doc_map[key] = doc
 
     for rank, (doc, _) in enumerate(sparse_hits):
         key = doc.metadata.get("chunk_hash", doc.page_content[:64])
-        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + sparse_weight / (k + rank + 1)
         if key not in doc_map:
             doc_map[key] = doc
 
@@ -105,11 +125,42 @@ def _mmr_deduplicate(
 
 
 def _expand_tamil_query(query: str) -> list[str]:
-    variants = [query]
+    cleaned_query = clean(query)
+    variants = [query.strip()]
+    if cleaned_query and cleaned_query not in variants:
+        variants.append(cleaned_query)
     for term, alts in _VARIANT_MAP.items():
-        if term in query:
+        if term in query or term in cleaned_query:
             variants.extend(alts)
-    return variants
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        normalized = normalize_for_matching(variant)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(variant)
+    return deduped
+
+
+def _query_fusion_weights(query: str) -> tuple[float, float]:
+    settings = _SETTINGS.retrieval
+    bm25_weight = settings.bm25_weight
+    vector_weight = settings.vector_weight
+    if not settings.adaptive_weighting:
+        return bm25_weight, vector_weight
+
+    cleaned_query = clean(query)
+    tokens = _tokenize(cleaned_query)
+    normalized_query = normalize_for_matching(cleaned_query)
+    question_like = any(term in normalized_query for term in _QUESTION_QUERY_TERMS)
+    if len(tokens) <= settings.short_query_token_threshold and not question_like:
+        bm25_weight *= settings.short_query_bm25_boost
+    else:
+        vector_weight *= settings.natural_query_vector_boost
+    if cleaned_query.strip() != query.strip():
+        bm25_weight *= settings.ocr_query_bm25_boost
+    return bm25_weight, vector_weight
 
 
 def _filter_key(filters: dict | None) -> str:
@@ -185,8 +236,10 @@ class HybridRetriever:
         Returns (Document, rrf_score) tuples.  Documents whose best cosine
         similarity is below min_cosine are discarded before MMR.
         """
-        expanded = _expand_tamil_query(query)
+        normalized_query = clean(query)
+        expanded = _expand_tamil_query(normalized_query)
         search_query = " ".join(expanded)
+        bm25_weight, vector_weight = _query_fusion_weights(query)
 
         bm25, bm25_docs = self._ensure_bm25(filters)
 
@@ -219,7 +272,13 @@ class HybridRetriever:
         if not dense_hits and not sparse_hits:
             return []
 
-        fused = _rrf_fuse(dense_hits, sparse_hits)
+        fused = _rrf_fuse(
+            dense_hits,
+            sparse_hits,
+            k=_SETTINGS.retrieval.rrf_k,
+            dense_weight=vector_weight,
+            sparse_weight=bm25_weight,
+        )
 
         # ── cosine-score gate ──────────────────────────────────────────────────
         filtered = [

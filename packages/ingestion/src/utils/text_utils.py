@@ -1,16 +1,21 @@
-"""Tamil-aware text normalization and OCR noise removal utilities."""
+"""Tamil/Telugu-aware text normalization and OCR noise removal utilities."""
 
 import re
 import unicodedata
+
+from settings import get_pipeline_settings
 
 # Virama (pulli) — used in OCR artifact patterns like "்்்"
 _VIRAMA = "்"
 # Zero-width non-joiner / zero-width joiner
 _ZWNJ = "‌"
 _ZWJ  = "‍"
+_TAMIL_BLOCK = "\u0B80-\u0BFF"
+_SETTINGS = get_pipeline_settings()
 
 # Repeated virama pattern (OCR artifact)
 _RE_REPEATED_VIRAMA = re.compile(r"(்){2,}")
+_RE_SPACE_BEFORE_VIRAMA = re.compile(rf"(?<=[{_TAMIL_BLOCK}])\s+{_VIRAMA}")
 # Control chars except tab, newline, carriage return
 _RE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Form feed
@@ -27,11 +32,67 @@ _RE_BOILERPLATE = re.compile(
     r"|\d+\s*\|\s*(?:Tamil|Maths|Science|தமிழ்|கணிதம்|அறிவியல்))",
     re.IGNORECASE,
 )
+_RE_PUNCT_SPACE = re.compile(r"\s*([,.;:!?])\s*")
+_RE_MATCHING_PUNCT = re.compile(r"[\[\]\(\){}\"'`“”‘’:;,.!?|\\/]+")
+
+_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "–": "-",
+        "—": "-",
+        "−": "-",
+        "•": " ",
+        "·": " ",
+        "…": "...",
+        "।": ".",
+        "॥": ".",
+        "\u00a0": " ",
+    }
+)
 
 
 def normalize_unicode(text: str) -> str:
     """Apply NFC normalization — critical for Tamil rendering consistency."""
+    if not _SETTINGS.normalization.unicode_normalization:
+        return text
     return unicodedata.normalize("NFC", text)
+
+
+def canonicalize_tamil(text: str) -> str:
+    """Normalize Tamil combining forms and remove invisible joiners from OCR output."""
+    if not _SETTINGS.normalization.canonical_tamil:
+        return text
+    text = text.replace(_ZWNJ, "").replace(_ZWJ, "")
+    if _SETTINGS.normalization.virama_cleanup:
+        text = _RE_REPEATED_VIRAMA.sub(_VIRAMA, text)
+        text = _RE_SPACE_BEFORE_VIRAMA.sub(_VIRAMA, text)
+    return text
+
+
+def correct_ocr_confusions(text: str) -> str:
+    """Apply configurable Tamil OCR confusion fixes using whole-word replacements."""
+    if not _SETTINGS.normalization.ocr_confusion_corrections:
+        return text
+
+    corrected = text
+    for wrong, right in sorted(
+        _SETTINGS.normalization.ocr_confusions.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        pattern = re.compile(rf"(?<![{_TAMIL_BLOCK}A-Za-z]){re.escape(wrong)}(?![{_TAMIL_BLOCK}A-Za-z])")
+        corrected = pattern.sub(right, corrected)
+    return corrected
+
+
+def normalize_punctuation(text: str) -> str:
+    if not _SETTINGS.normalization.punctuation_normalization:
+        return text
+    normalized = text.translate(_PUNCT_TRANSLATION)
+    return _RE_PUNCT_SPACE.sub(r" \1 ", normalized)
 
 
 def remove_ocr_artifacts(text: str) -> str:
@@ -49,6 +110,8 @@ def remove_boilerplate(text: str) -> str:
 
 def normalize_whitespace(text: str) -> str:
     """Collapse excessive whitespace while preserving paragraph breaks."""
+    if not _SETTINGS.normalization.whitespace_normalization:
+        return text.strip()
     text = _RE_EXCESS_SPACE.sub("  ", text)
     text = _RE_EXCESS_NEWLINE.sub("\n\n", text)
     return text.strip()
@@ -61,21 +124,33 @@ def remove_markdown_artifacts(text: str) -> str:
 def clean(text: str) -> str:
     """Full cleaning pipeline: normalize → remove artifacts → remove boilerplate → whitespace."""
     text = normalize_unicode(text)
+    text = canonicalize_tamil(text)
     text = remove_ocr_artifacts(text)
+    text = correct_ocr_confusions(text)
     text = remove_boilerplate(text)
+    text = normalize_punctuation(text)
     text = remove_markdown_artifacts(text)
     text = normalize_whitespace(text)
     return text
 
 
+def normalize_for_matching(text: str) -> str:
+    """Lightweight normalization for token matching and lexical relevance scoring."""
+    normalized = clean(text).lower()
+    normalized = _RE_MATCHING_PUNCT.sub(" ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
 def ocr_garbage_ratio(text: str) -> float:
-    """Fraction of characters that are neither Tamil, ASCII-printable, nor common punctuation."""
+    """Fraction of characters that are neither Tamil/Telugu, ASCII-printable, nor common punctuation."""
     if not text:
         return 0.0
     garbage = sum(
         1 for ch in text
         if not (
             0x0B80 <= ord(ch) <= 0x0BFF  # Tamil
+            or 0x0C00 <= ord(ch) <= 0x0C7F  # Telugu
             or ch.isascii()               # ASCII (includes digits, punctuation)
             or ch in "।॥‌‍"    # Indic punctuation, ZWJ/ZWNJ
         )

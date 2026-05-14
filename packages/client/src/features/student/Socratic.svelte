@@ -33,12 +33,14 @@
   };
 
   type SessionTurn = SessionQuestion & { student: number };
+  type SessionLanguage = "en" | "ta" | "te";
   type SummarizeResponse = {
     lines?: string[];
     questions?: SessionQuestion[];
     error?: string;
-    language?: "en" | "ta";
+    language?: SessionLanguage;
     images_base64?: string[];
+    diagram_captions?: string[];
   };
 
   type PreviewCard = {
@@ -137,12 +139,13 @@
   let summarySpeechCharIdx = $state(0);
   let summaryLoading = $state(false);
   let summaryError = $state("");
-  let sessionLanguage = $state<"en" | "ta">("en");
+  let sessionLanguage = $state<SessionLanguage>("en");
   let summaryPreviewCards = $state<PreviewCard[]>([]);
   let summaryPreviewLoading = $state(false);
   let sessionId = $state("");
   let sessionAttempts = $state<SessionAttempt[]>([]);
   let summaryImages = $state<string[]>([]);
+  let summaryDiagramCaptions = $state<string[]>([]);
 
   let questionPlan = $state<SessionTurn[]>([]);
   let autoAdvanceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -197,25 +200,37 @@
   const struggleCount = $derived(
     students.filter((_, idx) => sessionAttempts.some((attempt) => attempt.studentIdx === idx && !attempt.correct)).length,
   );
-  const sessionLanguageLabel = $derived(sessionLanguage === "ta" ? "Tamil" : "English");
+  const sessionLanguageLabel = $derived(
+    sessionLanguage === "ta" ? "Tamil" : sessionLanguage === "te" ? "Telugu" : "English",
+  );
   const headerLanguageLabel = $derived(
     phase === "start" ? "Follows textbook" : sessionLanguageLabel,
   );
   const summaryLanguageNote = $derived(
-    "Summary and MCQs will match the uploaded textbook language, including Tamil and English.",
+    "Summary and MCQs will match the uploaded textbook language, including Tamil, Telugu, and English.",
   );
 
-  function normalizeLanguage(value: unknown): "en" | "ta" {
-    return value === "ta" ? "ta" : "en";
+  function normalizeLanguage(value: unknown): SessionLanguage {
+    if (value === "ta") return "ta";
+    if (value === "te") return "te";
+    return "en";
   }
 
-  function detectLanguage(text: string): "en" | "ta" {
+  function detectLanguage(text: string): SessionLanguage {
     const sample = text.trim();
     if (!sample) return "en";
 
     const tamilChars = [...sample].filter((char) => char >= "\u0B80" && char <= "\u0BFF").length;
+    const teluguChars = [...sample].filter((char) => char >= "\u0C00" && char <= "\u0C7F").length;
     const latinChars = [...sample].filter((char) => /[A-Za-z]/.test(char)).length;
-    return tamilChars >= Math.max(6, Math.floor(latinChars / 2)) ? "ta" : "en";
+
+    if (teluguChars >= Math.max(6, Math.floor(latinChars / 2)) && teluguChars >= tamilChars) {
+      return "te";
+    }
+    if (tamilChars >= Math.max(6, Math.floor(latinChars / 2))) {
+      return "ta";
+    }
+    return "en";
   }
 
   function countWords(text: string): number {
@@ -338,6 +353,15 @@
       ];
     }
 
+    if (sessionLanguage === "te") {
+      return [
+        `ఈ రోజు మనం ${topic?.topic ?? "ఈ అంశాన్ని"} సులభమైన ${topic?.subject ?? "సైన్స్"} పదాలతో ప్రారంభిస్తాం.`,
+        "ఈ సారాంశం పాఠంలోని ముఖ్యాంశాలను నెమ్మదిగా, సులభంగా వివరిస్తుంది.",
+        "సారాంశం తర్వాత ప్రతి విద్యార్థి నాలుగు ఎంపికలలో ఒకదాన్ని మాత్రమే తాకి సమాధానం ఇవ్వాలి.",
+        "ప్రతి విద్యార్థికి ఆరు MCQ అవకాశాలు ఉంటాయి.",
+      ];
+    }
+
     return [
       `Today we are starting ${topic?.topic ?? "this topic"} in simple ${topic?.subject ?? "Science"} words.`,
       "This short summary follows the lesson points and keeps the explanation easy to follow.",
@@ -386,7 +410,7 @@
       .filter((line) => countWords(line) >= 5)
       .filter(
         (line) =>
-          !/question|option|tap|round|summary|session|mcq|கேள்வி|விருப்பம்|தொடு|சுருக்கம்|அமர்வு/i.test(
+          !/question|option|tap|round|summary|session|mcq|கேள்வி|விருப்பம்|தொடு|சுருக்கம்|அமர்வு|ప్రశ్న|ఎంపిక|తాకి|సారాంశం|సెషన్/i.test(
             line,
           ),
       )
@@ -440,6 +464,56 @@
           options,
           answerIndex,
           explain: "இந்த விடை பாடத்தில் வந்த சரியான தகவலுடன் பொருந்துகிறது.",
+        };
+      });
+    }
+
+    if (sessionLanguage === "te") {
+      const facts = [
+        ...summaryFactPool,
+        `${topicName} ను సులభమైన ${subjectName} భాషలో వివరిస్తారు.`,
+        `${topicName} ను రోజువారీ ఉదాహరణలతో నేర్పుతారు.`,
+        `${topicName} ప్రశ్నలకు ఒక సరైన ఎంపికను ఎంచుకుని సమాధానం ఇవ్వాలి.`,
+        `${topicName} అర్థం పాఠంలోని నిజాలను కలిపి ఆలోచించినప్పుడు మెరుగుపడుతుంది.`,
+        `${topicName} ను చిన్న దశలుగా పునర్విమర్శిస్తారు.`,
+        `${topicName} లో సమాధానం ఎంచుకునే ముందు అన్ని ఎంపికలను చదవాలి.`,
+      ].filter(
+        (fact, idx, arr) => arr.findIndex((value) => value.toLowerCase() === fact.toLowerCase()) === idx,
+      );
+
+      const questionTemplates = [
+        (cue: string) => `"${cue}" అనే పాఠ సూచనకు సరిపోయేది ఏది?`,
+        (cue: string) => `${topicName} గురించి "${cue}" కు సరైన సమాధానం ఏది?`,
+        (cue: string) => `ఈ ${subjectName} అంశంలో "${cue}" కి సరైన వాక్యం ఏది?`,
+        (cue: string) => `${topicName} పాఠంలో "${cue}" సూచించే సమాచారం ఏది?`,
+      ] as const;
+
+      const genericWrongs = [
+        `${topicName} అనేది ${subjectName}లో భాగం కాదు.`,
+        `${topicName} ప్రశ్నలను తరగతిలో దాటవేయాలి.`,
+        `${topicName} ప్రశ్నలకు ఎంపికలు చదవకుండా సమాధానం ఇవ్వొచ్చు.`,
+        `${topicName} గురించి ఆలోచించకుండా ఏ ఎంపికనైనా ఎంచుకోవచ్చు.`,
+      ] as const;
+
+      return Array.from({ length: count }, (_, idx) => {
+        const correct = facts[idx % facts.length];
+        const template = questionTemplates[Math.floor(idx / Math.max(1, facts.length)) % questionTemplates.length];
+        const cue = fallbackFactCue(correct);
+        const wrong = facts
+          .filter((fact) => fact.toLowerCase() !== correct.toLowerCase())
+          .slice(idx % Math.max(1, facts.length), (idx % Math.max(1, facts.length)) + 3);
+
+        while (wrong.length < 3) {
+          const fallbackWrong = genericWrongs[(idx + wrong.length) % genericWrongs.length];
+          if (!wrong.includes(fallbackWrong)) wrong.push(fallbackWrong);
+        }
+
+        const { options, answerIndex } = buildOptions(correct, wrong, idx);
+        return {
+          q: template(cue),
+          options,
+          answerIndex,
+          explain: "ఈ సమాధానం పాఠంలోని సరైన సమాచారంతో సరిపోతుంది.",
         };
       });
     }
@@ -520,6 +594,26 @@
           title: "தொட்டு பதிலளி",
           badge: "MCQ round",
           caption: "சுருக்கத்திற்குப் பிறகு, ஒவ்வொரு மாணவரும் கேள்வியை கேட்டு ஒரு பதிலைத் தொடுவார்கள்.",
+        },
+      ];
+    }
+
+    if (sessionLanguage === "te") {
+      return [
+        {
+          title: "అంశం ప్రారంభం",
+          badge: topic?.source === "custom" ? "Local notes" : "Textbook cue",
+          caption: `${topic?.topic ?? "ఈ అంశం"} ను సులభమైన ${topic?.subject ?? "సైన్స్"} పదాల్లో సిద్ధం చేస్తున్నాం.`,
+        },
+        {
+          title: "చిన్న ఉదాహరణ",
+          badge: "Real-life link",
+          caption: "ఇల్లు మరియు పాఠశాల ఉదాహరణలు పిల్లలకు త్వరగా అర్థమవడానికి సహాయపడతాయి.",
+        },
+        {
+          title: "తాకి సమాధానం",
+          badge: "MCQ round",
+          caption: "సారాంశం తర్వాత ప్రతి విద్యార్థి ప్రశ్న విని ఒక ఎంపికను తాకి సమాధానం ఇస్తాడు.",
         },
       ];
     }
@@ -631,7 +725,7 @@
       };
     }
 
-    if (/example|for example|like|such as|home|school|daily|உதாரண|வீடு|பள்ளி/i.test(lower)) {
+    if (/example|for example|like|such as|home|school|daily|உதாரண|வீடு|பள்ளி|ఉదాహరణ|ఇల్లు|పాఠశాల|రోజువారీ/i.test(lower)) {
       return {
         label: "Example",
         icon: Shapes,
@@ -643,7 +737,7 @@
       };
     }
 
-    if (/remember|key|important|rule|point|fact|முக்கிய|நினைவில்|தகவல்/i.test(lower)) {
+    if (/remember|key|important|rule|point|fact|முக்கிய|நினைவில்|தகவல்|గుర్తుంచుకో|ముఖ్య|నియమం|విషయం/i.test(lower)) {
       return {
         label: "Remember",
         icon: Lightbulb,
@@ -655,7 +749,7 @@
       };
     }
 
-    if (/question|mcq|option|tap|round|கேள்வி|விருப்ப|தொடு/i.test(lower)) {
+    if (/question|mcq|option|tap|round|கேள்வி|விருப்ப|தொடு|ప్రశ్న|ఎంపిక|తాకు|రౌండ్/i.test(lower)) {
       return {
         label: "Next step",
         icon: ArrowRight,
@@ -805,14 +899,14 @@
 
   /** Detect if a line looks like dialogue/conversation (e.g., "Teacher: ...", "Student: ...") */
   function isDialogueLine(line: string): { speaker: string; text: string; side: "left" | "right" } | null {
-    const match = line.match(/^([\w\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20})\s*[:：]\s*[""]?(.+?)[""]?\s*$/);
+    const match = line.match(/^([\w\u0B80-\u0BFF\u0C00-\u0C7F][\w\u0B80-\u0BFF\u0C00-\u0C7F ]{0,20})\s*[:：]\s*[""]?(.+?)[""]?\s*$/);
     if (!match) return null;
     const speaker = match[1].trim();
     const text = match[2].trim();
     if (!text || text.length < 2) return null;
 
-    const leftSpeakers = /^(teacher|ஆசிரியர்|அம்மா|அப்பா|mom|dad|parent|mother|father|person\s*1|speaker\s*1)/i;
-    const rightSpeakers = /^(student|மாணவ|குழந்தை|child|kid|boy|girl|ram|ravi|priya|sita|person\s*2|speaker\s*2)/i;
+    const leftSpeakers = /^(teacher|ఆచార్య|టీచర్|ஆசிரியர்|அம்மா|అమ్మ|அப்பா|నాన్న|mom|dad|parent|mother|father|person\s*1|speaker\s*1)/i;
+    const rightSpeakers = /^(student|విద్యార్థి|పిల్ల|మాణவ|மாணவ|குழந்தை|child|kid|boy|girl|ram|ravi|priya|sita|person\s*2|speaker\s*2)/i;
     if (leftSpeakers.test(speaker)) return { speaker, text, side: "left" };
     if (rightSpeakers.test(speaker)) return { speaker, text, side: "right" };
 
@@ -993,6 +1087,8 @@
   function customTopicLoadErrorMessage(): string {
     return sessionLanguage === "ta"
       ? "Ollama இந்த custom topic-க்கு சுருக்கத்தை உருவாக்கவில்லை. மீண்டும் முயற்சிக்கவும்."
+      : sessionLanguage === "te"
+        ? "ఈ custom topic కోసం Ollama సారాంశాన్ని తయారు చేయలేదు. దయచేసి మళ్లీ ప్రయత్నించండి."
       : "Ollama did not generate a summary for this custom topic. Please try again.";
   }
 
@@ -1047,6 +1143,11 @@
         summaryImages = Array.isArray(data.images_base64)
           ? data.images_base64.filter((img): img is string => typeof img === "string" && img.length > 0)
           : [];
+        summaryDiagramCaptions = Array.isArray(data.diagram_captions)
+          ? data.diagram_captions.filter(
+              (caption): caption is string => typeof caption === "string" && caption.trim().length > 0,
+            )
+          : [];
       } else {
         const data = (await response.json().catch(() => ({}))) as SummarizeResponse;
         sessionLanguage = normalizeLanguage(data.language ?? sessionLanguage);
@@ -1056,6 +1157,7 @@
         if (topic?.source === "custom") {
           summaryLines = normalizeSummaryLines([apiError || customTopicLoadErrorMessage()]);
           summaryImages = [];
+          summaryDiagramCaptions = [];
           questionPlan = [];
         } else {
           summaryLines = normalizeSummaryLines([
@@ -1063,6 +1165,7 @@
             "Choose an exact textbook topic from the class section and try again.",
           ]);
           questionPlan = [];
+          summaryDiagramCaptions = [];
         }
       }
     } catch (error) {
@@ -1071,13 +1174,18 @@
       summaryError = isAbort
         ? sessionLanguage === "ta"
           ? "AI சுருக்கம் தயாரிக்க அதிக நேரம் எடுத்துக்கொண்டது. மீண்டும் முயற்சிக்கவும்."
+          : sessionLanguage === "te"
+            ? "AI సారాంశం సిద్ధం చేయడానికి ఎక్కువ సమయం తీసుకుంది. దయచేసి మళ్లీ ప్రయత్నించండి."
           : "AI took too long to prepare the summary. Please try again."
         : sessionLanguage === "ta"
           ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
+          : sessionLanguage === "te"
+            ? "సారాంశాన్ని లోడ్ చేస్తున్నప్పుడు నెట్‌వర్క్ సమస్య వచ్చింది."
           : "Network issue while loading summary.";
       if (topic?.source === "custom") {
         summaryLines = normalizeSummaryLines([summaryError || customTopicLoadErrorMessage()]);
         summaryImages = [];
+        summaryDiagramCaptions = [];
         questionPlan = [];
       } else {
         summaryLines = normalizeSummaryLines([
@@ -1085,6 +1193,7 @@
           "Select the exact chapter topic name and retry.",
         ]);
         questionPlan = [];
+        summaryDiagramCaptions = [];
       }
     }
 
@@ -1115,6 +1224,7 @@
     sessionId = createSessionId();
     sessionAttempts = [];
     summaryImages = [];
+    summaryDiagramCaptions = [];
     questionPlan = [];
     resetTurnState();
 
@@ -1226,9 +1336,9 @@
     }
   }
 
-  function _pickVoice(lang: "en" | "ta"): SpeechSynthesisVoice | undefined {
+  function _pickVoice(lang: SessionLanguage): SpeechSynthesisVoice | undefined {
     const voices = speechSynthesis.getVoices();
-    const prefix = lang === "ta" ? "ta" : "en";
+    const prefix = lang === "ta" ? "ta" : lang === "te" ? "te" : "en";
 
     if (lang === "en") {
       // Strongly prefer Indian English voices for natural accent
@@ -1238,6 +1348,14 @@
         voices.find((v) => /\bindia\b/i.test(v.name) && v.lang.startsWith("en")) ??
         voices.find((v) => v.lang.toLowerCase().startsWith("en-in"));
       if (indianVoice) return indianVoice;
+    }
+
+    if (lang === "te") {
+      const teluguVoice =
+        voices.find((v) => v.lang === "te-IN") ??
+        voices.find((v) => v.lang.toLowerCase() === "te-in") ??
+        voices.find((v) => /telugu/i.test(v.name));
+      if (teluguVoice) return teluguVoice;
     }
 
     // Fallback: locale match then any matching lang
@@ -1250,7 +1368,7 @@
   /** Speak text and return a promise that resolves when utterance finishes. */
   function speakAsync(
     text: string,
-    lang: "en" | "ta" = "en",
+    lang: SessionLanguage = "en",
     options: {
       addPauses?: boolean;
       onBoundary?: (charIndex: number) => void;
@@ -1282,10 +1400,10 @@
           ? clean
           : clean.replace(/([,;])\s*/g, "$1 ... ").replace(/([.!?])\s+/g, "$1 ... ");
       const utt = new SpeechSynthesisUtterance(spokenText);
-      utt.lang = lang === "ta" ? "ta-IN" : "en-IN";
+      utt.lang = lang === "ta" ? "ta-IN" : lang === "te" ? "te-IN" : "en-IN";
       const voice = _pickVoice(lang);
       if (voice) utt.voice = voice;
-      utt.rate = lang === "ta" ? 0.72 : 0.78;
+      utt.rate = lang === "ta" ? 0.72 : lang === "te" ? 0.74 : 0.78;
       utt.pitch = 1.05;
       utt.onboundary = (event) => {
         if (typeof event.charIndex !== "number") return;
@@ -1301,7 +1419,7 @@
     });
   }
 
-  function speak(text: string, lang: "en" | "ta" = "en"): void {
+  function speak(text: string, lang: SessionLanguage = "en"): void {
     void speakAsync(text, lang);
   }
 
@@ -1330,6 +1448,8 @@
           speak(
             sessionLanguage === "ta"
               ? "நேரம் முடிகிறது, விரைவாக பதிலளிக்கவும்!"
+              : sessionLanguage === "te"
+                ? "సమయం ముగియబోతోంది, త్వరగా సమాధానం చెప్పండి!"
               : "Time is running out, please answer quickly!",
             sessionLanguage,
           );
@@ -1362,15 +1482,26 @@
       {
         studentIdx: currentQ.student,
         question: currentQ.q,
-        selectedOption: "No answer (timed out)",
+        selectedOption:
+          sessionLanguage === "ta"
+            ? "பதில் இல்லை (நேரம் முடிந்தது)"
+            : sessionLanguage === "te"
+              ? "సమాధానం లేదు (సమయం ముగిసింది)"
+              : "No answer (timed out)",
         correctOption: currentQ.options[currentQ.answerIndex] ?? "",
         correct: false,
         explain: currentQ.explain,
       },
     ];
     answerPhase = "feedback";
-    feedbackTitle = "Time Up";
-    feedbackDetail = `Correct answer: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`;
+    feedbackTitle =
+      sessionLanguage === "ta" ? "நேரம் முடிந்தது" : sessionLanguage === "te" ? "సమయం ముగిసింది" : "Time Up";
+    feedbackDetail =
+      sessionLanguage === "ta"
+        ? `சரியான விடை: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`
+        : sessionLanguage === "te"
+          ? `సరైన సమాధానం: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`
+          : `Correct answer: ${currentQ.options[currentQ.answerIndex]}. ${currentQ.explain}`;
   }
 
   // Speak question + options, then start timer when MCQ begins
@@ -1402,11 +1533,15 @@
       if (lastCorrect) {
         msg = sessionLanguage === "ta"
           ? `சரியான பதில்! ${currentQ.explain}`
+          : sessionLanguage === "te"
+            ? `సరైన సమాధానం! ${currentQ.explain}`
           : `That's right! ${currentQ.explain}`;
       } else {
         const correctOpt = currentQ.options[currentQ.answerIndex] ?? "";
         msg = sessionLanguage === "ta"
           ? `தவறான பதில். சரியான விடை: ${correctOpt}. ${currentQ.explain}`
+          : sessionLanguage === "te"
+            ? `తప్పు సమాధానం. సరైన సమాధానం: ${correctOpt}. ${currentQ.explain}`
           : `Not quite. The correct answer is: ${correctOpt}. ${currentQ.explain}`;
       }
       void speakAsync(msg, sessionLanguage, {
@@ -1970,19 +2105,31 @@
                     {#if lastCorrect}
                       <CheckCircle2 class="size-5" style="color:#15803d;" />
                       <div class="text-[15px] font-bold" style="color:#166534;">
-                        {sessionLanguage === "ta" ? "சரியான பதில்! " : "That's right! "}
+                        {sessionLanguage === "ta"
+                          ? "சரியான பதில்! "
+                          : sessionLanguage === "te"
+                            ? "సరైన సమాధానం! "
+                            : "That's right! "}
                       </div>
                     {:else}
                       <XCircle class="size-5" style="color:#dc2626;" />
                       <div class="text-[15px] font-bold" style="color:#dc2626;">
-                        {sessionLanguage === "ta" ? "தவறான பதில்." : "Not quite."}
+                        {sessionLanguage === "ta"
+                          ? "தவறான பதில்."
+                          : sessionLanguage === "te"
+                            ? "తప్పు సమాధానం."
+                            : "Not quite."}
                       </div>
                     {/if}
                   </div>
                   {#if !lastCorrect}
                     <div class="mb-2.5 ml-7 rounded-xl border-l-4 bg-white px-3 py-2.5" style="border-color:#22c55e;">
                       <div class="mb-0.5 text-[10px] font-semibold uppercase tracking-wider" style="color:#15803d;">
-                        {sessionLanguage === "ta" ? "சரியான விடை" : "Correct answer"}
+                        {sessionLanguage === "ta"
+                          ? "சரியான விடை"
+                          : sessionLanguage === "te"
+                            ? "సరైన సమాధానం"
+                            : "Correct answer"}
                       </div>
                       <div class="text-[14px] font-semibold" style="color:#166534;">
                         {currentQ?.options[currentQ.answerIndex] ?? ""}
@@ -1993,7 +2140,11 @@
                     {#if lastCorrect}
                       {currentQ?.explain ?? ""}
                     {:else}
-                      {sessionLanguage === "ta" ? "ஏன்? " : "Why? "}{currentQ?.explain ?? ""}
+                      {sessionLanguage === "ta"
+                        ? "ஏன்? "
+                        : sessionLanguage === "te"
+                          ? "ఎందుకు? "
+                          : "Why? "}{currentQ?.explain ?? ""}
                     {/if}
                   </div>
                   <div class="mt-1 pl-7 text-[11px]" style="color:var(--text-tertiary);">
@@ -2070,12 +2221,19 @@
                 {#if summaryImages.length > 0}
                   <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
                     {#each summaryImages.slice(0, 3) as img, i (`sidebar-img-${i}`)}
-                      <img
-                        src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
-                        alt="Textbook image {i + 1}"
-                        class="h-14 w-18 shrink-0 rounded-lg object-cover border"
-                        style="border-color:#e8dfc8;"
-                      />
+                      <div class="w-18 shrink-0">
+                        <img
+                          src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
+                          alt={summaryDiagramCaptions[i] || `Textbook image ${i + 1}`}
+                          class="h-14 w-18 rounded-lg object-cover border"
+                          style="border-color:#e8dfc8;"
+                        />
+                        {#if summaryDiagramCaptions[i]}
+                          <div class="mt-1 text-[9px] leading-[1.35]" style="color:var(--text-secondary);">
+                            {summaryDiagramCaptions[i]}
+                          </div>
+                        {/if}
+                      </div>
                     {/each}
                   </div>
                 {/if}
@@ -2602,12 +2760,19 @@
               {#if summaryImages.length > 0}
                 <div class="flex gap-2 overflow-x-auto pb-1">
                   {#each summaryImages.slice(0, 2) as img, i (`mob-details-img-${i}`)}
-                    <img
-                      src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
-                      alt="Textbook image {i + 1}"
-                      class="h-12 w-16 shrink-0 rounded-lg object-cover border"
-                      style="border-color:#f3d49a;"
-                    />
+                    <div class="w-16 shrink-0">
+                      <img
+                        src={img.startsWith("data:") ? img : `data:image/jpeg;base64,${img}`}
+                        alt={summaryDiagramCaptions[i] || `Textbook image ${i + 1}`}
+                        class="h-12 w-16 rounded-lg object-cover border"
+                        style="border-color:#f3d49a;"
+                      />
+                      {#if summaryDiagramCaptions[i]}
+                        <div class="mt-1 text-[9px] leading-[1.3]" style="color:var(--text-secondary);">
+                          {summaryDiagramCaptions[i]}
+                        </div>
+                      {/if}
+                    </div>
                   {/each}
                 </div>
               {/if}
@@ -2705,19 +2870,31 @@
                 {#if lastCorrect}
                   <CheckCircle2 class="size-5" style="color:#15803d;" />
                   <div class="text-[15px] font-bold" style="color:#166534;">
-                    {sessionLanguage === "ta" ? "சரியான பதில்! " : "That's right! "}
+                    {sessionLanguage === "ta"
+                      ? "சரியான பதில்! "
+                      : sessionLanguage === "te"
+                        ? "సరైన సమాధానం! "
+                        : "That's right! "}
                   </div>
                 {:else}
                   <XCircle class="size-5" style="color:#dc2626;" />
                   <div class="text-[15px] font-bold" style="color:#dc2626;">
-                    {sessionLanguage === "ta" ? "தவறான பதில்." : "Not quite."}
+                    {sessionLanguage === "ta"
+                      ? "தவறான பதில்."
+                      : sessionLanguage === "te"
+                        ? "తప్పు సమాధానం."
+                        : "Not quite."}
                   </div>
                 {/if}
               </div>
               {#if !lastCorrect}
                 <div class="mb-2.5 ml-7 rounded-xl border-l-4 bg-white px-3 py-2.5" style="border-color:#22c55e;">
                   <div class="mb-0.5 text-[10px] font-semibold uppercase tracking-wider" style="color:#15803d;">
-                    {sessionLanguage === "ta" ? "சரியான விடை" : "Correct answer"}
+                    {sessionLanguage === "ta"
+                      ? "சரியான விடை"
+                      : sessionLanguage === "te"
+                        ? "సరైన సమాధానం"
+                        : "Correct answer"}
                   </div>
                   <div class="text-[14px] font-semibold" style="color:#166534;">
                     {currentQ?.options[currentQ.answerIndex] ?? ""}
@@ -2728,7 +2905,11 @@
                 {#if lastCorrect}
                   {currentQ?.explain ?? ""}
                 {:else}
-                  {sessionLanguage === "ta" ? "ஏன்? " : "Why? "}{currentQ?.explain ?? ""}
+                  {sessionLanguage === "ta"
+                    ? "ஏன்? "
+                    : sessionLanguage === "te"
+                      ? "ఎందుకు? "
+                      : "Why? "}{currentQ?.explain ?? ""}
                 {/if}
               </div>
               <div class="mt-3 pl-7">

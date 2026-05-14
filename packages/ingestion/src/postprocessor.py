@@ -58,7 +58,9 @@ class PostProcessor:
                 continue
 
             # Length filter
-            raw_text = content.split("உள்ளடக்கம்: ")[-1] if "உள்ளடக்கம்: " in content else content
+            raw_text = meta.get("raw_text") or (
+                content.split("உள்ளடக்கம்: ")[-1] if "உள்ளடக்கம்: " in content else content
+            )
             if len(raw_text.strip()) < _MIN_CHARS:
                 discarded += 1
                 continue

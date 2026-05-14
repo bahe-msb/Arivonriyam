@@ -20,6 +20,7 @@ class ElementType(str, Enum):
 
 class DominantLanguage(str, Enum):
     TAMIL    = "ta"
+    TELUGU   = "te"
     ENGLISH  = "en"
     BILINGUAL = "bilingual"
 
@@ -32,6 +33,9 @@ class ChunkMeta(BaseModel):
     standard:      int = Field(ge=1, le=10)
     chapter_number: int = Field(default=0, ge=0)
     chapter_title:  str = Field(default="")
+    topic_title:    str = Field(default="")
+    section_title:  str = Field(default="")
+    section_role:   str = Field(default="")
     page_number:    int = Field(default=0, ge=0)
     element_type:   ElementType = ElementType.BODY
     dominant_language: DominantLanguage = DominantLanguage.TAMIL
@@ -40,6 +44,7 @@ class ChunkMeta(BaseModel):
     total_chunks_in_chapter: int = Field(default=0, ge=0)
     chunk_hash:     str = ""
     hypothetical_question_tamil:   str = ""
+    hypothetical_question_telugu:  str = ""
     hypothetical_question_english: str = ""
     keywords:       List[str] = Field(default_factory=list)
 

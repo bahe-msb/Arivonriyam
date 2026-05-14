@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run src/__tests__",
+    "test:watch": "vitest src/__tests__"
   },
   "keywords": [],
   "author": "Balasubramanian",
@@ -22,7 +23,10 @@
     "@types/express": "^5.0.6",
     "@types/multer": "^2.0.0",
     "@types/pg": "^8.20.0",
-    "tsx": "^4.21.0"
+    "@types/supertest": "^6.0.3",
+    "supertest": "^7.1.4",
+    "tsx": "^4.21.0",
+    "vitest": "^3.2.4"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

@@ -55,6 +55,11 @@ export async function generateTamilResponse(prompt: string): Promise<string> {
   return callOllama({ prompt });
 }
 
+/** Sends a prompt to Ollama and returns trimmed model output in Telugu (no language override). */
+export async function generateTeluguResponse(prompt: string): Promise<string> {
+  return callOllama({ prompt });
+}
+
 /** Sends a prompt to Ollama and returns trimmed model output. */
 export async function generateLlmResponse(prompt: string): Promise<string> {
   const englishOnlyPrompt = [

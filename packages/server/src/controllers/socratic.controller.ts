@@ -4,10 +4,16 @@ import {
   generateLlmJson,
   generateLlmResponse,
   generateTamilResponse,
+  generateTeluguResponse,
   retrieveTopicChunks,
   summarizeTopic,
   type RetrieverChunk,
 } from "../repositories";
+import {
+  buildCustomTopicSummaryJsonPrompt,
+  buildCustomTopicSummaryTextPrompt,
+  type SocraticPromptLanguage,
+} from "../prompts/socratic.prompts";
 
 interface SummarizeBody {
   topic?: string;
@@ -32,6 +38,7 @@ interface SummaryShape {
   word_count: number;
   chunks_used: number;
   images_base64?: string[];
+  diagram_captions?: string[];
   exercise_chunks?: Array<{ text: string; page: number }>;
 }
 
@@ -74,7 +81,7 @@ interface QuestionBankRequest {
   exerciseChunks?: Array<{ text: string; page: number }>;
 }
 
-type SupportedLanguage = "en" | "ta";
+type SupportedLanguage = "en" | "ta" | "te";
 
 const QUESTIONS_PER_STUDENT = 6;
 const MIN_SUMMARY_WORDS = 260;
@@ -160,6 +167,28 @@ const QUESTION_KEYWORD_STOPWORDS_TA = new Set([
   "சுருக்கம்",
   "ஆசிரியர்",
 ]);
+const QUESTION_KEYWORD_STOPWORDS_TE = new Set([
+  "ఇది",
+  "ఇప్పుడు",
+  "ఎందుకు",
+  "ఎలా",
+  "ఎప్పుడు",
+  "ఏది",
+  "ఏవి",
+  "ఎవరు",
+  "ప్రశ్న",
+  "సమాధానం",
+  "తరగతి",
+  "విద్యార్థి",
+  "విద్యార్థులు",
+  "విషయం",
+  "టాపిక్",
+  "పాఠం",
+  "సారాంశం",
+  "రౌండ్",
+  "ఎంపిక",
+  "గురువు",
+]);
 
 /**
  * POST /api/socratic/summarize
@@ -177,7 +206,7 @@ const QUESTION_KEYWORD_STOPWORDS_TA = new Set([
  *   word_count:  number
  *   chunks_used: number          0 = no RAG context found
  *   lines:       string[]        flat list for backward-compat
- *   language:    "en" | "ta"
+ *   language:    "en" | "ta" | "te"
  *   questionsPerStudent: number  fixed to 6
  *   questions:   SocraticQuestion[]
  * }
@@ -231,6 +260,12 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
         const summaryImages = Array.isArray(summary.images_base64)
           ? summary.images_base64.filter(Boolean)
           : [];
+        const summaryDiagramCaptions = Array.isArray(summary.diagram_captions)
+          ? summary.diagram_captions.filter(
+              (caption): caption is string =>
+                typeof caption === "string" && caption.trim().length > 0,
+            )
+          : [];
         const summaryExercises = Array.isArray(summary.exercise_chunks)
           ? summary.exercise_chunks
           : [];
@@ -241,6 +276,7 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
             word_count: words,
             chunks_used: summary.chunks_used,
             images_base64: summaryImages,
+            diagram_captions: summaryDiagramCaptions,
             exercise_chunks: summaryExercises,
           };
         } else if (normalized.intro.length >= 10 || normalized.content.length >= 40) {
@@ -249,6 +285,7 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
           effective = {
             ..._repairRagSummary(normalized, topic, summary.chunks_used, targetLanguage),
             images_base64: summaryImages,
+            diagram_captions: summaryDiagramCaptions,
             exercise_chunks: summaryExercises,
           };
         } else {
@@ -433,9 +470,10 @@ export async function postSocraticAlertSuggestion(req: Request, res: Response): 
   }
 }
 
-function _countScripts(text: string): { tamil: number; latin: number } {
+function _countScripts(text: string): { tamil: number; telugu: number; latin: number } {
   return {
     tamil: [...text].filter((char) => char >= "\u0B80" && char <= "\u0BFF").length,
+    telugu: [...text].filter((char) => char >= "\u0C00" && char <= "\u0C7F").length,
     latin: [...text].filter((char) => /[A-Za-z]/.test(char)).length,
   };
 }
@@ -444,12 +482,30 @@ function _detectLanguage(text: string): SupportedLanguage {
   const sample = text.trim();
   if (!sample) return "en";
 
-  const { tamil: tamilChars, latin: latinChars } = _countScripts(sample);
-  const total = tamilChars + latinChars;
+  const { tamil: tamilChars, telugu: teluguChars, latin: latinChars } = _countScripts(sample);
+  const total = tamilChars + teluguChars + latinChars;
   if (total === 0) return "en";
 
   const tamilRatio = tamilChars / total;
-  if (tamilChars > 0 && (latinChars === 0 || tamilRatio >= 0.55)) {
+  const teluguRatio = teluguChars / total;
+
+  if (teluguChars > 0 && tamilChars === 0 && (latinChars === 0 || teluguRatio >= 0.55)) {
+    return "te";
+  }
+
+  if (tamilChars > 0 && teluguChars === 0 && (latinChars === 0 || tamilRatio >= 0.55)) {
+    return "ta";
+  }
+
+  if (teluguChars > 0 && tamilChars > 0) {
+    return teluguChars >= tamilChars ? "te" : "ta";
+  }
+
+  if (teluguChars > 0 && teluguRatio >= 0.45) {
+    return "te";
+  }
+
+  if (tamilChars > 0 && tamilRatio >= 0.45) {
     return "ta";
   }
 
@@ -459,12 +515,16 @@ function _detectLanguage(text: string): SupportedLanguage {
 function _normalizeChunkLanguage(chunk: RetrieverChunk): SupportedLanguage | null {
   const rawLanguage = typeof chunk.language === "string" ? chunk.language.trim().toLowerCase() : "";
   if (rawLanguage === "ta") return "ta";
+  if (rawLanguage === "te") return "te";
   if (rawLanguage === "en") return "en";
 
   const text = chunk.text || "";
-  const { tamil: tamilChars, latin: latinChars } = _countScripts(text);
+  const { tamil: tamilChars, telugu: teluguChars, latin: latinChars } = _countScripts(text);
   if (rawLanguage === "bilingual") {
-    if (tamilChars > 0 && (latinChars === 0 || tamilChars >= latinChars)) {
+    if (teluguChars > 0 && (latinChars === 0 || teluguChars >= Math.max(tamilChars, latinChars))) {
+      return "te";
+    }
+    if (tamilChars > 0 && (latinChars === 0 || tamilChars >= Math.max(teluguChars, latinChars))) {
       return "ta";
     }
     if (latinChars > 0) return "en";
@@ -484,11 +544,14 @@ function _pickLanguageFromChunks(chunks: RetrieverChunk[]): SupportedLanguage | 
       acc[language] += 1;
       return acc;
     },
-    { en: 0, ta: 0 },
+    { en: 0, ta: 0, te: 0 },
   );
 
-  if (counts.ta === 0 && counts.en === 0) return null;
-  return counts.ta >= counts.en ? "ta" : "en";
+  if (counts.ta === 0 && counts.te === 0 && counts.en === 0) return null;
+
+  if (counts.te >= counts.ta && counts.te >= counts.en) return "te";
+  if (counts.ta >= counts.te && counts.ta >= counts.en) return "ta";
+  return "en";
 }
 
 async function _resolveSessionLanguage(
@@ -520,44 +583,12 @@ async function _buildCustomTopicSummary(
   classLevel: number,
   lang: SupportedLanguage,
 ): Promise<SummaryShape> {
-  const prompt =
-    lang === "ta"
-      ? [
-          "தமிழில் மட்டும் பதிலளிக்கவும்.",
-          "நீங்கள் இந்திய தொடக்கப்பள்ளிக்கான மென்மையான கற்பித்தல் உதவியாளர்.",
-          `கற்றல் நிலை: வகுப்பு ${classLevel}.`,
-          `தலைப்பு: ${topic}`,
-          `பாடம்: ${subject}`,
-          "",
-          `"${topic}" பற்றி வகுப்பு ${classLevel} மாணவர்களுக்கு ஏற்ற எளிய விளக்கம் தயார் செய்யவும்.`,
-          "உங்கள் சொந்த அறிவை பயன்படுத்தவும். அன்பான ஆசிரியர் நடையில் எழுதவும்.",
-          "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
-          "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
-          "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
-          "தமிழ்நாடு பள்ளி நடைபோக்கில் 'வணக்கம்', 'அம்மா', 'அப்பா', 'மாணவர்', 'ஆசிரியர்' போன்ற சொற்களைப் பயன்படுத்தலாம்.",
-          "வீடு அல்லது பள்ளி உதாரணங்களை கொடுக்கவும். MCQ சுற்றுக்கான bridge வரியுடன் முடிக்கவும்.",
-          "",
-          "Return ONLY valid JSON:",
-          '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
-        ].join("\n")
-      : [
-          "Respond only in English.",
-          "You are a calm Indian primary-school teaching assistant.",
-          `Target learners: Class ${classLevel} (India, Class 1-5).`,
-          `Topic: ${topic}`,
-          `Subject: ${subject}`,
-          "",
-          `Explain "${topic}" for Class ${classLevel} students using your own knowledge.`,
-          "Use a warm Indian classroom-teacher tone. Give simple home or school examples.",
-          "Do not ask the students questions. Do not use question marks in the summary.",
-          "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
-          "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
-          "Use neutral Tamil Nadu school wording such as Good morning, mother, father, student, and teacher.",
-          "Cover what it is, why it matters, and a real-life example. End with a bridge into MCQ practice.",
-          "",
-          "Return ONLY valid JSON in this exact shape:",
-          '{"intro":"...","content":"...","key_points":["...","...","...","..."],"bridge":"..."}',
-        ].join("\n");
+  const prompt = buildCustomTopicSummaryJsonPrompt({
+    topic,
+    subject,
+    classLevel,
+    lang: lang as SocraticPromptLanguage,
+  });
 
   let lastError: unknown = null;
 
@@ -581,30 +612,19 @@ async function _buildCustomTopicSummary(
 
   // --- Fallback: plain-text LLM call (no JSON constraint, much more reliable) ---
   try {
-    const textPrompt =
-      lang === "ta"
-        ? [
-            "தமிழில் மட்டும் பதிலளிக்கவும்.",
-            `நீங்கள் வகுப்பு ${classLevel} மாணவர்களுக்கு "${topic}" (${subject}) பற்றி எளிய தமிழில் விளக்க வேண்டும்.`,
-            "அன்பான ஆசிரியர் நடையில் 3-4 பத்திகளில் எழுதுங்கள்.",
-            "மாணவர்களிடம் கேள்வி கேட்க வேண்டாம். '?' குறியைப் பயன்படுத்த வேண்டாம்.",
-            "Markdown, bold, bullet, '*', '_', '`' போன்ற குறிகள் வேண்டாம்.",
-            "'நமஸ்தே', 'பாப்பா', 'மம்மி', 'பேட்டா' போன்ற இந்தி அல்லது வடஇந்திய சொற்களை பயன்படுத்த வேண்டாம்.",
-            "வீடு அல்லது பள்ளி உதாரணங்கள் கொடுக்கவும்.",
-          ].join("\n")
-        : [
-            `You are a primary school teacher in India. Explain "${topic}" (${subject}) to Class ${classLevel} students.`,
-            "Use simple words and give examples from daily life.",
-            "Write 3-4 paragraphs in a warm, friendly tone.",
-            "Do not ask the students questions. Do not use question marks.",
-            "Do not use Markdown, bold markers, bullets, asterisks, underscores, or backticks.",
-            "Do not use Hindi or North-India classroom words like Namaste, papa, mummy, beta, or baccha.",
-          ].join("\n");
+    const textPrompt = buildCustomTopicSummaryTextPrompt({
+      topic,
+      subject,
+      classLevel,
+      lang: lang as SocraticPromptLanguage,
+    });
 
     const raw =
       lang === "ta"
         ? await generateTamilResponse(textPrompt)
-        : await generateLlmResponse(textPrompt);
+        : lang === "te"
+          ? await generateTeluguResponse(textPrompt)
+          : await generateLlmResponse(textPrompt);
 
     if (raw && raw.trim().length >= 40) {
       const shape = _textToSummaryShape(raw, topic, lang);
@@ -625,7 +645,9 @@ async function _buildCustomTopicSummary(
   throw new AppError(
     lang === "ta"
       ? `"${topic}" தலைப்புக்கான சுருக்கத்தை Ollama உருவாக்க முடியவில்லை.`
-      : `Ollama could not generate a summary for "${topic}".`,
+      : lang === "te"
+        ? `"${topic}" విషయానికి Ollama సారాంశాన్ని రూపొందించలేకపోయింది.`
+        : `Ollama could not generate a summary for "${topic}".`,
     502,
     "ollama",
   );
@@ -655,7 +677,9 @@ function _buildQuestionFacts(
   const weakFactPattern =
     lang === "ta"
       ? /mcq|கேள்வி|சுற்று|விருப்பம்|தொடங்கலாம்|தேர்வு|வணக்கம்|அறிமுக|தொடக்கம்|அமர்வு|எப்படி இருக்க|பாடத்தின் பொதுவான/i
-      : /mcq|question round|tap one option|summary|lesson|classroom process|practice round|introduction|opening line|how are you/i;
+      : lang === "te"
+        ? /mcq|ప్రశ్న|రౌండ్|ఎంపిక|సారాంశం|పాఠం|పరిచయం|ప్రారంభం|సెషన్|ఎలా ఉన్నారు|నమస్కారం/i
+        : /mcq|question round|tap one option|summary|lesson|classroom process|practice round|introduction|opening line|how are you/i;
 
   const facts: string[] = [];
   for (const source of sources) {
@@ -674,10 +698,17 @@ function _collectQuestionKeywords(
   questionFacts: string[],
   lang: SupportedLanguage,
 ): string[] {
-  const stopwords = lang === "ta" ? QUESTION_KEYWORD_STOPWORDS_TA : QUESTION_KEYWORD_STOPWORDS_EN;
-  const minLength = lang === "ta" ? 3 : 4;
+  const stopwords =
+    lang === "ta"
+      ? QUESTION_KEYWORD_STOPWORDS_TA
+      : lang === "te"
+        ? QUESTION_KEYWORD_STOPWORDS_TE
+        : QUESTION_KEYWORD_STOPWORDS_EN;
+  const minLength = lang === "ta" || lang === "te" ? 3 : 4;
   const tokens =
-    `${topic} ${questionFacts.join(" ")}`.toLowerCase().match(/[a-z]+|[\u0B80-\u0BFF]+/g) ?? [];
+    `${topic} ${questionFacts.join(" ")}`
+      .toLowerCase()
+      .match(/[a-z]+|[\u0B80-\u0BFF]+|[\u0C00-\u0C7F]+/g) ?? [];
 
   const keywords: string[] = [];
   for (const token of tokens) {
@@ -691,10 +722,15 @@ function _collectQuestionKeywords(
 }
 
 function _normalizeQuestionTokens(text: string, lang: SupportedLanguage): string[] {
-  const stopwords = lang === "ta" ? QUESTION_KEYWORD_STOPWORDS_TA : QUESTION_KEYWORD_STOPWORDS_EN;
-  const minLength = lang === "ta" ? 2 : 3;
+  const stopwords =
+    lang === "ta"
+      ? QUESTION_KEYWORD_STOPWORDS_TA
+      : lang === "te"
+        ? QUESTION_KEYWORD_STOPWORDS_TE
+        : QUESTION_KEYWORD_STOPWORDS_EN;
+  const minLength = lang === "ta" || lang === "te" ? 2 : 3;
 
-  return (text.toLowerCase().match(/[a-z0-9]+|[\u0B80-\u0BFF]+/g) ?? [])
+  return (text.toLowerCase().match(/[a-z0-9]+|[\u0B80-\u0BFF]+|[\u0C00-\u0C7F]+/g) ?? [])
     .map((token) => {
       if (lang === "en" && token.length > 4 && token.endsWith("s")) {
         return token.slice(0, -1);
@@ -780,7 +816,9 @@ function _buildQuestionPrompt(
       ? questionFacts.map((fact, idx) => `${idx + 1}. ${fact}`).join("\n")
       : input.lang === "ta"
         ? `${input.topic} பற்றிய உறுதியான தகவல்களை மட்டும் கேள்வியாக மாற்றவும்.`
-        : `Stay tightly focused on ${input.topic} only.`;
+        : input.lang === "te"
+          ? `${input.topic} గురించి ఖచ్చితమైన నిజాలనే ప్రశ్నలుగా మార్చండి.`
+          : `Stay tightly focused on ${input.topic} only.`;
 
   const anchorsBlock = anchorWords.length > 0 ? anchorWords.join(", ") : input.topic;
   const usedQuestionsBlock =
@@ -791,67 +829,103 @@ function _buildQuestionPrompt(
           .join("\n")
       : input.lang === "ta"
         ? "இன்னும் எதுவும் பயன்படுத்தப்படவில்லை."
-        : "None yet.";
+        : input.lang === "te"
+          ? "ఇంకా ఏ ప్రశ్నా ఉపయోగించలేదు."
+          : "None yet.";
 
-  return input.lang === "ta"
-    ? [
-        "தமிழில் மட்டும் பதிலளிக்கவும்.",
-        `நீங்கள் வகுப்பு ${input.classLevel} ${input.subject} ஆசிரியர்.`,
-        `தலைப்பு: ${input.topic}`,
-        "",
-        "கீழே உள்ள topic facts-ஐ மட்டும் பயன்படுத்தவும்:",
-        factsBlock,
-        `Anchor words: ${anchorsBlock}`,
-        "",
-        "ஏற்கனவே பயன்படுத்திய கேள்வி கருத்துகள். இவற்றை மீண்டும் அல்லது வேறு வடிவில் கேட்க வேண்டாம்:",
-        usedQuestionsBlock,
-        "",
-        "விதிகள்:",
-        `- இந்த batch-க்கு ${batchSize} MCQ மட்டும் உருவாக்கவும்.`,
-        "- மேலே உள்ள facts-இல் இல்லாத தகவலை உருவாக்க வேண்டாம்.",
-        "- ஒவ்வொரு கேள்வியும் தலைப்பின் ஒரு தெளிவான உண்மை, பகுதி, வேலை, உதாரணம், வரிசை, காரணம் அல்லது விளைவைச் சோதிக்க வேண்டும்.",
-        "- பாடம், சுருக்கம், வகுப்பு நடைமுறை, அல்லது பொதுவான subject பற்றி கேள்வி கேட்க வேண்டாம்.",
-        "- ஒவ்வொரு கேள்வியும் வேறு fact அல்லது வேறு reasoning angle-ஐ பயன்படுத்த வேண்டும்.",
-        "- முதல் கேள்விகள் எளிதாகவும், பின்னைய கேள்விகள் சிந்திக்க வைக்கும் வகையிலும் இருக்கட்டும்.",
-        "- ஒவ்வொரு கேள்விக்கும் 4 விருப்பங்கள் மட்டும்; 1 சரியான பதில் மட்டும்.",
-        "- விருப்பங்கள் குறுகிய சொற்கள் அல்லது சிறு சொற்றொடர்கள் மட்டும்; முழு வாக்கியங்கள் வேண்டாம்.",
-        "- தவறான விருப்பங்கள் இதே topic-இல் வரும் நம்பகமான குழப்பங்கள் ஆக இருக்க வேண்டும்.",
-        "- 'all of the above', 'none of the above', 'இந்த topic தொடர்பில்லை', 'skip' போன்ற பொதுவான fillers வேண்டாம்.",
-        "- explain ஒரு குறுகிய வாக்கியமாக சரியான பதில் ஏன் சரி என்பதைச் சொல்ல வேண்டும்.",
-        "- ஒரே கேள்வி கருத்தை மீண்டும் மீண்டும் பயன்படுத்த வேண்டாம்.",
-        "",
-        "Return ONLY valid JSON in this exact shape:",
-        '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
-      ].join("\n")
-    : [
-        "Respond only in English.",
-        `You are writing a topic-locked MCQ bank for Class ${input.classLevel} ${input.subject}.`,
-        `Topic: ${input.topic}`,
-        "",
-        "Use ONLY these topic facts:",
-        factsBlock,
-        `Anchor words: ${anchorsBlock}`,
-        "",
-        "Already used question ideas. Do not repeat or paraphrase any of these:",
-        usedQuestionsBlock,
-        "",
-        "Rules:",
-        `- Create exactly ${batchSize} MCQs for this batch.`,
-        "- Use only the facts above. If a detail is not supported there, do not invent it.",
-        "- Every question must test a concrete topic fact, part, function, sequence, example, cause, or effect.",
-        "- Do not ask about the lesson, summary, classroom process, or the subject in general.",
-        "- Each question must use a different fact or a clearly different reasoning angle from the previous questions.",
-        "- Start with easier recall questions and move toward simple reasoning.",
-        "- Each question must have exactly 4 options and exactly 1 correct answer.",
-        "- Options must be short words or short phrases, never full sentences.",
-        "- Wrong options must be plausible confusions from the same topic.",
-        "- Never use fillers such as all of the above, none of the above, this topic is unrelated, skip, or not in the lesson.",
-        "- explain must be one short sentence that states why the correct answer is right using the topic fact.",
-        "- Do not repeat the same question idea or the same correct answer when avoidable.",
-        "",
-        "Return ONLY valid JSON in this exact shape:",
-        '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
-      ].join("\n");
+  if (input.lang === "ta") {
+    return [
+      "தமிழில் மட்டும் பதிலளிக்கவும்.",
+      `நீங்கள் வகுப்பு ${input.classLevel} ${input.subject} ஆசிரியர்.`,
+      `தலைப்பு: ${input.topic}`,
+      "",
+      "கீழே உள்ள topic facts-ஐ மட்டும் பயன்படுத்தவும்:",
+      factsBlock,
+      `Anchor words: ${anchorsBlock}`,
+      "",
+      "ஏற்கனவே பயன்படுத்திய கேள்வி கருத்துகள். இவற்றை மீண்டும் அல்லது வேறு வடிவில் கேட்க வேண்டாம்:",
+      usedQuestionsBlock,
+      "",
+      "விதிகள்:",
+      `- இந்த batch-க்கு ${batchSize} MCQ மட்டும் உருவாக்கவும்.`,
+      "- மேலே உள்ள facts-இல் இல்லாத தகவலை உருவாக்க வேண்டாம்.",
+      "- ஒவ்வொரு கேள்வியும் தலைப்பின் ஒரு தெளிவான உண்மை, பகுதி, வேலை, உதாரணம், வரிசை, காரணம் அல்லது விளைவைச் சோதிக்க வேண்டும்.",
+      "- பாடம், சுருக்கம், வகுப்பு நடைமுறை, அல்லது பொதுவான subject பற்றி கேள்வி கேட்க வேண்டாம்.",
+      "- ஒவ்வொரு கேள்வியும் வேறு fact அல்லது வேறு reasoning angle-ஐ பயன்படுத்த வேண்டும்.",
+      "- முதல் கேள்விகள் எளிதாகவும், பின்னைய கேள்விகள் சிந்திக்க வைக்கும் வகையிலும் இருக்கட்டும்.",
+      "- ஒவ்வொரு கேள்விக்கும் 4 விருப்பங்கள் மட்டும்; 1 சரியான பதில் மட்டும்.",
+      "- விருப்பங்கள் குறுகிய சொற்கள் அல்லது சிறு சொற்றொடர்கள் மட்டும்; முழு வாக்கியங்கள் வேண்டாம்.",
+      "- தவறான விருப்பங்கள் இதே topic-இல் வரும் நம்பகமான குழப்பங்கள் ஆக இருக்க வேண்டும்.",
+      "- 'all of the above', 'none of the above', 'இந்த topic தொடர்பில்லை', 'skip' போன்ற பொதுவான fillers வேண்டாம்.",
+      "- explain ஒரு குறுகிய வாக்கியமாக சரியான பதில் ஏன் சரி என்பதைச் சொல்ல வேண்டும்.",
+      "- ஒரே கேள்வி கருத்தை மீண்டும் மீண்டும் பயன்படுத்த வேண்டாம்.",
+      "",
+      "Return ONLY valid JSON in this exact shape:",
+      '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
+    ].join("\n");
+  }
+
+  if (input.lang === "te") {
+    return [
+      "తెలుగులో మాత్రమే సమాధానం ఇవ్వండి.",
+      `మీరు తరగతి ${input.classLevel} ${input.subject} ఉపాధ్యాయులు.`,
+      `టాపిక్: ${input.topic}`,
+      "",
+      "క్రింది టాపిక్ నిజాలను మాత్రమే ఉపయోగించండి:",
+      factsBlock,
+      `Anchor words: ${anchorsBlock}`,
+      "",
+      "ఇప్పటికే వాడిన ప్రశ్న ఆలోచనలు. వీటిని మళ్లీ వాడకండి:",
+      usedQuestionsBlock,
+      "",
+      "నియమాలు:",
+      `- ఈ బ్యాచ్‌కు ఖచ్చితంగా ${batchSize} MCQలు తయారు చేయండి.`,
+      "- పై నిజాలకు బయట సమాచారం కల్పించకండి.",
+      "- ప్రతి ప్రశ్న టాపిక్‌లోని స్పష్టమైన నిజం, భాగం, పని, ఉదాహరణ, కారణం లేదా ఫలితాన్ని పరీక్షించాలి.",
+      "- పాఠం నడిపిన విధానం, సారాంశం, సెషన్ గురించి మెటా ప్రశ్నలు అడగకండి.",
+      "- ప్రతి ప్రశ్న వేర్వేరు నిజం లేదా వేర్వేరు reasoning angle ను ఉపయోగించాలి.",
+      "- మొదట సులభ recall ప్రశ్నలు, తర్వాత సులభ reasoning ప్రశ్నలు ఇవ్వండి.",
+      "- ప్రతి ప్రశ్నకు 4 ఎంపికలు, 1 సరైన సమాధానం మాత్రమే ఉండాలి.",
+      "- ఎంపికలు చిన్న పదాలు లేదా చిన్న పదబంధాలుగా ఉండాలి; పూర్తి వాక్యాలు కాదు.",
+      "- తప్పు ఎంపికలు అదే టాపిక్‌లో సాధారణ గందరగోళాలుగా ఉండాలి.",
+      "- all of the above, none of the above, skip వంటి fillers వాడకండి.",
+      "- explain ఒక చిన్న వాక్యంగా సరైన సమాధానం ఎందుకు సరైందో చెప్పాలి.",
+      "- ఒకే ప్రశ్న ఆలోచనను మళ్లీ మళ్లీ వాడకండి.",
+      "",
+      "Return ONLY valid JSON in this exact shape:",
+      '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
+    ].join("\n");
+  }
+
+  return [
+    "Respond only in English.",
+    `You are writing a topic-locked MCQ bank for Class ${input.classLevel} ${input.subject}.`,
+    `Topic: ${input.topic}`,
+    "",
+    "Use ONLY these topic facts:",
+    factsBlock,
+    `Anchor words: ${anchorsBlock}`,
+    "",
+    "Already used question ideas. Do not repeat or paraphrase any of these:",
+    usedQuestionsBlock,
+    "",
+    "Rules:",
+    `- Create exactly ${batchSize} MCQs for this batch.`,
+    "- Use only the facts above. If a detail is not supported there, do not invent it.",
+    "- Every question must test a concrete topic fact, part, function, sequence, example, cause, or effect.",
+    "- Do not ask about the lesson, summary, classroom process, or the subject in general.",
+    "- Each question must use a different fact or a clearly different reasoning angle from the previous questions.",
+    "- Start with easier recall questions and move toward simple reasoning.",
+    "- Each question must have exactly 4 options and exactly 1 correct answer.",
+    "- Options must be short words or short phrases, never full sentences.",
+    "- Wrong options must be plausible confusions from the same topic.",
+    "- Never use fillers such as all of the above, none of the above, this topic is unrelated, skip, or not in the lesson.",
+    "- explain must be one short sentence that states why the correct answer is right using the topic fact.",
+    "- Do not repeat the same question idea or the same correct answer when avoidable.",
+    "",
+    "Return ONLY valid JSON in this exact shape:",
+    '{"questions":[{"q":"...","options":["...","...","...","..."],"answerIndex":0,"explain":"..."}]}',
+  ].join("\n");
 }
 
 async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQuestion[]> {
@@ -900,7 +974,9 @@ async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQ
       const raw =
         input.lang === "ta"
           ? await generateTamilResponse(prompt)
-          : await generateLlmResponse(prompt);
+          : input.lang === "te"
+            ? await generateTeluguResponse(prompt)
+            : await generateLlmResponse(prompt);
       const parsed = _parseQuestionEnvelope(raw);
       if (parsed) {
         const normalized = _normalizeQuestions(parsed.questions, batchSize, input.lang);
@@ -951,6 +1027,36 @@ function _extractClassLevel(className: string): number {
 }
 
 function _sanitizeSummaryText(text: string, lang: SupportedLanguage): string {
+  const greetingReplacement =
+    lang === "ta" ? "வணக்கம்" : lang === "te" ? "నమస్కారం" : "Good morning";
+  const fatherReplacement = lang === "ta" ? "அப்பா" : lang === "te" ? "నాన్న" : "father";
+  const motherReplacement = lang === "ta" ? "அம்மா" : lang === "te" ? "అమ్మ" : "mother";
+  const childReplacement = lang === "ta" ? "குழந்தை" : lang === "te" ? "బిడ్డ" : "child";
+  const continueReplacement =
+    lang === "ta"
+      ? "இப்போது தொடங்கலாம். "
+      : lang === "te"
+        ? "ఇప్పుడు ప్రారంభిద్దాం. "
+        : "Now let us continue. ";
+  const lookAroundReplacement =
+    lang === "ta"
+      ? "சுற்றிலும் பாருங்கள். "
+      : lang === "te"
+        ? "చుట్టూ చూడండి. "
+        : "Look around you. ";
+  const hereSeeReplacement =
+    lang === "ta"
+      ? "இங்கு நாம் பார்க்கலாம். "
+      : lang === "te"
+        ? "ఇక్కడ మనం చూడవచ్చు. "
+        : "Here we can see. ";
+  const shallWeReplacement =
+    lang === "ta"
+      ? "இப்போது தொடர்வோம். "
+      : lang === "te"
+        ? "ఇప్పుడు కొనసాగుదాం. "
+        : "Let us continue. ";
+
   return text
     .replace(/\*\*(.*?)\*\*/g, "$1")
     .replace(/__(.*?)__/g, "$1")
@@ -958,26 +1064,19 @@ function _sanitizeSummaryText(text: string, lang: SupportedLanguage): string {
     .replace(/_(.*?)_/g, "$1")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/^\s*[-*•]\s+/gm, "")
-    .replace(/\bnamaste\b/gi, lang === "ta" ? "வணக்கம்" : "Good morning")
-    .replace(/\bpapa\b/gi, lang === "ta" ? "அப்பா" : "father")
-    .replace(/\bmummy\b|\bmumma\b/gi, lang === "ta" ? "அம்மா" : "mother")
-    .replace(/\bbeta\b|\bbaccha\b/gi, lang === "ta" ? "குழந்தை" : "child")
+    .replace(/\bnamaste\b/gi, greetingReplacement)
+    .replace(/\bpapa\b/gi, fatherReplacement)
+    .replace(/\bmummy\b|\bmumma\b/gi, motherReplacement)
+    .replace(/\bbeta\b|\bbaccha\b/gi, childReplacement)
     .replace(/\bHow are you(?: doing)?(?: today)?\b[.!?]*/gi, "")
-    .replace(
-      /\bAre you ready\b[.!?]*/gi,
-      lang === "ta" ? "இப்போது தொடங்கலாம். " : "Now let us continue. ",
-    )
-    .replace(
-      /\bWhat do you see\b[.!?]*/gi,
-      lang === "ta" ? "சுற்றிலும் பாருங்கள். " : "Look around you. ",
-    )
-    .replace(
-      /\bCan you see\b[.!?]*/gi,
-      lang === "ta" ? "இங்கு நாம் பார்க்கலாம். " : "Here we can see. ",
-    )
-    .replace(/\bShall we\b[.!?]*/gi, lang === "ta" ? "இப்போது தொடர்வோம். " : "Let us continue. ")
+    .replace(/\bAre you ready\b[.!?]*/gi, continueReplacement)
+    .replace(/\bWhat do you see\b[.!?]*/gi, lookAroundReplacement)
+    .replace(/\bCan you see\b[.!?]*/gi, hereSeeReplacement)
+    .replace(/\bShall we\b[.!?]*/gi, shallWeReplacement)
     .replace(/தயாரா[?!.]*/g, "இப்போது தொடங்கலாம். ")
     .replace(/என்ன பார்க்கிறீர்கள்[?!.]*/g, "சுற்றிலும் பாருங்கள். ")
+    .replace(/సిద్ధమేనా[?!.]*/g, "ఇప్పుడు ప్రారంభిద్దాం. ")
+    .replace(/ఏమి చూస్తున్నారు[?!.]*/g, "చుట్టూ చూడండి. ")
     .replace(/\?/g, ".")
     .replace(/\s+([,.;:!])/g, "$1")
     .replace(/\.{2,}/g, ".")
@@ -1198,14 +1297,20 @@ function _tightenSummaryOpening(
       ? /காலை வணக்கம்|வணக்கம்/i.test(introText)
         ? "காலை வணக்கம். "
         : ""
-      : /\b(good morning|good afternoon|good evening|hello)\b/i.test(introText)
-        ? "Good morning. "
-        : "";
+      : lang === "te"
+        ? /శుభోదయం|నమస్కారం|హలో/i.test(introText)
+          ? "శుభోదయం. "
+          : ""
+        : /\b(good morning|good afternoon|good evening|hello)\b/i.test(introText)
+          ? "Good morning. "
+          : "";
   const needsCompaction =
     lang === "ta"
       ? introLines.length > 2 || /\?|தயாரா|விளையாடு|அருமை/i.test(introText)
-      : introLines.length > 2 ||
-        /\?|are you ready|has anyone|wow|magical|let'?s play/i.test(introText);
+      : lang === "te"
+        ? introLines.length > 2 || /\?|సిద్ధమేనా|ఆడుకుందాం|బాగుంది/i.test(introText)
+        : introLines.length > 2 ||
+          /\?|are you ready|has anyone|wow|magical|let'?s play/i.test(introText);
 
   if (!introText || needsCompaction) {
     return {
@@ -1213,7 +1318,9 @@ function _tightenSummaryOpening(
       intro:
         lang === "ta"
           ? `${greeting}இன்று நாம் ${subject} பாடத்தில் ${topic} தலைப்பை மெதுவாக தொடங்கப் போகிறோம்.`
-          : `${greeting}Today we are going to start ${topic} in ${subject}.`,
+          : lang === "te"
+            ? `${greeting}ఈ రోజు మనం ${subject}లో ${topic} అంశాన్ని నెమ్మదిగా ప్రారంభించబోతున్నాం.`
+            : `${greeting}Today we are going to start ${topic} in ${subject}.`,
     };
   }
 
@@ -1272,7 +1379,9 @@ function _textToSummaryShape(
     allSentences.at(-1) ||
     (lang === "ta"
       ? `சரி. இப்போது ${topic} பற்றி ஒரு சிறிய MCQ சுற்றுக்கு செல்லலாம்.`
-      : `Good. Now we will move to a short MCQ round on ${topic}.`);
+      : lang === "te"
+        ? `సరే. ఇప్పుడు ${topic} గురించి చిన్న MCQ రౌండ్‌కు వెళ్దాం.`
+        : `Good. Now we will move to a short MCQ round on ${topic}.`);
 
   return { intro, content, key_points, bridge };
 }
@@ -1283,10 +1392,11 @@ function _splitForFlow(text: string, preserveWhole = false): string[] {
   if (preserveWhole) return [trimmed];
 
   // Dialogue pattern: "Speaker: text" or "Speaker : text"
-  const dialogueRe = /^[\w\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20}\s*[:：]\s*.+/;
+  const dialogueRe =
+    /^[\w\u0B80-\u0BFF\u0C00-\u0C7F][\w\u0B80-\u0BFF\u0C00-\u0C7F ]{0,20}\s*[:：]\s*.+/;
   // Inline dialogue split: detect a second speaker starting mid-line
   const inlineDialogueSplitRe =
-    /(?<=[.!?""']\s{1,3})(?=[A-Z\u0B80-\u0BFF][\w\u0B80-\u0BFF ]{0,20}\s*[:：])/g;
+    /(?<=[.!?""']\s{1,3})(?=[A-Z\u0B80-\u0BFF\u0C00-\u0C7F][\w\u0B80-\u0BFF\u0C00-\u0C7F ]{0,20}\s*[:：])/g;
 
   // Split by paragraphs (double newline) to keep natural text flow.
   const paragraphs = trimmed.split(/\n\n+/);
@@ -1335,7 +1445,7 @@ function _countWords(lines: string[]): number {
 function _hasWeakMcqOption(option: string): boolean {
   return (
     _countTextWords(option) > MAX_QUESTION_OPTION_WORDS ||
-    /all of the above|none of the above|both a and b|both a & b|this topic is unrelated|skip|not in the lesson|today.?s summary/i.test(
+    /all of the above|none of the above|both a and b|both a & b|this topic is unrelated|skip|not in the lesson|today.?s summary|పైవన్నీ|ఏదీ కాదు|ఈ పాఠానికి సంబంధం లేదు/i.test(
       option,
     )
   );
@@ -1429,6 +1539,8 @@ function _isMetaQuestion(q: SocraticQuestion): boolean {
     )
   )
     return true;
+  if (/ఈరోజు సారాంశం|ఈ పాఠం ఏమిటి|పరిచయం|ప్రారంభం|సెషన్|ఎలా ఉన్నారు|నమస్కారం/i.test(q.q))
+    return true;
   // Options that are statements about the lesson
   if (
     /today we are going to|this topic should be|are needed for this topic|is unrelated to|introduction|opening speech/i.test(
@@ -1437,6 +1549,9 @@ function _isMetaQuestion(q: SocraticQuestion): boolean {
   )
     return true;
   if (/அறிமுக உரை|தொடக்க உரை|பாடத்தின் தொடக்கம்|அமர்வு தொடக்கம்/i.test(q.options.join(" "))) {
+    return true;
+  }
+  if (/పరిచయ మాట|ప్రారంభ ఉపన్యాసం|పాఠం ప్రారంభం|సెషన్ ప్రారంభం/i.test(q.options.join(" "))) {
     return true;
   }
   return false;
@@ -1453,7 +1568,11 @@ async function _fallbackQuestions(
 
   try {
     const raw =
-      input.lang === "ta" ? await generateTamilResponse(prompt) : await generateLlmResponse(prompt);
+      input.lang === "ta"
+        ? await generateTamilResponse(prompt)
+        : input.lang === "te"
+          ? await generateTeluguResponse(prompt)
+          : await generateLlmResponse(prompt);
     const parsed = _parseQuestionEnvelope(raw);
     if (parsed) {
       const normalized = _normalizeQuestions(parsed.questions, remaining, input.lang);
@@ -1486,7 +1605,9 @@ function _extractKeyPoints(
   const pad =
     lang === "ta"
       ? `${topic} பற்றிய முக்கியமான விவரங்களை நினைவில் கொள்ளவும்.`
-      : `Remember the key details about ${topic} from the lesson.`;
+      : lang === "te"
+        ? `${topic} గురించి ముఖ్యమైన విషయాలను గుర్తుంచుకోండి.`
+        : `Remember the key details about ${topic} from the lesson.`;
   while (result.length < count) result.push(pad);
   return result;
 }
@@ -1507,7 +1628,9 @@ function _repairRagSummary(
       ? normalized.bridge
       : lang === "ta"
         ? `சரி. இப்போது ${topic} பற்றி ஒரு சிறிய MCQ சுற்றுக்கு செல்லலாம்.`
-        : `Good. Now we will move to a short MCQ round on ${topic}.`;
+        : lang === "te"
+          ? `సరే. ఇప్పుడు ${topic} గురించి చిన్న MCQ రౌండ్‌కు వెళ్దాం.`
+          : `Good. Now we will move to a short MCQ round on ${topic}.`;
 
   const repaired = {
     intro: normalized.intro,
