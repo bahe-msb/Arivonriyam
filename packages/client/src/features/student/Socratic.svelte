@@ -241,11 +241,26 @@
     const words = text.split(/\s+/).filter(Boolean);
     if (words.length <= wordLimit) return [text];
 
+    // Prefer breaks at clause boundaries (comma, semicolon, dash, ellipsis,
+    // 'and'/'but'/'so'). Falling back to a hard word-slice can sever short
+    // phrases like "Don't worry" mid-thought across boxes.
+    const clauseBreak = /([,;:—–]|\s\.\.\.|\s(?:and|but|so|because|then|or)\s)/i;
     const segments: string[] = [];
-    for (let start = 0; start < words.length; start += wordLimit) {
-      segments.push(words.slice(start, start + wordLimit).join(" "));
+    let remaining = text.trim();
+    let guard = 0;
+    while (countWords(remaining) > wordLimit && guard++ < 32) {
+      const slice = remaining.split(/\s+/).slice(0, wordLimit).join(" ");
+      const match = clauseBreak.exec(slice);
+      let cutAt = slice.length;
+      if (match && match.index > Math.floor(wordLimit / 3)) {
+        cutAt = match.index + match[0].length;
+      }
+      const head = remaining.slice(0, cutAt).trim();
+      if (!head) break;
+      segments.push(head);
+      remaining = remaining.slice(cutAt).trim();
     }
-
+    if (remaining) segments.push(remaining);
     return segments;
   }
 

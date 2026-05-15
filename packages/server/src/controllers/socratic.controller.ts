@@ -679,12 +679,18 @@ function _compactQuestionFact(text: string, lang: SupportedLanguage): string {
   return `${words.slice(0, 24).join(" ")}...`;
 }
 
+const EXERCISE_FACT_TAG = "[EXERCISE]";
+
 function _buildQuestionFacts(
   summaryLines: string[],
   exerciseChunks: Array<{ text: string; page: number }>,
   lang: SupportedLanguage,
 ): string[] {
-  const sources = [...exerciseChunks.map((chunk) => chunk.text), ...summaryLines];
+  // Tag exercise-derived facts so the MCQ prompt can prioritise them. The
+  // tag is stripped from the LLM input but its position in the array
+  // identifies real textbook exercises versus general summary lines.
+  const taggedExercises = exerciseChunks.map((chunk) => `${EXERCISE_FACT_TAG}${chunk.text}`);
+  const sources = [...taggedExercises, ...summaryLines];
 
   const weakFactPattern =
     lang === "ta"
@@ -695,9 +701,13 @@ function _buildQuestionFacts(
 
   const facts: string[] = [];
   for (const source of sources) {
-    const fact = _compactQuestionFact(source, lang);
-    if (!fact || fact.length < 18 || weakFactPattern.test(fact)) continue;
-    if (facts.some((existing) => existing.toLowerCase() === fact.toLowerCase())) continue;
+    const isExercise = source.startsWith(EXERCISE_FACT_TAG);
+    const stripped = isExercise ? source.slice(EXERCISE_FACT_TAG.length) : source;
+    const compacted = _compactQuestionFact(stripped, lang);
+    if (!compacted || compacted.length < 18 || weakFactPattern.test(compacted)) continue;
+    const fact = isExercise ? `${EXERCISE_FACT_TAG}${compacted}` : compacted;
+    const lowered = fact.toLowerCase();
+    if (facts.some((existing) => existing.toLowerCase() === lowered)) continue;
     facts.push(fact);
     if (facts.length >= MAX_QUESTION_CONTEXT_FACTS) break;
   }
@@ -823,9 +833,23 @@ function _buildQuestionPrompt(
   existingQuestions: SocraticQuestion[],
   batchSize: number,
 ): string {
+  const _exerciseLabel =
+    input.lang === "ta"
+      ? "[பாடப்புத்தக பயிற்சி]"
+      : input.lang === "te"
+        ? "[పాఠ్యపుస్తక వ్యాయామం]"
+        : "[TEXTBOOK EXERCISE]";
+  const hasExerciseFacts = questionFacts.some((f) => f.startsWith(EXERCISE_FACT_TAG));
   const factsBlock =
     questionFacts.length > 0
-      ? questionFacts.map((fact, idx) => `${idx + 1}. ${fact}`).join("\n")
+      ? questionFacts
+          .map((fact, idx) => {
+            if (fact.startsWith(EXERCISE_FACT_TAG)) {
+              return `${idx + 1}. ${_exerciseLabel} ${fact.slice(EXERCISE_FACT_TAG.length)}`;
+            }
+            return `${idx + 1}. ${fact}`;
+          })
+          .join("\n")
       : input.lang === "ta"
         ? `${input.topic} பற்றிய உறுதியான தகவல்களை மட்டும் கேள்வியாக மாற்றவும்.`
         : input.lang === "te"
@@ -860,6 +884,11 @@ function _buildQuestionPrompt(
       "",
       "விதிகள்:",
       `- இந்த batch-க்கு ${batchSize} MCQ மட்டும் உருவாக்கவும்.`,
+      ...(hasExerciseFacts
+        ? [
+            "- [பாடப்புத்தக பயிற்சி] என குறிக்கப்பட்ட facts-ஐ முதன்மையாக பயன்படுத்தவும் — அவை உண்மையான பாடப்புத்தக கேள்விகள். அவற்றை அதே வடிவில் நகலெடுக்காமல், அதே கருத்தை சோதிக்கும் புதிய MCQ-ஆக மறுவடிவமைக்கவும்.",
+          ]
+        : []),
       "- மேலே உள்ள facts-இல் இல்லாத தகவலை உருவாக்க வேண்டாம்.",
       "- ஒவ்வொரு கேள்வியும் தலைப்பின் ஒரு தெளிவான உண்மை, பகுதி, வேலை, உதாரணம், வரிசை, காரணம் அல்லது விளைவைச் சோதிக்க வேண்டும்.",
       "- பாடம், சுருக்கம், வகுப்பு நடைமுறை, அல்லது பொதுவான subject பற்றி கேள்வி கேட்க வேண்டாம்.",
@@ -892,6 +921,11 @@ function _buildQuestionPrompt(
       "",
       "నియమాలు:",
       `- ఈ బ్యాచ్‌కు ఖచ్చితంగా ${batchSize} MCQలు తయారు చేయండి.`,
+      ...(hasExerciseFacts
+        ? [
+            "- [పాఠ్యపుస్తక వ్యాయామం] అని గుర్తు పెట్టిన facts ను ముఖ్యంగా వాడండి — అవి అసలైన పాఠ్యపుస్తక ప్రశ్నలు. వాటిని యథాతథంగా కాపీ చేయకుండా, అదే భావనను పరీక్షించే కొత్త MCQ గా రూపొందించండి.",
+          ]
+        : []),
       "- పై నిజాలకు బయట సమాచారం కల్పించకండి.",
       "- ప్రతి ప్రశ్న టాపిక్‌లోని స్పష్టమైన నిజం, భాగం, పని, ఉదాహరణ, కారణం లేదా ఫలితాన్ని పరీక్షించాలి.",
       "- పాఠం నడిపిన విధానం, సారాంశం, సెషన్ గురించి మెటా ప్రశ్నలు అడగకండి.",
@@ -923,6 +957,11 @@ function _buildQuestionPrompt(
     "",
     "Rules:",
     `- Create exactly ${batchSize} MCQs for this batch.`,
+    ...(hasExerciseFacts
+      ? [
+          "- Facts tagged [TEXTBOOK EXERCISE] are real exercises from the textbook — prefer them as the primary source. Do NOT copy them verbatim; rewrite each as a new MCQ that tests the same concept.",
+        ]
+      : []),
     "- Use only the facts above. If a detail is not supported there, do not invent it.",
     "- Every question must test a concrete topic fact, part, function, sequence, example, cause, or effect.",
     "- Do not ask about the lesson, summary, classroom process, or the subject in general.",

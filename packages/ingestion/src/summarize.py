@@ -181,6 +181,7 @@ def _build_prompt_ta(
         "• கணிதம் என்றால்: '🍎 + 🍎 = 2 ஆப்பிள்கள்!' போன்ற emoji காட்சிகளை வாக்கியங்களுக்குள் பயன்படுத்துங்கள்.",
         "• கீழே உள்ள பாடப்புத்தக பகுதிகளை மட்டுமே பயன்படுத்தவும்.",
         "• உங்கள் சொந்த அறிவை சேர்க்காதீர்கள்.",
+        "• கணித குறியீடுகள் ($, \\text{}, \\frac, \\times, LaTeX) எதையும் பயன்படுத்த வேண்டாம். எளிய சொற்களாலும் emoji-களாலும் மட்டும் எழுதுங்கள். உதாரணம்: 'adj A' என்று நேரடியாக எழுதுங்கள், '$\\text{adj} A$' என்று அல்ல.",
         "• 'கற்போம்', 'பார்ப்போம்', 'கற்பனை செய்', 'என்ன நடக்கும் தெரியுமா?' போன்ற ஆர்வமூட்டும் சொற்களை பயன்படுத்தவும்.",
         "• ஒவ்வொரு வாக்கியமும் முழுமையாக இருக்க வேண்டும் — பாதியில் முடிக்கக் கூடாது.",
         "• உதாரணங்களை வீடு, பள்ளி, இயற்கை என்று தேர்ந்தெடுக்கவும்.",
@@ -266,6 +267,7 @@ def _build_prompt_te(
         "• ప్రతి పేరాలో 3-5 పూర్తి వాక్యాలు ఉండాలి.",
         "• కథ చెబుతున్నట్టుగా అర్థమయ్యేలా చెప్పండి.",
         "• కింద ఉన్న textbook excerpts మాత్రమే ఉపయోగించండి; బయట సమాచారం జోడించకండి.",
+        "• ఎలాంటి గణిత చిహ్నాలు ($, \\text{}, \\frac, \\times, LaTeX) వాడకండి. సాధారణ పదాలు, emojis మాత్రమే వాడండి. ఉదాహరణ: 'adj A' అని నేరుగా రాయండి, '$\\text{adj} A$' అని కాదు.",
         "• ఇల్లు, పాఠశాల, ప్రకృతి నుంచి సరళమైన ఉదాహరణలు ఇవ్వండి.",
         *([f"• {note}" for note in multimodal_notes] if multimodal_notes else []),
         "",
@@ -342,6 +344,7 @@ def _build_prompt_en(
         "  Student: <what student says>",
         "• For math topics: use emoji visuals inline like '🍎 + 🍎 = 2 apples!' within sentences.",
         "• Use ONLY the textbook excerpts below. Do not add external facts.",
+        "• NEVER use LaTeX, dollar signs ($), or math notation like \\text{}, \\frac, \\times, \\rightarrow. Write everything in plain words and emojis only. Example: write 'adj A' directly, not '$\\text{adj} A$'.",
         "• Use encouraging phrases: 'Let us see…', 'Imagine you are…', 'Think of it like…', 'Can you guess?'",
         "• Ask rhetorical questions: 'What do you think happens next?', 'Have you seen this at home?'",
         "• Every sentence must be complete — no mid-thought truncation.",
@@ -387,8 +390,34 @@ def _build_prompt_en(
     ]))
 
 
+import re as _re
+
+_LATEX_INLINE_RE   = _re.compile(r"\$([^$]+?)\$")
+_LATEX_DISPLAY_RE  = _re.compile(r"\$\$([^$]+?)\$\$")
+_LATEX_CMD_RE      = _re.compile(r"\\(?:text|mathrm|mathbf|mathit|operatorname|frac|times|cdot|rightarrow|leftarrow|left|right|begin|end)\{?([^{}]*)\}?")
+_LATEX_BARE_CMD_RE = _re.compile(r"\\[a-zA-Z]+")
+
+
+def _strip_latex(text: str) -> str:
+    """Strip LaTeX/math markup that primary-school renderer can't display.
+
+    Removes $...$ / $$...$$ delimiters, common math commands, and stray
+    backslashes — without disturbing plain prose. Belt-and-braces fallback
+    in case the LLM ignores the no-LaTeX prompt rule.
+    """
+    if not text:
+        return text
+    cleaned = _LATEX_DISPLAY_RE.sub(r"\1", text)
+    cleaned = _LATEX_INLINE_RE.sub(r"\1", cleaned)
+    cleaned = _LATEX_CMD_RE.sub(r"\1", cleaned)
+    cleaned = _LATEX_BARE_CMD_RE.sub("", cleaned)
+    cleaned = cleaned.replace("{", "").replace("}", "")
+    return _re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
 def _ensure_complete_sentences(text: str) -> str:
     """Add a period to any line that doesn't end with sentence-final punctuation."""
+    text = _strip_latex(text)
     lines = text.split("\n")
     fixed = []
     sentence_endings = ".!?।"
@@ -459,8 +488,14 @@ def generate_topic_summary(
     chunks = topic_retrieve(class_name, subject, topic, top_k=top_k)
     # Use a meaningful cosine threshold; fall back to the best available if
     # nothing clears the bar (avoids empty context on edge-case topics).
+    # Pedagogical types (definition/formula/theorem/example/table/exercise)
+    # bypass the gate so the type-aware supplement is not undone here.
     THRESHOLD = 0.25
-    good = [c for c in chunks if c["score"] >= THRESHOLD]
+    _GUARANTEED = {"definition", "formula", "theorem", "example", "table", "exercise"}
+    good = [
+        c for c in chunks
+        if c["score"] >= THRESHOLD or c.get("element_type") in _GUARANTEED
+    ]
     if not good and chunks:
         best = max(c["score"] for c in chunks)
         logger.warning(

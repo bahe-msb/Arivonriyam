@@ -156,15 +156,40 @@ def _build_filters(class_name: str, subject: str) -> dict | None:
     return None
 
 
+def _with_element_type(base: dict | None, element_type: str) -> dict:
+    """Compose the (class, subject) filter with an element_type predicate."""
+    et_clause = {"element_type": {"$eq": element_type}}
+    if not base:
+        return et_clause
+    if "$and" in base:
+        return {"$and": [*base["$and"], et_clause]}
+    return {"$and": [base, et_clause]}
+
+
+# Per-type quotas for supplementary fetches. Body text already dominates the
+# main hybrid query — these guarantee the rare pedagogical types reach the
+# summarizer/MCQ pipeline even when body chunks would otherwise out-score them.
+_TYPE_QUOTAS: dict[str, int] = {
+    "definition": 3,
+    "formula":    3,
+    "theorem":    2,
+    "example":    2,
+    "table":      2,
+    "exercise":   4,
+    "summary":    2,
+}
+
+
 def _search(
     query: str,
     class_name: str,
     subject: str,
     top_k: int,
     min_cosine: float = 0.20,
+    filters_override: dict | None = None,
 ) -> List[Dict[str, Any]]:
     retriever = _get_retriever()
-    filters = _build_filters(class_name, subject)
+    filters = filters_override if filters_override is not None else _build_filters(class_name, subject)
     t0 = time.time()
     try:
         hits = retriever.retrieve(
@@ -185,6 +210,45 @@ def _search(
     except Exception as e:
         logger.warning("Hybrid search failed: %s", e)
         return []
+
+
+def _supplement_by_type(
+    query: str,
+    class_name: str,
+    subject: str,
+    primary_hashes: set[str],
+) -> List[Dict[str, Any]]:
+    """Top up the main hit list with per-type quotas.
+
+    The main hybrid search optimises for cosine relevance and is dominated by
+    body chunks in practice. This pass issues one extra query per pedagogical
+    type, scoped by the (class, subject) filter, and merges in any new chunks
+    that the main pass missed. Failure of any single type is non-fatal.
+    """
+    base = _build_filters(class_name, subject)
+    extras: List[Dict[str, Any]] = []
+    seen_local: set[str] = set()
+    for etype, quota in _TYPE_QUOTAS.items():
+        try:
+            hits = _search(
+                query,
+                class_name,
+                subject,
+                top_k=quota,
+                min_cosine=0.10,  # looser gate — these are guaranteed slots
+                filters_override=_with_element_type(base, etype),
+            )
+        except Exception as e:
+            logger.warning("Type supplement failed for %s: %s", etype, e)
+            continue
+        for c in hits:
+            key = f"{c.get('page', 0)}::{c.get('text', '')[:80]}"
+            if key in primary_hashes or key in seen_local:
+                continue
+            seen_local.add(key)
+            extras.append(c)
+        logger.info("Type supplement %-10s: +%d chunk(s)", etype, len(hits))
+    return extras
 
 
 def chapter_retrieve(class_name: str, subject: str, chapter: str, top_k: int = 8) -> List[Dict[str, Any]]:
@@ -221,6 +285,16 @@ def topic_retrieve(class_name: str, subject: str, topic: str, top_k: int = 14) -
     )
 
     result = _search(expanded, class_name, subject, top_k, min_cosine=0.18)
+
+    # Guarantee the rare pedagogical types reach the summarizer even when
+    # body chunks out-score them in the main hybrid query.
+    primary_keys = {
+        f"{c.get('page', 0)}::{c.get('text', '')[:80]}" for c in result
+    }
+    extras = _supplement_by_type(expanded, class_name, subject, primary_keys)
+    if extras:
+        logger.info("Type-aware supplement merged: +%d chunk(s)", len(extras))
+        result = result + extras
 
     # Re-rank: chunks from a chapter whose title contains the topic keyword
     # are almost certainly on-topic — move them to the front.

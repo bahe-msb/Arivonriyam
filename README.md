@@ -2,23 +2,35 @@
 
 An AI-powered Tamil/English/Telugu primary-school tutoring platform with Socratic dialogue and RAG-backed lesson plans. pnpm monorepo with SvelteKit frontend, Express backend, and a Python ingestion pipeline. Powered by 7 coordinated Gemma 4 agents with multi-language prompting and persistent reteach state tracking.
 
+## Live Demo
+
+Arivonriyam is intentionally **offline-first** and runs on the evaluator's laptop, so the live demo is provided as runnable files instead of a hosted URL.
+
+- **Native Postgres setup**: `bash scripts/demo-setup.sh` then `pnpm dev`
+- **Docker Postgres fallback**: `USE_DOCKER_POSTGRES=1 bash scripts/demo-setup.sh` then `pnpm dev`
+- **Auto-seeded judge setup**: `SEED_DEMO_DATA=1 bash scripts/demo-setup.sh` then `pnpm dev`
+- **Judge walkthrough**: [demo.md](demo.md)
+
+Start at [demo.md](demo.md) for the clean-machine walkthrough.
+
 ## Stack
 
-| Layer      | Technology                                                                 |
-| ---------- | -------------------------------------------------------------------------- |
-| Frontend   | SvelteKit v2, Svelte 5, Tailwind CSS v4, shadcn-svelte                     |
-| Backend    | Express v5, TypeScript, tsx; multi-language prompts (Tamil/English/Telugu) |
-| AI / LLM   | Ollama (local) — `gemma4:latest`; 7 coordinated agents                     |
-| RAG DB     | PostgreSQL 17 + pgvector 0.8 (HNSW cosine index)                           |
-| Embeddings | BAAI/bge-m3 via sentence-transformers (CPU, 1024-dim)                      |
-| Ingestion  | Python (uv) — Unstructured, BM25 hybrid retrieval                          |
-| App DB     | SQLite via bun:sqlite; persistent reteach state & topic selection          |
-| Tooling    | pnpm workspaces, ESLint, Prettier, uv                                      |
+| Layer         | Technology                                                                    |
+| ------------- | ----------------------------------------------------------------------------- |
+| Frontend      | SvelteKit v2, Svelte 5, Tailwind CSS v4, shadcn-svelte                        |
+| Backend       | Express v5, TypeScript, tsx; multi-language prompts (Tamil/English/Telugu)    |
+| AI / LLM      | Ollama (local) — `gemma4:latest`; 7 coordinated agents                        |
+| RAG + state   | PostgreSQL 17 + pgvector 0.8 (retrieval, school setup, alerts, reteach state) |
+| Embeddings    | BAAI/bge-m3 via sentence-transformers (CPU, 1024-dim)                         |
+| Ingestion     | Python (uv) — Unstructured, BM25 hybrid retrieval                             |
+| Local storage | SQLite via better-sqlite3 for saved lesson plans and manifest fallback        |
+| Tooling       | pnpm workspaces, ESLint, Prettier, uv                                         |
 
 ## Project Structure
 
 ```
 .
+├── pdfs/          # committed demo textbooks copied into packages/ingestion/data/pdfs by scripts/demo-setup.sh
 ├── packages/
 │   ├── client/       # SvelteKit app
 │   ├── server/       # Express API + RAG repository + multi-language Socratic prompts
@@ -39,17 +51,18 @@ An AI-powered Tamil/English/Telugu primary-school tutoring platform with Socrati
   6. **Lesson Blueprints** — Multi-turn dialogue for introducing new topics
   7. **Performance Analytics** — Analyze learning patterns across sessions
 - **Multi-Language Socratic Prompts** — Tamil, English, and Telugu with culturally-appropriate classroom language (see `packages/server/src/prompts/socratic.prompts.ts`)
-- **Persistent Reteach State** — Daily tracking of student misconceptions across sessions via SQLite
+- **Persistent Reteach State** — PostgreSQL-backed daily tracking of student misconceptions across sessions
 - **Topic Selection & Persistence** — Students browse class-level curriculum with persistent selection state
+- **Downloadable Daily Reports** — One-click daily report export with school, teacher, date, and class performance data; useful as inspection-ready proof and a quick parent-facing progress record without extra end-of-day paperwork
 - **Hybrid RAG Retrieval** — Dense (pgvector HNSW) + sparse (BM25) with RRF fusion for accurate curriculum-grounded responses
-- **Offline-First Architecture** — Local Gemma 4 (text + vision) + SQLite fallback for rural schools with intermittent internet
+- **Offline-First Architecture** — Local Gemma 4 (text + vision), PostgreSQL-backed runtime state, and local saved-plan storage for rural schools with intermittent internet
 
 ## Prerequisites
 
 - Node.js 20+, pnpm 10+
 - [Ollama](https://ollama.com/) running locally on port `11434` with `gemma4:latest` pulled
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
-- [Postgres.app](https://postgresapp.com/) or PostgreSQL 17 with pgvector 0.8+
+- [Postgres.app](https://postgresapp.com/) or PostgreSQL 17 with pgvector 0.8+, or Docker Desktop plus `USE_DOCKER_POSTGRES=1`
 
 ## Setup
 
