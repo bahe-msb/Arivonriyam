@@ -71,6 +71,11 @@ interface AlertSuggestionShape {
   encouragement: string;
 }
 
+interface AlertSuggestionResult extends AlertSuggestionShape {
+  source: "ai" | "fallback";
+  message?: string;
+}
+
 interface QuestionBankRequest {
   topic: string;
   subject: string;
@@ -464,9 +469,16 @@ export async function postSocraticAlertSuggestion(req: Request, res: Response): 
 
   try {
     const generated = await generateLlmJson<AlertSuggestionShape>(prompt);
-    res.json(_normalizeAlertSuggestion(generated, studentName, topic, subject, safeMisses));
+    res.json({
+      ..._normalizeAlertSuggestion(generated, studentName, topic, subject, safeMisses),
+      source: "ai",
+    } satisfies AlertSuggestionResult);
   } catch {
-    res.json(_fallbackAlertSuggestion(studentName, topic, subject, safeMisses));
+    res.json({
+      ..._fallbackAlertSuggestion(studentName, topic, subject, safeMisses),
+      source: "fallback",
+      message: "AI suggestion is unavailable right now. Showing a local support plan instead.",
+    } satisfies AlertSuggestionResult);
   }
 }
 

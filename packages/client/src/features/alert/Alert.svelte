@@ -27,7 +27,11 @@
 
   type AlertSuggestionResponse = Partial<AlertSuggestion> & {
     error?: string;
+    message?: string;
+    source?: "ai" | "fallback";
   };
+
+  type SuggestionSource = "local" | "ai" | "fallback";
 
   // ── Date navigation ────────────────────────────────────────────────
   function todayKey(): string {
@@ -157,6 +161,8 @@
   let detailSheetOpen = $state(false);
   let suggestionCache = $state<Record<string, AlertSuggestion>>({});
   let suggestionErrors = $state<Record<string, string>>({});
+  let suggestionSources = $state<Record<string, SuggestionSource>>({});
+  let suggestionUpdatedAt = $state<Record<string, number>>({});
   let suggestionLoadingId = $state<string | null>(null);
 
   const activeRecord = $derived(
@@ -169,6 +175,20 @@
   );
   const activeSuggestionError = $derived(
     activeRecord ? suggestionErrors[activeRecord.id] ?? "" : "",
+  );
+  const activeSuggestionSource = $derived(
+    activeRecord ? suggestionSources[activeRecord.id] ?? "local" : "local",
+  );
+  const activeSuggestionLoading = $derived(
+    activeRecord ? suggestionLoadingId === activeRecord.id : false,
+  );
+  const activeSuggestionUpdatedLabel = $derived(
+    activeRecord && suggestionUpdatedAt[activeRecord.id]
+      ? new Date(suggestionUpdatedAt[activeRecord.id]).toLocaleTimeString("en-IN", {
+          hour: "numeric",
+          minute: "2-digit",
+        })
+      : "",
   );
   const activeClassInfo = $derived(classOptions.find((cls) => cls.id === selectedClassId));
   const totalMissesForClass = $derived(
@@ -295,14 +315,37 @@
       }
 
       const data = (await response.json()) as AlertSuggestionResponse;
+      const source = data.source === "ai" ? "ai" : "fallback";
+
       suggestionCache = {
         ...suggestionCache,
         [record.id]: normalizeSuggestion(data, record),
+      };
+      suggestionSources = {
+        ...suggestionSources,
+        [record.id]: source,
+      };
+      suggestionUpdatedAt = {
+        ...suggestionUpdatedAt,
+        [record.id]: Date.now(),
+      };
+      suggestionErrors = {
+        ...suggestionErrors,
+        [record.id]:
+          typeof data.message === "string" && data.message.trim() ? data.message.trim() : "",
       };
     } catch {
       suggestionCache = {
         ...suggestionCache,
         [record.id]: fallbackSuggestion(record),
+      };
+      suggestionSources = {
+        ...suggestionSources,
+        [record.id]: "fallback",
+      };
+      suggestionUpdatedAt = {
+        ...suggestionUpdatedAt,
+        [record.id]: Date.now(),
       };
       suggestionErrors = {
         ...suggestionErrors,
@@ -344,6 +387,19 @@
     if (!detailSheetOpen && selectedRecordId !== null) {
       selectedRecordId = null;
     }
+  });
+
+  $effect(() => {
+    if (!detailSheetOpen || !activeRecord) {
+      return;
+    }
+
+    const recordId = activeRecord.id;
+    if (suggestionCache[recordId] || suggestionLoadingId === recordId) {
+      return;
+    }
+
+    void loadSuggestion(activeRecord);
   });
 </script>
 
@@ -567,9 +623,19 @@
                     <Button
                       variant="secondary"
                       class="justify-start"
+                      disabled={activeSuggestionLoading}
                       onclick={() => void loadSuggestion(activeRecord)}
                     >
-                      <RefreshCw class="size-3.5" /> Improve with AI
+                      <RefreshCw class={`size-3.5 ${activeSuggestionLoading ? "animate-spin" : ""}`} />
+                      {#if activeSuggestionLoading}
+                        Improving...
+                      {:else if activeSuggestionSource === "ai"}
+                        Refresh AI note
+                      {:else if activeSuggestionSource === "fallback"}
+                        Try AI again
+                      {:else}
+                        Improve with AI
+                      {/if}
                     </Button>
                     <Button variant="ghost" class="justify-start" onclick={() => goto("/student/topic")}>
                       <ArrowRight class="size-3.5" /> Return to topic picker
@@ -600,8 +666,34 @@
                 </Card>
 
                 <Card class="p-5">
-                  <div class="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#6b7280]">
-                    <Lightbulb class="size-4" /> AI support plan
+                  <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#6b7280]">
+                      <Lightbulb class="size-4" /> AI support plan
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span
+                        class={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                          activeSuggestionLoading
+                            ? "bg-[#e8f1ff] text-[#2f67c8]"
+                            : activeSuggestionSource === "ai"
+                              ? "bg-[#eef9f2] text-[#247a46]"
+                              : "bg-[#fff3d8] text-[#9a6708]"
+                        }`}
+                      >
+                        {#if activeSuggestionLoading}
+                          Improving with AI
+                        {:else if activeSuggestionSource === "ai"}
+                          AI refined
+                        {:else if activeSuggestionSource === "fallback"}
+                          Local fallback
+                        {:else}
+                          Instant preview
+                        {/if}
+                      </span>
+                      {#if activeSuggestionUpdatedLabel}
+                        <span class="text-[11px] text-text-secondary">Updated {activeSuggestionUpdatedLabel}</span>
+                      {/if}
+                    </div>
                   </div>
 
                   {#if activeSuggestion}
@@ -611,9 +703,19 @@
                       </div>
                     {/if}
 
-                    {#if suggestionLoadingId === activeRecord.id}
-                      <div class="mb-3 rounded-2xl border border-[#d7e7ff] bg-[#eef6ff] px-3.5 py-3 text-[12px] text-[#2f67c8]">
-                        AI is refining the teacher note. The local support plan is already shown below.
+                    {#if activeSuggestionLoading}
+                      <div class="mb-3 rounded-2xl border border-[#d7e7ff] bg-[#eef6ff] px-3.5 py-3 text-[#2f67c8]">
+                        <div class="flex items-center gap-2 text-[12px] font-semibold">
+                          <RefreshCw class="size-4 animate-spin" /> Improving this note with AI
+                        </div>
+                        <div class="mt-2 text-[12px] leading-[1.6]">
+                          Reviewing missed questions, sharpening focus areas, and drafting clearer teacher next steps. The instant plan stays visible while the refined note is generated.
+                        </div>
+                        <div class="mt-3 grid gap-2 text-[11px]">
+                          <div class="rounded-xl bg-white/70 px-3 py-2">Reviewing the exact mistakes</div>
+                          <div class="rounded-xl bg-white/70 px-3 py-2">Building topic-wise focus areas</div>
+                          <div class="rounded-xl bg-white/70 px-3 py-2">Writing concrete teacher actions</div>
+                        </div>
                       </div>
                     {/if}
 
