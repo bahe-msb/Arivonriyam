@@ -21,6 +21,17 @@ interface SummarizeBody {
   className?: string;
   source?: string;
   studentCount?: number;
+  includeQuestions?: boolean;
+}
+
+interface QuestionBankBody {
+  topic?: string;
+  subject?: string;
+  className?: string;
+  studentCount?: number;
+  language?: SupportedLanguage;
+  summaryLines?: string[];
+  exerciseChunks?: Array<{ text?: string; page?: number }>;
 }
 
 interface SocraticQuestion {
@@ -99,7 +110,8 @@ const MAX_QUESTION_OPTION_WORDS = 6;
 const QUESTION_GENERATION_BATCH_SIZE = 6;
 const QUESTION_GENERATION_MAX_ROUNDS = 8;
 const QUESTION_DUPLICATE_SIMILARITY = 0.45;
-const SOCRATIC_OLLAMA_TIMEOUT_MS = 240_000;
+const SUMMARY_OLLAMA_TIMEOUT_MS = 240_000;
+const NO_OLLAMA_TIMEOUT_MS = 0;
 const QUESTION_KEYWORD_STOPWORDS_EN = new Set([
   "about",
   "after",
@@ -224,6 +236,7 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
     className = "class_1",
     source = "curriculum",
     studentCount,
+    includeQuestions = true,
   } = req.body as SummarizeBody;
 
   if (!topic || !subject) {
@@ -331,7 +344,22 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
     effective = _tightenSummaryOpening(effective, topic, subject, targetLanguage);
 
     const lines = _toLines(effective);
-    const questions = await _buildQuestionBank({
+    if (!includeQuestions) {
+      res.json({
+        ...effective,
+        lines,
+        language: targetLanguage,
+        questionsPerStudent: QUESTIONS_PER_STUDENT,
+        studentCount: safeStudentCount,
+        sourceUsed: sourceMode,
+        classLevel,
+        questions: [],
+        word_count: _countWords(lines),
+      });
+      return;
+    }
+
+    const questions = await _buildQuestionBankWithBudget({
       topic,
       subject,
       questionCount: questionBankCount,
@@ -358,6 +386,82 @@ export async function postSocraticSummarize(req: Request, res: Response): Promis
       return;
     }
     res.status(500).json({ error: "Failed to generate summary", lines: [], questions: [] });
+  }
+}
+
+export async function postSocraticQuestions(req: Request, res: Response): Promise<void> {
+  const {
+    topic,
+    subject,
+    className = "class_1",
+    studentCount,
+    language,
+    summaryLines,
+    exerciseChunks,
+  } = req.body as QuestionBankBody;
+
+  if (!topic || !subject) {
+    res.status(400).json({ error: "topic and subject are required" });
+    return;
+  }
+
+  const normalizedSummaryLines = Array.isArray(summaryLines)
+    ? summaryLines
+        .filter((line): line is string => typeof line === "string")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+    : [];
+
+  if (normalizedSummaryLines.length === 0) {
+    res.status(400).json({ error: "summaryLines are required" });
+    return;
+  }
+
+  const normalizedExerciseChunks = Array.isArray(exerciseChunks)
+    ? exerciseChunks
+        .map((chunk) => ({
+          text: typeof chunk?.text === "string" ? chunk.text.trim() : "",
+          page: Number.isFinite(chunk?.page) ? Math.floor(Number(chunk?.page)) : 0,
+        }))
+        .filter((chunk) => chunk.text.length > 0)
+    : [];
+
+  const classLevel = _extractClassLevel(className);
+  const safeStudentCount = Math.max(
+    1,
+    Math.min(12, Number.isFinite(studentCount) ? Math.floor(Number(studentCount)) : 4),
+  );
+  const totalQuestionCount = safeStudentCount * QUESTIONS_PER_STUDENT;
+  const questionBankCount = Math.min(MAX_QUESTION_BANK_SIZE, totalQuestionCount);
+  const targetLanguage =
+    language === "ta" || language === "te" || language === "en"
+      ? language
+      : _detectLanguage(`${topic} ${subject} ${normalizedSummaryLines.join(" ")}`);
+
+  try {
+    const questions = await _buildQuestionBankWithBudget({
+      topic,
+      subject,
+      questionCount: questionBankCount,
+      classLevel,
+      lang: targetLanguage,
+      summaryLines: normalizedSummaryLines,
+      exerciseChunks: normalizedExerciseChunks,
+    });
+
+    res.json({
+      language: targetLanguage,
+      classLevel,
+      questionsPerStudent: QUESTIONS_PER_STUDENT,
+      studentCount: safeStudentCount,
+      questions,
+    });
+  } catch (error) {
+    if (error instanceof AppError) {
+      res.status(error.status).json({ error: error.message, stage: error.stage, questions: [] });
+      return;
+    }
+    res.status(500).json({ error: "Failed to generate questions", questions: [] });
   }
 }
 
@@ -589,18 +693,38 @@ async function _resolveSessionLanguage(
   return topicGuess;
 }
 
-async function _generateSocraticJson<T>(prompt: string): Promise<T> {
-  return generateLlmJson<T>(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+async function _generateSummaryJson<T>(prompt: string): Promise<T> {
+  return generateLlmJson<T>(prompt, { timeoutMs: SUMMARY_OLLAMA_TIMEOUT_MS });
 }
 
-async function _generateSocraticText(prompt: string, lang: SupportedLanguage): Promise<string> {
+async function _generateSummaryText(prompt: string, lang: SupportedLanguage): Promise<string> {
   if (lang === "ta") {
-    return generateTamilResponse(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+    return generateTamilResponse(prompt, { timeoutMs: SUMMARY_OLLAMA_TIMEOUT_MS });
   }
   if (lang === "te") {
-    return generateTeluguResponse(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+    return generateTeluguResponse(prompt, { timeoutMs: SUMMARY_OLLAMA_TIMEOUT_MS });
   }
-  return generateLlmResponse(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+  return generateLlmResponse(prompt, { timeoutMs: SUMMARY_OLLAMA_TIMEOUT_MS });
+}
+
+async function _generateQuestionBankJson<T>(prompt: string): Promise<T> {
+  return generateLlmJson<T>(prompt, { timeoutMs: NO_OLLAMA_TIMEOUT_MS });
+}
+
+async function _generateQuestionBankText(prompt: string, lang: SupportedLanguage): Promise<string> {
+  if (lang === "ta") {
+    return generateTamilResponse(prompt, { timeoutMs: NO_OLLAMA_TIMEOUT_MS });
+  }
+  if (lang === "te") {
+    return generateTeluguResponse(prompt, { timeoutMs: NO_OLLAMA_TIMEOUT_MS });
+  }
+  return generateLlmResponse(prompt, { timeoutMs: NO_OLLAMA_TIMEOUT_MS });
+}
+
+async function _buildQuestionBankWithBudget(
+  input: QuestionBankRequest,
+): Promise<SocraticQuestion[]> {
+  return _buildQuestionBank(input);
 }
 
 // ── custom + fallback summary builders ───────────────────────────────────────
@@ -621,7 +745,7 @@ async function _buildCustomTopicSummary(
 
   try {
     const generated =
-      await _generateSocraticJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
+      await _generateSummaryJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
     const normalized = _normalizeSummary(generated);
     // Accept the LLM response as long as it has real content — don't discard on word count alone.
     if (normalized.intro.length >= 20 && normalized.content.length >= 60) {
@@ -646,7 +770,7 @@ async function _buildCustomTopicSummary(
       lang: lang as SocraticPromptLanguage,
     });
 
-    const raw = await _generateSocraticText(textPrompt, lang);
+    const raw = await _generateSummaryText(textPrompt, lang);
 
     if (raw && raw.trim().length >= 40) {
       const shape = _textToSummaryShape(raw, topic, lang);
@@ -742,8 +866,8 @@ function _buildQuestionFacts(
     const lowered = compacted.toLowerCase();
     if (
       summaryFacts.some((existing) => existing.toLowerCase() === lowered) ||
-      exerciseFacts.some((existing) =>
-        existing.slice(EXERCISE_FACT_TAG.length).toLowerCase() === lowered,
+      exerciseFacts.some(
+        (existing) => existing.slice(EXERCISE_FACT_TAG.length).toLowerCase() === lowered,
       )
     ) {
       continue;
@@ -842,7 +966,7 @@ function _isNearDuplicateQuestion(
     // Two questions with the exact same correct-answer token signature are
     // almost always the same fact rephrased. Block unless their stems are
     // visibly different (which would imply a genuine new angle).
-    if (sameAnswerSignature && stemSimilarity >= 0.20) {
+    if (sameAnswerSignature && stemSimilarity >= 0.2) {
       return true;
     }
 
@@ -1128,7 +1252,7 @@ async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQ
     );
 
     try {
-      const generated = await _generateSocraticJson<{ questions: SocraticQuestion[] }>(prompt);
+      const generated = await _generateQuestionBankJson<{ questions: SocraticQuestion[] }>(prompt);
       const normalized = _normalizeQuestions(generated.questions, batchSize, input.lang);
       collected = _mergeQuestions(collected, normalized, targetCount, input.lang);
       if (collected.length >= targetCount) {
@@ -1140,7 +1264,7 @@ async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQ
     }
 
     try {
-      const raw = await _generateSocraticText(prompt, input.lang);
+      const raw = await _generateQuestionBankText(prompt, input.lang);
       const parsed = _parseQuestionEnvelope(raw);
       if (parsed) {
         const normalized = _normalizeQuestions(parsed.questions, batchSize, input.lang);
@@ -1769,7 +1893,7 @@ async function _fallbackQuestions(
   );
 
   try {
-    const raw = await _generateSocraticText(prompt, input.lang);
+    const raw = await _generateQuestionBankText(prompt, input.lang);
     const parsed = _parseQuestionEnvelope(raw);
     if (parsed) {
       const normalized = _normalizeQuestions(parsed.questions, remaining, input.lang);

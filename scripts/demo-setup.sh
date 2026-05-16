@@ -3,8 +3,8 @@
 # Arivonriyam — one-command demo setup
 #
 # What this does (idempotent — safe to re-run):
-#   1. Verifies prerequisites: node, pnpm, uv, ollama, tesseract (+ eng/tam/tel), and Postgres access
-#      (Bruno CLI is optional — warns only if absent.)
+#   1. Verifies prerequisites: node, pnpm, uv, ollama, tesseract (+ eng/tam/tel),
+#      cmake, git, and Postgres access. (Bruno CLI is optional — warns only.)
 #   2. Ensures Ollama is running and `gemma4:latest` is pulled
 #   3. Creates the `arivonriyam_rag` Postgres DB + required extensions
 #   4. Ensures runtime tables exist for school setup, alerts, and reteach state
@@ -13,7 +13,9 @@
 #   7. `pnpm install` at the repo root
 #   8. `uv sync` inside packages/ingestion
 #   9. Pre-downloads BGE-M3 + YOLO + Table-Transformer (offline cache)
-#  10. Stages repo-root PDFs under packages/ingestion/data/pdfs
+#  10. Clones, builds, and downloads the model for whisper.cpp
+#      (speech-to-text). Size via WHISPER_MODEL_SIZE (default "small").
+#  11. Stages repo-root PDFs under packages/ingestion/data/pdfs
 #
 # NOTE: This script does NOT run ingestion. Run it manually per demo.md:
 #   cd packages/ingestion && uv run python src/main.py ingest --no-questions
@@ -79,6 +81,29 @@ require_or_install() {
       elif [[ "$os" == "Linux" ]]; then
         curl -fsSL https://ollama.com/install.sh | sh \
           || warn "ollama installer exited non-zero"
+      else
+        warn "Unsupported OS '$os' for auto-install. Install manually: $install_hint"
+      fi
+      ;;
+    cmake)
+      # Required to build whisper.cpp from source.
+      log "cmake is going to be installed (needed to build whisper.cpp for speech-to-text)."
+      if [[ "$os" == "Darwin" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+          brew install cmake || warn "brew install cmake failed"
+        else
+          warn "Homebrew not present. Install cmake manually: $install_hint"
+        fi
+      elif [[ "$os" == "Linux" ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update -y && sudo apt-get install -y cmake build-essential \
+            || warn "apt-get install cmake build-essential failed"
+        elif command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y cmake gcc-c++ make \
+            || warn "dnf install cmake failed"
+        else
+          warn "No supported package manager. Install cmake manually: $install_hint"
+        fi
       else
         warn "Unsupported OS '$os' for auto-install. Install manually: $install_hint"
       fi
@@ -316,6 +341,68 @@ seed_demo_data() {
   ok "Sample school + roster seeded"
 }
 
+# Bring whisper.cpp to a runnable state: clone if missing, build if the
+# whisper-cli binary is missing, and download the ggml model file the
+# server expects. Idempotent — re-running this skips work already done.
+setup_whisper() {
+  local whisper_root="$REPO_ROOT/whisper.cpp"
+  local whisper_exec="$whisper_root/build/bin/whisper-cli"
+  local model_file="$whisper_root/models/ggml-${WHISPER_MODEL_SIZE}.bin"
+
+  # 1. clone if the directory is empty / missing
+  if [[ ! -f "$whisper_root/CMakeLists.txt" ]]; then
+    log "Cloning whisper.cpp into $whisper_root..."
+    rm -rf "$whisper_root"
+    git clone --depth 1 "$WHISPER_REPO_URL" "$whisper_root" \
+      || fail "git clone of whisper.cpp failed. Check network and re-run."
+    ok "whisper.cpp source cloned"
+  else
+    ok "whisper.cpp source already present"
+  fi
+
+  # 2. build the whisper-cli binary if missing
+  if [[ -x "$whisper_exec" ]]; then
+    ok "whisper-cli already built at $whisper_exec"
+  else
+    log "Building whisper.cpp (cmake + make — this can take a few minutes)..."
+    (
+      cd "$whisper_root" \
+        && cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null \
+        && cmake --build build --config Release -j"$(_cpu_count)" >/dev/null
+    ) || fail "whisper.cpp build failed. Re-run with verbose output: cd packages/whisper.cpp && cmake -B build && cmake --build build -j"
+    [[ -x "$whisper_exec" ]] \
+      || fail "Build finished but $whisper_exec is missing — check the build log."
+    ok "whisper-cli built: $whisper_exec"
+  fi
+
+  # 3. download the ggml model
+  if [[ -f "$model_file" ]]; then
+    ok "Whisper model already present: $model_file"
+  else
+    log "Downloading Whisper ggml-${WHISPER_MODEL_SIZE} model (one-time)..."
+    if [[ ! -x "$whisper_root/models/download-ggml-model.sh" ]]; then
+      chmod +x "$whisper_root/models/download-ggml-model.sh" 2>/dev/null || true
+    fi
+    (
+      cd "$whisper_root/models" \
+        && bash ./download-ggml-model.sh "$WHISPER_MODEL_SIZE"
+    ) || fail "Failed to download Whisper model ggml-${WHISPER_MODEL_SIZE}.bin. Check network."
+    [[ -f "$model_file" ]] \
+      || fail "Download script ran but $model_file is missing. Try a different WHISPER_MODEL_SIZE."
+    ok "Whisper model ready: $model_file"
+  fi
+}
+
+_cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  elif command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.ncpu 2>/dev/null || echo 4
+  else
+    echo 4
+  fi
+}
+
 stage_repo_pdfs() {
   local source_count="0"
 
@@ -352,7 +439,20 @@ PG_PORT="${PG_PORT:-5432}"
 PG_DB="${PG_DB:-arivonriyam_rag}"
 
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:latest}"
-INGEST_FLAGS="${INGEST_FLAGS:---no-questions}"
+# Default matches packages/ingestion/src/ingest.py — questions are generated
+# (its internal default is generate_questions=True). Leave empty so the
+# CLI uses that default. 
+#Override with INGEST_FLAGS=--no-questions for a
+# faster, retrieval-only ingest.``
+INGEST_FLAGS="${INGEST_FLAGS:-}"
+
+# Speech-to-text via whisper.cpp. Valid sizes: tiny | base | small | medium |
+# large-v2. Default is "large-v2" (~3 GB) for best Tamil/Telugu/English
+# accuracy — override with WHISPER_MODEL_SIZE=small for faster downloads.
+# Language: "auto" lets whisper detect Tamil / English / Telugu per utterance.
+WHISPER_MODEL_SIZE="${WHISPER_MODEL_SIZE:-large-v2}"
+WHISPER_LANGUAGE="${WHISPER_LANGUAGE:-auto}"
+WHISPER_REPO_URL="${WHISPER_REPO_URL:-https://github.com/ggerganov/whisper.cpp.git}"
 
 DOCKER_POSTGRES_CONTAINER="${DOCKER_POSTGRES_CONTAINER:-arivonriyam-pg}"
 DOCKER_POSTGRES_PASSWORD="${DOCKER_POSTGRES_PASSWORD:-arivonriyam}"
@@ -380,6 +480,8 @@ require_or_install uv        "curl -LsSf https://astral.sh/uv/install.sh | sh"
 require_or_install ollama    "https://ollama.com/download"
 require_or_install tesseract "macOS: brew install tesseract tesseract-lang  |  Debian/Ubuntu: sudo apt-get install tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam tesseract-ocr-tel"
 ensure_tesseract_langs
+require_or_install cmake     "macOS: brew install cmake  |  Debian/Ubuntu: sudo apt-get install cmake build-essential"
+require git "https://git-scm.com/downloads"
 check_bruno
 
 if [[ "$USE_DOCKER_POSTGRES" == "1" ]]; then
@@ -505,6 +607,8 @@ PORT=9012
 OLLAMA_BASE_URL=http://localhost:11434/
 OLLAMA_MODEL=$OLLAMA_MODEL
 PG_DSN=$PG_DSN
+WHISPER_MODEL_SIZE=$WHISPER_MODEL_SIZE
+WHISPER_LANGUAGE=$WHISPER_LANGUAGE
 EOF
   ok "Server .env written"
 fi
@@ -539,7 +643,12 @@ log "Pre-downloading ML models for offline use (~3.7 GB, one-time)..."
 (cd packages/ingestion && uv run python download_models.py)
 ok "ML models cached under ~/.cache/huggingface/hub/"
 
-# --- 8. stage PDFs (no auto-ingest) ---------------------------------------
+# --- 8. whisper.cpp (speech-to-text) --------------------------------------
+
+log "Setting up whisper.cpp (speech-to-text) — model size: $WHISPER_MODEL_SIZE"
+setup_whisper
+
+# --- 9. stage PDFs (no auto-ingest) ---------------------------------------
 
 log "Staging textbook PDFs from repo source for manual ingestion..."
 stage_repo_pdfs
@@ -552,18 +661,24 @@ else
   ok "Staged $PDF_COUNT PDF(s) under $PDF_TARGET_DIR — ready for manual ingestion."
 fi
 
-# --- 9. final summary ------------------------------------------------------
+# --- 10. final summary -----------------------------------------------------
 
 log "----------------------------------------------------------------"
 ok  "Setup complete. (Ingestion has NOT been run — do it manually.)"
+ok  "Speech-to-text ready (whisper.cpp, model: $WHISPER_MODEL_SIZE)."
 log ""
 log "Next steps — follow demo.md for the full judge walkthrough:"
 log "  1. Start the dev servers:"
 log "       pnpm dev          # client on http://localhost:5173, server on :9012"
 log ""
-log "  2. Run ingestion manually from the repo root:"
-log "       cd packages/ingestion && uv run python src/main.py ingest $INGEST_FLAGS"
-log "     (class-only: cd packages/ingestion && uv run python src/main.py ingest --class class_3 --no-questions)"
+log "  2. Run ingestion manually from the repo root (questions generated by default):"
+if [[ -n "${INGEST_FLAGS:-}" ]]; then
+  log "       cd packages/ingestion && uv run python src/main.py ingest $INGEST_FLAGS"
+else
+  log "       cd packages/ingestion && uv run python src/main.py ingest"
+fi
+log "     (faster, retrieval-only: append --no-questions)"
+log "     (class-only:              append --class class_3)"
 log ""
 if [[ "$SEED_DEMO_DATA" == "1" ]]; then
   log "Sample school + roster were auto-seeded because SEED_DEMO_DATA=1 was set."

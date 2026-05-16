@@ -1,5 +1,6 @@
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AppError } from "../lib/errors";
 
 const repoMocks = vi.hoisted(() => ({
   generateLlmJson: vi.fn(),
@@ -114,6 +115,10 @@ describe("socratic summarize smoke", () => {
     repoMocks.generateLlmJson.mockResolvedValue(JSON.parse(envelope));
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("returns expected response shape for curriculum summarize", async () => {
     const response = await request(createApp()).post("/api/socratic/summarize").send({
       topic: "Fractions",
@@ -137,5 +142,84 @@ describe("socratic summarize smoke", () => {
     expect(Array.isArray(response.body.questions)).toBe(true);
     expect(response.body.questions.length).toBeGreaterThanOrEqual(5);
     expect(response.body.chunks_used).toBeGreaterThan(0);
+  });
+
+  it("fails the summarize request when question generation fails", async () => {
+    const timeoutError = new AppError("Ollama did not respond within 25 seconds.", 504, "ollama");
+
+    repoMocks.generateLlmJson.mockRejectedValue(timeoutError);
+    repoMocks.generateLlmResponse.mockRejectedValue(timeoutError);
+    repoMocks.generateTamilResponse.mockRejectedValue(timeoutError);
+    repoMocks.generateTeluguResponse.mockRejectedValue(timeoutError);
+
+    const response = await request(createApp()).post("/api/socratic/summarize").send({
+      topic: "Fractions",
+      subject: "Mathematics",
+      className: "class_5",
+      source: "curriculum",
+      studentCount: 1,
+    });
+
+    expect(response.status).toBe(504);
+    expect(response.body).toMatchObject({
+      error: "Ollama did not respond within 25 seconds.",
+      stage: "ollama",
+    });
+  });
+
+  it("returns the summary immediately when questions are deferred", async () => {
+    repoMocks.generateLlmJson.mockClear();
+    repoMocks.generateLlmResponse.mockClear();
+    repoMocks.generateTamilResponse.mockClear();
+    repoMocks.generateTeluguResponse.mockClear();
+
+    const response = await request(createApp()).post("/api/socratic/summarize").send({
+      topic: "Fractions",
+      subject: "Mathematics",
+      className: "class_5",
+      source: "curriculum",
+      studentCount: 1,
+      includeQuestions: false,
+    });
+
+    expect(response.status).toBe(200);
+    expect(Array.isArray(response.body.lines)).toBe(true);
+    expect(response.body.lines.length).toBeGreaterThan(0);
+    expect(response.body.questions).toEqual([]);
+    expect(repoMocks.generateLlmJson).not.toHaveBeenCalled();
+    expect(repoMocks.generateLlmResponse).not.toHaveBeenCalled();
+    expect(repoMocks.generateTamilResponse).not.toHaveBeenCalled();
+    expect(repoMocks.generateTeluguResponse).not.toHaveBeenCalled();
+  });
+
+  it("builds questions from an existing summary without regenerating it", async () => {
+    repoMocks.summarizeTopic.mockClear();
+
+    const response = await request(createApp())
+      .post("/api/socratic/questions")
+      .send({
+        topic: "Fractions",
+        subject: "Mathematics",
+        className: "class_5",
+        studentCount: 1,
+        language: "en",
+        summaryLines: [
+          "Fractions describe parts of a whole.",
+          "The denominator tells how many equal parts make the whole.",
+          "Equivalent fractions can show the same value.",
+        ],
+        exerciseChunks: [{ text: "Compare fractions using common denominators.", page: 4 }],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      language: "en",
+      classLevel: 5,
+      questionsPerStudent: 6,
+      studentCount: 1,
+    });
+    expect(Array.isArray(response.body.questions)).toBe(true);
+    expect(response.body.questions.length).toBeGreaterThanOrEqual(5);
+    expect(repoMocks.summarizeTopic).not.toHaveBeenCalled();
   });
 });

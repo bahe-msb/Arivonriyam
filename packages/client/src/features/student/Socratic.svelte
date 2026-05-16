@@ -41,6 +41,7 @@
     language?: SessionLanguage;
     images_base64?: string[];
     diagram_captions?: string[];
+    exercise_chunks?: Array<{ text: string; page: number }>;
   };
 
   type PreviewCard = {
@@ -80,7 +81,6 @@
   const PROGRESS_SEGMENTS = 6;
   const AUTO_ADVANCE_MS = 5000;
   const TABLET_STUDENT_BREAKPOINT = 835;
-  const SUMMARY_FETCH_TIMEOUT_MS = 360000;
   const SUMMARY_SEGMENT_WORD_LIMIT = 18;
   const SUMMARY_SEGMENT_SENTENCE_LIMIT = 2;
   type SocraticStudent = { id: string; name: string; emoji: string };
@@ -146,6 +146,7 @@
   let sessionAttempts = $state<SessionAttempt[]>([]);
   let summaryImages = $state<string[]>([]);
   let summaryDiagramCaptions = $state<string[]>([]);
+  let summaryExerciseChunks = $state<Array<{ text: string; page: number }>>([]);
 
   let questionPlan = $state<SessionTurn[]>([]);
   let autoAdvanceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -180,6 +181,11 @@
       Math.floor(turnIndex / Math.max(1, students.length)) + 1,
     ),
   );
+  const plannedRounds = $derived(
+    questionPlan.length > 0
+      ? Math.max(1, Math.ceil(questionPlan.length / Math.max(1, students.length)))
+      : QUESTIONS_PER_STUDENT,
+  );
   const progressStep = $derived(
     phase === "complete" ? totalQuestionCount : Math.min(qIdx + 1, totalQuestionCount),
   );
@@ -194,7 +200,7 @@
       ? summaryLines.slice(0, Math.max(1, summaryIdx + 1))
       : summaryLines,
   );
-  const blockedBySource = $derived(phase === "session" && questionPlan.length === 0);
+  const canSkipSummary = $derived(questionPlan.length > 0);
   const accent = $derived(cls?.color ?? "#6B94E7");
   const isFinalTurn = $derived(questionPlan.length > 0 && qIdx >= questionPlan.length - 1);
   const struggleCount = $derived(
@@ -406,180 +412,6 @@
     }
 
     return merged;
-  }
-
-  function fallbackFactCue(text: string, wordLimit = 12): string {
-    const words = text.split(/\s+/).filter(Boolean);
-    if (words.length <= wordLimit) return text;
-
-    const headCount = Math.ceil(wordLimit / 2);
-    const tailCount = Math.max(2, wordLimit - headCount - 1);
-    return `${words.slice(0, headCount).join(" ")} ... ${words.slice(-tailCount).join(" ")}`;
-  }
-
-  function fallbackQuestions(count: number): SessionQuestion[] {
-    const topicName = topic?.topic ?? "this topic";
-    const subjectName = topic?.subject ?? "Science";
-    const summaryFactPool = summaryLines
-      .map((line) => line.replace(/\s+/g, " ").trim())
-      .filter((line) => countWords(line) >= 5)
-      .filter(
-        (line) =>
-          !/question|option|tap|round|summary|session|mcq|கேள்வி|விருப்பம்|தொடு|சுருக்கம்|அமர்வு|ప్రశ్న|ఎంపిక|తాకి|సారాంశం|సెషన్/i.test(
-            line,
-          ),
-      )
-      .filter(
-        (line, idx, arr) => arr.findIndex((value) => value.toLowerCase() === line.toLowerCase()) === idx,
-      );
-
-    if (sessionLanguage === "ta") {
-      const facts = [
-        ...summaryFactPool,
-        `${topicName} எளிய ${subjectName} மொழியில் விளக்கப்படுகிறது.`,
-        `${topicName} அன்றாட உதாரணங்கள் மூலம் கற்றுக்கொள்ளப்படுகிறது.`,
-        `${topicName} கேள்விகளுக்கு ஒரு சரியான பதிலைத் தேர்ந்தெடுத்து விடை அளிக்க வேண்டும்.`,
-        `${topicName} புரிதல் பாடத்தில் உள்ள தகவலைச் சேர்த்து யோசிக்கும் போது மேம்படும்.`,
-        `${topicName} இளம் கற்றவர்களுக்கு படிப்படியாக மறுபார்வை செய்யப்படுகிறது.`,
-        `${topicName} கேள்வியில் பதிலைத் தேர்வதற்கு முன் எல்லா விருப்பங்களையும் படிக்க வேண்டும்.`,
-      ].filter(
-        (fact, idx, arr) => arr.findIndex((value) => value.toLowerCase() === fact.toLowerCase()) === idx,
-      );
-
-      const questionTemplates = [
-        (cue: string) => `"${cue}" என்ற பாடக் குறிக்குறியுடன் பொருந்துவது எது?`,
-        (cue: string) => `${topicName} பற்றி "${cue}" என்ற தகவலுக்கு சரியான விடை எது?`,
-        (cue: string) => `இந்த ${subjectName} தலைப்பில் "${cue}" எனில் சரியான கூற்று எது?`,
-        (cue: string) => `${topicName} பாடத்தில் "${cue}" குறிக்கும் தகவல் எது?`,
-      ] as const;
-
-      const genericWrongs = [
-        `${topicName} என்பது ${subjectName} பாடத்தின் பகுதி அல்ல.`,
-        `${topicName} கேள்விகளை வகுப்பில் தவிர்க்க வேண்டும்.`,
-        `${topicName} கேள்விக்கு பதில் அளிக்க விருப்பங்களைப் படிக்கத் தேவையில்லை.`,
-        `${topicName} பற்றி யோசிக்காமல் எந்த விடையையும் தேர்ந்தெடுக்கலாம்.`,
-      ] as const;
-
-      return Array.from({ length: count }, (_, idx) => {
-        const correct = facts[idx % facts.length];
-        const template = questionTemplates[Math.floor(idx / Math.max(1, facts.length)) % questionTemplates.length];
-        const cue = fallbackFactCue(correct);
-        const wrong = facts
-          .filter((fact) => fact.toLowerCase() !== correct.toLowerCase())
-          .slice(idx % Math.max(1, facts.length), (idx % Math.max(1, facts.length)) + 3);
-
-        while (wrong.length < 3) {
-          const fallbackWrong = genericWrongs[(idx + wrong.length) % genericWrongs.length];
-          if (!wrong.includes(fallbackWrong)) wrong.push(fallbackWrong);
-        }
-
-        const { options, answerIndex } = buildOptions(correct, wrong, idx);
-        return {
-          q: template(cue),
-          options,
-          answerIndex,
-          explain: "இந்த விடை பாடத்தில் வந்த சரியான தகவலுடன் பொருந்துகிறது.",
-        };
-      });
-    }
-
-    if (sessionLanguage === "te") {
-      const facts = [
-        ...summaryFactPool,
-        `${topicName} ను సులభమైన ${subjectName} భాషలో వివరిస్తారు.`,
-        `${topicName} ను రోజువారీ ఉదాహరణలతో నేర్పుతారు.`,
-        `${topicName} ప్రశ్నలకు ఒక సరైన ఎంపికను ఎంచుకుని సమాధానం ఇవ్వాలి.`,
-        `${topicName} అర్థం పాఠంలోని నిజాలను కలిపి ఆలోచించినప్పుడు మెరుగుపడుతుంది.`,
-        `${topicName} ను చిన్న దశలుగా పునర్విమర్శిస్తారు.`,
-        `${topicName} లో సమాధానం ఎంచుకునే ముందు అన్ని ఎంపికలను చదవాలి.`,
-      ].filter(
-        (fact, idx, arr) => arr.findIndex((value) => value.toLowerCase() === fact.toLowerCase()) === idx,
-      );
-
-      const questionTemplates = [
-        (cue: string) => `"${cue}" అనే పాఠ సూచనకు సరిపోయేది ఏది?`,
-        (cue: string) => `${topicName} గురించి "${cue}" కు సరైన సమాధానం ఏది?`,
-        (cue: string) => `ఈ ${subjectName} అంశంలో "${cue}" కి సరైన వాక్యం ఏది?`,
-        (cue: string) => `${topicName} పాఠంలో "${cue}" సూచించే సమాచారం ఏది?`,
-      ] as const;
-
-      const genericWrongs = [
-        `${topicName} అనేది ${subjectName}లో భాగం కాదు.`,
-        `${topicName} ప్రశ్నలను తరగతిలో దాటవేయాలి.`,
-        `${topicName} ప్రశ్నలకు ఎంపికలు చదవకుండా సమాధానం ఇవ్వొచ్చు.`,
-        `${topicName} గురించి ఆలోచించకుండా ఏ ఎంపికనైనా ఎంచుకోవచ్చు.`,
-      ] as const;
-
-      return Array.from({ length: count }, (_, idx) => {
-        const correct = facts[idx % facts.length];
-        const template = questionTemplates[Math.floor(idx / Math.max(1, facts.length)) % questionTemplates.length];
-        const cue = fallbackFactCue(correct);
-        const wrong = facts
-          .filter((fact) => fact.toLowerCase() !== correct.toLowerCase())
-          .slice(idx % Math.max(1, facts.length), (idx % Math.max(1, facts.length)) + 3);
-
-        while (wrong.length < 3) {
-          const fallbackWrong = genericWrongs[(idx + wrong.length) % genericWrongs.length];
-          if (!wrong.includes(fallbackWrong)) wrong.push(fallbackWrong);
-        }
-
-        const { options, answerIndex } = buildOptions(correct, wrong, idx);
-        return {
-          q: template(cue),
-          options,
-          answerIndex,
-          explain: "ఈ సమాధానం పాఠంలోని సరైన సమాచారంతో సరిపోతుంది.",
-        };
-      });
-    }
-
-    const facts = [
-      ...summaryFactPool,
-      `${topicName} is explained in simple ${subjectName} language.`,
-      `${topicName} is learned through examples from daily life.`,
-      `${topicName} questions are answered by choosing one correct option.`,
-      `${topicName} understanding improves when we match answers with lesson facts.`,
-      `${topicName} is revised step by step for young learners.`,
-      `Students should read all options before choosing the answer in ${topicName}.`,
-    ].filter(
-      (fact, idx, arr) => arr.findIndex((value) => value.toLowerCase() === fact.toLowerCase()) === idx,
-    );
-
-    const questionTemplates = [
-      (cue: string) => `Which answer matches this lesson clue about ${topicName}: "${cue}"?`,
-      (cue: string) => `According to the ${subjectName} lesson on ${topicName}, which statement fits "${cue}"?`,
-      (cue: string) => `Choose the correct idea linked to this ${topicName} clue: "${cue}".`,
-      (cue: string) => `Which statement stays true for ${topicName} when the lesson says "${cue}"?`,
-    ] as const;
-
-    const genericWrongs = [
-      `${topicName} is not part of ${subjectName}.`,
-      `Students should skip ${topicName} questions in class.`,
-      `${topicName} can be answered without reading options.`,
-      `${topicName} does not need any lesson facts to answer correctly.`,
-    ] as const;
-
-    return Array.from({ length: count }, (_, idx) => {
-      const correct = facts[idx % facts.length];
-      const template = questionTemplates[Math.floor(idx / Math.max(1, facts.length)) % questionTemplates.length];
-      const cue = fallbackFactCue(correct);
-      const wrong = facts
-        .filter((fact) => fact.toLowerCase() !== correct.toLowerCase())
-        .slice(idx % Math.max(1, facts.length), (idx % Math.max(1, facts.length)) + 3);
-
-      while (wrong.length < 3) {
-        const fallbackWrong = genericWrongs[(idx + wrong.length) % genericWrongs.length];
-        if (!wrong.includes(fallbackWrong)) wrong.push(fallbackWrong);
-      }
-
-      const { options, answerIndex } = buildOptions(correct, wrong, idx);
-      return {
-        q: template(cue),
-        options,
-        answerIndex,
-        explain: "This answer matches the lesson detail for the topic.",
-      };
-    });
   }
 
   function buildSessionRequestBody(): Record<string, unknown> {
@@ -795,19 +627,6 @@
     return `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
-  function buildOptions(
-    correct: string,
-    wrong: readonly string[],
-    seed: number,
-  ): { options: string[]; answerIndex: number } {
-    const options = wrong.slice(0, 3).map((item) => item.trim());
-    while (options.length < 3) options.push("Not enough context available.");
-
-    const answerIndex = seed % 4;
-    options.splice(answerIndex, 0, correct.trim());
-    return { options, answerIndex };
-  }
-
   function normalizeQuestions(raw: unknown, expectedCount: number): SessionQuestion[] {
     if (!Array.isArray(raw)) return [];
 
@@ -859,21 +678,15 @@
   function buildQuestionPlan(questionBank: SessionQuestion[]): SessionTurn[] {
     const safeStudents = Math.max(1, students.length);
     const totalTurns = safeStudents * QUESTIONS_PER_STUDENT;
+    const sourceBank = mergeUniqueQuestions(questionBank, [], totalTurns).slice(0, totalTurns);
 
-    const uniqueBank = mergeUniqueQuestions(questionBank, [], totalTurns);
-    const sourceBank =
-      uniqueBank.length >= totalTurns
-        ? uniqueBank.slice(0, totalTurns)
-        : mergeUniqueQuestions(uniqueBank, fallbackQuestions(totalTurns), totalTurns);
-
-    if (sourceBank.length < totalTurns) return [];
+    if (sourceBank.length === 0) return [];
 
     const turns: SessionTurn[] = [];
-    for (let round = 0; round < QUESTIONS_PER_STUDENT; round += 1) {
+    for (let round = 0; round < QUESTIONS_PER_STUDENT && turns.length < sourceBank.length; round += 1) {
       for (let student = 0; student < safeStudents; student += 1) {
-        const bankIndex = student * QUESTIONS_PER_STUDENT + round;
-        const question = sourceBank[bankIndex];
-        if (!question) return [];
+        const question = sourceBank[turns.length];
+        if (!question) break;
 
         turns.push({
           ...question,
@@ -1100,6 +913,7 @@
   }
 
   function skipSummary(): void {
+    if (!canSkipSummary) return;
     finishSummaryPlayback(true);
   }
 
@@ -1115,55 +929,53 @@
     summaryLoading = true;
     summaryError = "";
 
-    const expectedTurns = Math.max(1, students.length) * QUESTIONS_PER_STUDENT;
     const requestBody = buildSessionRequestBody();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SUMMARY_FETCH_TIMEOUT_MS);
 
     try {
       const response = await fetch("/api/socratic/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
         body: JSON.stringify(requestBody),
       });
-      clearTimeout(timeout);
 
       if (response.ok) {
         const data = (await response.json()) as SummarizeResponse;
         sessionLanguage = normalizeLanguage(data.language);
         const lines = normalizeSummaryLines(
           Array.isArray(data.lines)
-          ? data.lines.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
+            ? data.lines.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
           : [],
         );
+        const expectedTurns = Math.max(1, students.length) * QUESTIONS_PER_STUDENT;
         const normalizedPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
-
         if (topic?.source === "custom") {
-          if (lines.length === 0) {
+          if (lines.length === 0 || normalizedPlan.length === 0) {
             summaryError = typeof data.error === "string" && data.error.trim()
               ? data.error
-              : customTopicLoadErrorMessage();
+              : lines.length === 0
+                ? customTopicLoadErrorMessage()
+                : sessionLanguage === "ta"
+                  ? "MCQகள் தயாராகவில்லை. மீண்டும் முயற்சிக்கவும்."
+                  : sessionLanguage === "te"
+                    ? "MCQలు సిద్ధం కాలేదు. దయచేసి మళ్లీ ప్రయత్నించండి."
+                    : "MCQs could not be prepared. Please try again.";
             summaryLines = normalizeSummaryLines([summaryError]);
             questionPlan = [];
           } else {
             summaryLines = lines;
             questionPlan = normalizedPlan;
-            if (questionPlan.length === 0) {
-              questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
-            }
-            if (questionPlan.length === 0) {
-              summaryError = typeof data.error === "string" && data.error.trim()
-                ? data.error
-                : customTopicLoadErrorMessage();
-              summaryLines = normalizeSummaryLines([summaryError]);
-            }
           }
         } else {
           summaryLines = lines.length > 0 ? lines : normalizeSummaryLines(fallbackLines());
           questionPlan = normalizedPlan;
-          if (questionPlan.length === 0) {
-            questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+          if (normalizedPlan.length === 0) {
+            summaryError = typeof data.error === "string" && data.error.trim()
+              ? data.error
+              : sessionLanguage === "ta"
+                ? "MCQகள் தயாராகவில்லை. மீண்டும் முயற்சிக்கவும்."
+                : sessionLanguage === "te"
+                  ? "MCQలు సిద్ధం కాలేదు. దయచేసి మళ్లీ ప్రయత్నించండి."
+                  : "MCQs could not be prepared. Please try again.";
           }
         }
 
@@ -1176,6 +988,12 @@
               (caption): caption is string => typeof caption === "string" && caption.trim().length > 0,
             )
           : [];
+        summaryExerciseChunks = Array.isArray(data.exercise_chunks)
+          ? data.exercise_chunks.filter(
+              (chunk): chunk is { text: string; page: number } =>
+                !!chunk && typeof chunk.text === "string" && chunk.text.trim().length > 0,
+            )
+          : [];
       } else {
         const data = (await response.json().catch(() => ({}))) as SummarizeResponse;
         sessionLanguage = normalizeLanguage(data.language ?? sessionLanguage);
@@ -1186,6 +1004,7 @@
           summaryLines = normalizeSummaryLines([apiError || customTopicLoadErrorMessage()]);
           summaryImages = [];
           summaryDiagramCaptions = [];
+          summaryExerciseChunks = [];
           questionPlan = [];
         } else {
           summaryLines = normalizeSummaryLines([
@@ -1194,26 +1013,20 @@
           ]);
           questionPlan = [];
           summaryDiagramCaptions = [];
+          summaryExerciseChunks = [];
         }
       }
     } catch (error) {
-      clearTimeout(timeout);
-      const isAbort = error instanceof Error && error.name === "AbortError";
-      summaryError = isAbort
-        ? sessionLanguage === "ta"
-          ? "AI சுருக்கம் தயாரிக்க அதிக நேரம் எடுத்துக்கொண்டது. மீண்டும் முயற்சிக்கவும்."
-          : sessionLanguage === "te"
-            ? "AI సారాంశం సిద్ధం చేయడానికి ఎక్కువ సమయం తీసుకుంది. దయచేసి మళ్లీ ప్రయత్నించండి."
-          : "AI took too long to prepare the summary. Please try again."
-        : sessionLanguage === "ta"
-          ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
-          : sessionLanguage === "te"
-            ? "సారాంశాన్ని లోడ్ చేస్తున్నప్పుడు నెట్‌వర్క్ సమస్య వచ్చింది."
+      summaryError = sessionLanguage === "ta"
+        ? "சுருக்கத்தை ஏற்றும்போது வலைப்பின்னல் சிக்கல் ஏற்பட்டது."
+        : sessionLanguage === "te"
+          ? "సారాంశాన్ని లోడ్ చేస్తున్నప్పుడు నెట్‌వర్క్ సమస్య వచ్చింది."
           : "Network issue while loading summary.";
       if (topic?.source === "custom") {
         summaryLines = normalizeSummaryLines([summaryError || customTopicLoadErrorMessage()]);
         summaryImages = [];
         summaryDiagramCaptions = [];
+        summaryExerciseChunks = [];
         questionPlan = [];
       } else {
         summaryLines = normalizeSummaryLines([
@@ -1222,6 +1035,7 @@
         ]);
         questionPlan = [];
         summaryDiagramCaptions = [];
+        summaryExerciseChunks = [];
       }
     }
 
@@ -1253,6 +1067,7 @@
     sessionAttempts = [];
     summaryImages = [];
     summaryDiagramCaptions = [];
+    summaryExerciseChunks = [];
     questionPlan = [];
     resetTurnState();
 
@@ -1290,6 +1105,7 @@
     summaryPreviewCards = [];
     sessionId = "";
     sessionAttempts = [];
+    summaryExerciseChunks = [];
     questionPlan = [];
     resetTurnState();
   }
@@ -1764,7 +1580,7 @@
                 AI is thinking...
               </div>
               <div class="text-[14px] max-w-100" style="color:var(--text-secondary);">
-                Generating summary, images, and MCQ questions. This may take a moment.
+                Generating the summary and MCQ questions together. This may take a moment.
               </div>
               <div class="flex items-center gap-2">
                 <div class="size-2 animate-bounce rounded-full" style="background:{accent};"></div>
@@ -1774,14 +1590,14 @@
             </div>
 
           {:else if phase === "ready"}
-            {#if summaryError && questionPlan.length === 0}
+            {#if summaryError || questionPlan.length === 0}
               <div class="flex flex-1 flex-col items-center justify-center gap-5 px-10 py-10 text-center">
                 <div class="text-[48px]">⚠️</div>
                 <div class="text-[24px] font-semibold" style="color:var(--ink);">
                   Could not prepare this topic
                 </div>
                 <div class="max-w-110 text-[14px] leading-[1.7]" style="color:var(--text-secondary);">
-                  {summaryError}
+                  {summaryError || "The summary or MCQ questions could not be prepared."}
                 </div>
                 <div class="flex flex-wrap items-center justify-center gap-3">
                   <button
@@ -1987,8 +1803,12 @@
                   <button
                     type="button"
                     onclick={skipSummary}
-                    class="mt-2 cursor-pointer rounded-xl px-4 py-2 text-[12px] font-semibold"
-                    style="color:{accent}; background:{accent}12;"
+                    disabled={!canSkipSummary}
+                    title={!canSkipSummary ? "Skip is available after MCQs are ready." : undefined}
+                    class="mt-2 rounded-xl px-4 py-2 text-[12px] font-semibold disabled:cursor-not-allowed disabled:opacity-70"
+                    style={canSkipSummary
+                      ? `color:${accent}; background:${accent}12;`
+                      : "color:rgba(100,116,139,0.65); background:rgba(148,163,184,0.12);"}
                   >
                     Skip to MCQ
                   </button>
@@ -1996,23 +1816,15 @@
               </div>
             </div>
 
-          {:else if blockedBySource}
+          {:else if questionPlan.length === 0}
             <div class="flex flex-1 flex-col items-center justify-center gap-4 px-8 text-center">
-              <div class="text-[24px]">📚</div>
+              <div class="text-[24px]">⚠️</div>
               <div class="text-[20px] font-semibold" style="color:var(--ink);">
-                Textbook content required
+                Could not prepare this topic
               </div>
               <div class="max-w-120 text-[13px] leading-relaxed" style="color:var(--text-secondary);">
-                {summaryError || "No vectorized textbook chunks were found for this class topic."}
+                {summaryError || "The summary or MCQ questions could not be prepared."}
               </div>
-              <button
-                type="button"
-                onclick={() => goto(resolve("/student/topic"))}
-                class="cursor-pointer rounded-xl px-5 py-2 text-[13px] font-semibold text-white"
-                style="background:{accent};"
-              >
-                Pick textbook topic
-              </button>
             </div>
 
           {:else if phase === "complete"}
@@ -2031,7 +1843,7 @@
               </div>
               <div class="flex flex-wrap items-center justify-center gap-2.5">
                 <Pill tone="cobalt">{totalQuestionCount} of {totalQuestionCount} questions done</Pill>
-                <Pill tone="success">Round {QUESTIONS_PER_STUDENT} of {QUESTIONS_PER_STUDENT}</Pill>
+                <Pill tone="success">Round {plannedRounds} of {plannedRounds}</Pill>
               </div>
             </div>
 
@@ -2302,8 +2114,12 @@
               <button
                 type="button"
                 onclick={skipSummary}
-                class="mt-3 shrink-0 cursor-pointer rounded-xl px-3 py-2 text-[11px] font-semibold"
-                style="background:{accent}12; color:{accent};"
+                disabled={!canSkipSummary}
+                title={!canSkipSummary ? "Skip is available after MCQs are ready." : undefined}
+                class="mt-3 shrink-0 rounded-xl px-3 py-2 text-[11px] font-semibold disabled:cursor-not-allowed disabled:opacity-70"
+                style={canSkipSummary
+                  ? `background:${accent}12; color:${accent};`
+                  : "color:rgba(100,116,139,0.65); background:rgba(148,163,184,0.12);"}
               >
                 Skip summary
               </button>
@@ -2393,7 +2209,7 @@
               </div>
             {:else}
               <div class="text-center text-[10px]" style="color:var(--text-secondary);">
-                {QUESTIONS_PER_STUDENT} questions each for {students.length} students.
+                Up to {QUESTIONS_PER_STUDENT} questions each for {students.length} students.
               </div>
             {/if}
           </div>
@@ -2414,7 +2230,7 @@
         <div class="flex items-center gap-1.5 text-[12px]" style="color:var(--text-secondary);">
           <RotateCcw class="size-3 opacity-60" />
           <span>
-            Round <strong style="color:var(--ink);">{roundNum}</strong> of {QUESTIONS_PER_STUDENT}
+            Round <strong style="color:var(--ink);">{roundNum}</strong> of {plannedRounds}
           </span>
         </div>
         <div class="flex-1"></div>
@@ -2516,7 +2332,7 @@
       <div class="animate-pulse text-[48px]">🧠</div>
       <div class="text-[24px] font-semibold text-white">AI is thinking...</div>
       <div class="text-[14px]" style="color:rgba(255,255,255,0.5);">
-        Generating summary, images, and questions.
+        Generating the summary and MCQ questions together.
       </div>
       <div class="flex items-center gap-2">
         <div class="size-2 animate-bounce rounded-full" style="background:{accent};"></div>
@@ -2526,12 +2342,12 @@
     </div>
 
   {:else if phase === "ready"}
-    {#if summaryError && questionPlan.length === 0}
+    {#if summaryError || questionPlan.length === 0}
       <div class="flex flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
         <div class="text-[48px]">⚠️</div>
         <div class="text-[24px] font-semibold text-white">Could not prepare this topic</div>
         <div class="text-[14px] max-w-sm leading-[1.7]" style="color:rgba(255,255,255,0.58);">
-          {summaryError}
+          {summaryError || "The summary or MCQ questions could not be prepared."}
         </div>
         <button
           type="button"
@@ -2547,7 +2363,7 @@
         <div class="text-[48px]">✅</div>
         <div class="text-[24px] font-semibold text-white">Ready!</div>
         <div class="text-[14px]" style="color:rgba(255,255,255,0.55);">
-          {summaryLines.length} sections, {questionPlan.length} questions preloaded.
+          {summaryLines.length} sections and {questionPlan.length} questions are ready.
         </div>
         <button
           type="button"
@@ -2697,8 +2513,12 @@
           <button
             type="button"
             onclick={skipSummary}
-            class="mt-2 cursor-pointer rounded-xl px-4 py-2 text-[12px] font-semibold"
-            style="color:{accent}; background:white;"
+            disabled={!canSkipSummary}
+            title={!canSkipSummary ? "Skip is available after MCQs are ready." : undefined}
+            class="mt-2 rounded-xl px-4 py-2 text-[12px] font-semibold disabled:cursor-not-allowed disabled:opacity-70"
+            style={canSkipSummary
+              ? `color:${accent}; background:white;`
+              : "color:rgba(100,116,139,0.65); background:rgba(255,255,255,0.68);"}
           >
             Skip to MCQ
           </button>
@@ -2723,7 +2543,7 @@
           {totalQuestionCount} of {totalQuestionCount} done
         </div>
         <div class="rounded-full px-3 py-1.5 text-[12px] font-semibold" style="background:{accent}22; color:white;">
-          Round {QUESTIONS_PER_STUDENT} of {QUESTIONS_PER_STUDENT}
+          Round {plannedRounds} of {plannedRounds}
         </div>
       </div>
     </div>
@@ -2743,21 +2563,13 @@
       style="background:var(--ivory);"
     >
       <div class="flex flex-1 flex-col overflow-y-auto p-5">
-        {#if blockedBySource}
+        {#if questionPlan.length === 0}
           <div class="flex flex-1 flex-col items-center justify-center gap-4 text-center">
-            <div class="text-[24px]">📚</div>
-            <div class="text-[18px] font-semibold" style="color:var(--ink);">Textbook topic required</div>
+            <div class="text-[24px]">⚠️</div>
+            <div class="text-[18px] font-semibold" style="color:var(--ink);">Could not prepare this topic</div>
             <div class="text-[13px]" style="color:var(--text-secondary);">
-              {summaryError || "No vectorized textbook chunks found for this topic."}
+              {summaryError || "The summary or MCQ questions could not be prepared."}
             </div>
-            <button
-              type="button"
-              onclick={() => goto(resolve("/student/topic"))}
-              class="cursor-pointer rounded-xl px-4 py-2 text-[13px] font-semibold text-white"
-              style="background:{accent};"
-            >
-              Pick class topic
-            </button>
           </div>
         {:else}
           <div

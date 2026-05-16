@@ -11,7 +11,9 @@ interface OllamaCallOptions {
 
 const DEFAULT_OLLAMA_TIMEOUT_MS = 45_000;
 
-function resolveTimeoutMs(timeoutMs?: number): number {
+function resolveTimeoutMs(timeoutMs?: number): number | null {
+  if (timeoutMs === 0) return null;
+
   return Number.isFinite(timeoutMs) && Number(timeoutMs) > 0
     ? Math.floor(Number(timeoutMs))
     : DEFAULT_OLLAMA_TIMEOUT_MS;
@@ -24,7 +26,7 @@ async function callOllama(
   let response: Response;
   const controller = new AbortController();
   const timeoutMs = resolveTimeoutMs(options.timeoutMs);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = timeoutMs === null ? null : setTimeout(() => controller.abort(), timeoutMs);
   const baseUrl = env.ollamaBaseUrl.replace(/\/+$/, "");
 
   try {
@@ -35,10 +37,10 @@ async function callOllama(
       body: JSON.stringify({ model: env.ollamaModel, stream: false, ...body }),
     });
   } catch (error) {
-    clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
     if (error instanceof Error && error.name === "AbortError") {
       throw new AppError(
-        `Ollama did not respond within ${Math.round(timeoutMs / 1000)} seconds.`,
+        `Ollama did not respond within ${Math.round((timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS) / 1000)} seconds.`,
         504,
         "ollama",
       );
@@ -50,7 +52,7 @@ async function callOllama(
     );
   }
 
-  clearTimeout(timeout);
+  if (timeout !== null) clearTimeout(timeout);
 
   if (!response.ok) {
     throw new AppError(

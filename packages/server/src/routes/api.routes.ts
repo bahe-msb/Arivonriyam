@@ -12,6 +12,7 @@ import {
   getReportPerformance,
   postAlertsSession,
   postSocraticAlertSuggestion,
+  postSocraticQuestions,
   postSocraticPreview,
   postLessonBlueprint,
   postReteachState,
@@ -51,6 +52,7 @@ export function createApiRouter(): Router {
 
   // Socratic
   router.post("/api/socratic/alerts/suggestion", postSocraticAlertSuggestion);
+  router.post("/api/socratic/questions", postSocraticQuestions);
   router.post("/api/socratic/preview", postSocraticPreview);
   router.post("/api/socratic/summarize", postSocraticSummarize);
 

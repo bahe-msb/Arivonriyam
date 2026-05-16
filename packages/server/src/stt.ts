@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "util";
 import { env } from "./config";
+import { SUPPORTED_WHISPER_LANGUAGES, type WhisperLanguage } from "./config/env";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -25,6 +26,7 @@ function getWhisperModelPath(modelName: string): string {
 }
 
 export interface TranscribeOptions {
+  /** "auto" | "ta" | "en" | "te". Anything else is normalized to "auto". */
   sourceLanguage?: string;
   translateToEnglish?: boolean;
   modelName?: "base" | "small" | "large-v2";
@@ -32,12 +34,19 @@ export interface TranscribeOptions {
   bestOf?: number;
 }
 
+function normalizeLang(raw: string | undefined): WhisperLanguage {
+  const v = (raw ?? "").trim().toLowerCase();
+  return (SUPPORTED_WHISPER_LANGUAGES as readonly string[]).includes(v)
+    ? (v as WhisperLanguage)
+    : "auto";
+}
+
 /** Transcribes speech from a local audio file with whisper.cpp. */
 export async function transcribeAudio(
   audioPath: string,
   options: TranscribeOptions = {},
 ): Promise<string> {
-  const sourceLanguage = options.sourceLanguage ?? env.whisperLanguage;
+  const sourceLanguage = normalizeLang(options.sourceLanguage ?? env.whisperLanguage);
   const translateToEnglish = options.translateToEnglish ?? false;
   const beamSize = options.beamSize ?? 5;
   const bestOf = options.bestOf ?? 5;
