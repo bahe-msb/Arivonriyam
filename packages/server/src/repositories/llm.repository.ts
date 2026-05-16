@@ -5,12 +5,26 @@ interface OllamaResponse {
   response?: string;
 }
 
-const OLLAMA_TIMEOUT_MS = 45_000;
+interface OllamaCallOptions {
+  timeoutMs?: number;
+}
 
-async function callOllama(body: Record<string, unknown>): Promise<string> {
+const DEFAULT_OLLAMA_TIMEOUT_MS = 45_000;
+
+function resolveTimeoutMs(timeoutMs?: number): number {
+  return Number.isFinite(timeoutMs) && Number(timeoutMs) > 0
+    ? Math.floor(Number(timeoutMs))
+    : DEFAULT_OLLAMA_TIMEOUT_MS;
+}
+
+async function callOllama(
+  body: Record<string, unknown>,
+  options: OllamaCallOptions = {},
+): Promise<string> {
   let response: Response;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+  const timeoutMs = resolveTimeoutMs(options.timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const baseUrl = env.ollamaBaseUrl.replace(/\/+$/, "");
 
   try {
@@ -24,7 +38,7 @@ async function callOllama(body: Record<string, unknown>): Promise<string> {
     clearTimeout(timeout);
     if (error instanceof Error && error.name === "AbortError") {
       throw new AppError(
-        `Ollama did not respond within ${Math.round(OLLAMA_TIMEOUT_MS / 1000)} seconds.`,
+        `Ollama did not respond within ${Math.round(timeoutMs / 1000)} seconds.`,
         504,
         "ollama",
       );
@@ -51,17 +65,26 @@ async function callOllama(body: Record<string, unknown>): Promise<string> {
 }
 
 /** Sends a prompt to Ollama and returns trimmed model output in Tamil (no language override). */
-export async function generateTamilResponse(prompt: string): Promise<string> {
-  return callOllama({ prompt });
+export async function generateTamilResponse(
+  prompt: string,
+  options?: OllamaCallOptions,
+): Promise<string> {
+  return callOllama({ prompt }, options);
 }
 
 /** Sends a prompt to Ollama and returns trimmed model output in Telugu (no language override). */
-export async function generateTeluguResponse(prompt: string): Promise<string> {
-  return callOllama({ prompt });
+export async function generateTeluguResponse(
+  prompt: string,
+  options?: OllamaCallOptions,
+): Promise<string> {
+  return callOllama({ prompt }, options);
 }
 
 /** Sends a prompt to Ollama and returns trimmed model output. */
-export async function generateLlmResponse(prompt: string): Promise<string> {
+export async function generateLlmResponse(
+  prompt: string,
+  options?: OllamaCallOptions,
+): Promise<string> {
   const englishOnlyPrompt = [
     "Respond only in English.",
     "Keep the response clear and concise for a primary-school student.",
@@ -69,7 +92,7 @@ export async function generateLlmResponse(prompt: string): Promise<string> {
     prompt,
   ].join("\n");
 
-  return callOllama({ prompt: englishOnlyPrompt });
+  return callOllama({ prompt: englishOnlyPrompt }, options);
 }
 
 /**
@@ -77,8 +100,8 @@ export async function generateLlmResponse(prompt: string): Promise<string> {
  * response as JSON. The caller is responsible for telling the model
  * what shape to produce — this function only enforces parseability.
  */
-export async function generateLlmJson<T>(prompt: string): Promise<T> {
-  const raw = await callOllama({ prompt, format: "json" });
+export async function generateLlmJson<T>(prompt: string, options?: OllamaCallOptions): Promise<T> {
+  const raw = await callOllama({ prompt, format: "json" }, options);
   try {
     return JSON.parse(raw) as T;
   } catch {

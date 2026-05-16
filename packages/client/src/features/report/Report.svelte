@@ -62,6 +62,20 @@
   let mode = $state<string>("dashboard");
   let period = $state<"day" | "week" | "month">("day");
 
+  // Keep the chip selection and the calendar date in sync. Picking
+  // "This Week"/"This Month" snaps the anchor to today; picking a date on
+  // the calendar drops the user back to single-day mode.
+  function selectPeriod(next: "day" | "week" | "month"): void {
+    period = next;
+    if (next !== "day") {
+      dateKey = todayKey();
+    }
+  }
+  function selectDate(next: string): void {
+    dateKey = next;
+    if (period !== "day") period = "day";
+  }
+
   // ── Data fetching ─────────────────────────────────────────────────
   let data = $state<PerformanceData | null>(null);
   let loading = $state(false);
@@ -352,39 +366,52 @@
       subtitle="Review the dashboard or download the formatted daily report with live classroom metrics."
     >
       {#snippet actions()}
-        <div class="no-print">
-          <DateNav label="Day" value={dateKey} onChange={(d) => (dateKey = d)} />
-        </div>
         <Tabs.List class="no-print">
           <Tabs.Trigger value="dashboard">Dashboard</Tabs.Trigger>
           <Tabs.Trigger value="gazette">Daily Report</Tabs.Trigger>
         </Tabs.List>
-        <Button variant="primary" class="no-print" onclick={downloadReport} disabled={loading || downloading}>
-          <Download class="size-3.5" /> {downloading ? "Preparing PDF..." : "Download PDF"}
-        </Button>
       {/snippet}
     </PageHeader>
 
-    <Tabs.Content value="dashboard">
-
-      <!-- Period selector -->
-      <div class="no-print mb-4 flex items-center gap-2">
-        {#each [{ key: "day", label: "Today" }, { key: "week", label: "This Week" }, { key: "month", label: "This Month" }] as opt (opt.key)}
-          <button
-            type="button"
-            onclick={() => { period = opt.key as "day" | "week" | "month"; }}
-            class="rounded-full border px-4 py-1.5 text-[12px] font-semibold transition-all
-                   {period === opt.key
-              ? 'border-[#2f67c8] bg-[#eef6ff] text-[#2f67c8]'
-              : 'border-border-default bg-white text-text-secondary hover:bg-gray-50'}"
-          >
-            {opt.label}
-          </button>
-        {/each}
+    <!-- Controls row: calendar + period chips + download.
+         Stacks on mobile, single row from md+. -->
+    <div
+      class="no-print mb-4 flex flex-col gap-3 rounded-xl border border-border-default bg-white p-3
+             md:flex-row md:items-center md:justify-between md:gap-4"
+    >
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+        <DateNav label="Day" value={dateKey} onChange={selectDate} />
+        <div class="flex flex-wrap items-center gap-2">
+          {#each [{ key: "day", label: "Today" }, { key: "week", label: "This Week" }, { key: "month", label: "This Month" }] as opt (opt.key)}
+            <button
+              type="button"
+              onclick={() => selectPeriod(opt.key as "day" | "week" | "month")}
+              class="rounded-full border px-4 py-1.5 text-[12px] font-semibold transition-all
+                     {period === opt.key
+                ? 'border-[#2f67c8] bg-[#eef6ff] text-[#2f67c8]'
+                : 'border-border-default bg-white text-text-secondary hover:bg-gray-50'}"
+            >
+              {opt.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
         {#if loading}
           <span class="text-[11px] text-text-secondary">Loading…</span>
         {/if}
+        <Button
+          variant="primary"
+          onclick={downloadReport}
+          disabled={loading || downloading}
+        >
+          <Download class="size-3.5" />
+          {downloading ? "Preparing PDF..." : "Download PDF"}
+        </Button>
       </div>
+    </div>
+
+    <Tabs.Content value="dashboard">
 
       {#if !loading && totalStudents === 0}
         <Card class="border-clay-100 bg-clay-50 p-8 text-center">

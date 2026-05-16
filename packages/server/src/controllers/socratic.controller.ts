@@ -98,7 +98,8 @@ const MAX_QUESTION_CONTEXT_FACTS = 24;
 const MAX_QUESTION_OPTION_WORDS = 6;
 const QUESTION_GENERATION_BATCH_SIZE = 6;
 const QUESTION_GENERATION_MAX_ROUNDS = 8;
-const QUESTION_DUPLICATE_SIMILARITY = 0.55;
+const QUESTION_DUPLICATE_SIMILARITY = 0.45;
+const SOCRATIC_OLLAMA_TIMEOUT_MS = 240_000;
 const QUESTION_KEYWORD_STOPWORDS_EN = new Set([
   "about",
   "after",
@@ -588,6 +589,20 @@ async function _resolveSessionLanguage(
   return topicGuess;
 }
 
+async function _generateSocraticJson<T>(prompt: string): Promise<T> {
+  return generateLlmJson<T>(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+}
+
+async function _generateSocraticText(prompt: string, lang: SupportedLanguage): Promise<string> {
+  if (lang === "ta") {
+    return generateTamilResponse(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+  }
+  if (lang === "te") {
+    return generateTeluguResponse(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+  }
+  return generateLlmResponse(prompt, { timeoutMs: SOCRATIC_OLLAMA_TIMEOUT_MS });
+}
+
 // ── custom + fallback summary builders ───────────────────────────────────────
 async function _buildCustomTopicSummary(
   topic: string,
@@ -606,7 +621,7 @@ async function _buildCustomTopicSummary(
 
   try {
     const generated =
-      await generateLlmJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
+      await _generateSocraticJson<Omit<SummaryShape, "word_count" | "chunks_used">>(prompt);
     const normalized = _normalizeSummary(generated);
     // Accept the LLM response as long as it has real content — don't discard on word count alone.
     if (normalized.intro.length >= 20 && normalized.content.length >= 60) {
@@ -631,12 +646,7 @@ async function _buildCustomTopicSummary(
       lang: lang as SocraticPromptLanguage,
     });
 
-    const raw =
-      lang === "ta"
-        ? await generateTamilResponse(textPrompt)
-        : lang === "te"
-          ? await generateTeluguResponse(textPrompt)
-          : await generateLlmResponse(textPrompt);
+    const raw = await _generateSocraticText(textPrompt, lang);
 
     if (raw && raw.trim().length >= 40) {
       const shape = _textToSummaryShape(raw, topic, lang);
@@ -680,39 +690,69 @@ function _compactQuestionFact(text: string, lang: SupportedLanguage): string {
 }
 
 const EXERCISE_FACT_TAG = "[EXERCISE]";
+const RESERVED_EXERCISE_SLOTS = 8;
+const MIN_EXERCISE_FACT_LENGTH = 8;
+const MIN_SUMMARY_FACT_LENGTH = 18;
 
 function _buildQuestionFacts(
   summaryLines: string[],
   exerciseChunks: Array<{ text: string; page: number }>,
   lang: SupportedLanguage,
 ): string[] {
-  // Tag exercise-derived facts so the MCQ prompt can prioritise them. The
-  // tag is stripped from the LLM input but its position in the array
-  // identifies real textbook exercises versus general summary lines.
-  const taggedExercises = exerciseChunks.map((chunk) => `${EXERCISE_FACT_TAG}${chunk.text}`);
-  const sources = [...taggedExercises, ...summaryLines];
-
-  const weakFactPattern =
+  // The summary path used to filter exercises with the same weak-fact regex
+  // intended for greetings/meta — which silently dropped real textbook
+  // exercises that contained the word "lesson" or "practice". Exercises now
+  // pass through a much smaller meta-only filter, have a relaxed length
+  // floor, and are guaranteed reserved slots in the final fact list so they
+  // are never crowded out by talkative summary prose.
+  const summaryWeakPattern =
     lang === "ta"
-      ? /mcq|கேள்வி|சுற்று|விருப்பம்|தொடங்கலாம்|தேர்வு|வணக்கம்|அறிமுக|தொடக்கம்|அமர்வு|எப்படி இருக்க|பாடத்தின் பொதுவான/i
+      ? /mcq|கேள்வி சுற்று|விருப்பம்|தொடங்கலாம்|தேர்வு|வணக்கம்|அறிமுக|தொடக்கம்|அமர்வு|எப்படி இருக்க|பாடத்தின் பொதுவான/i
       : lang === "te"
-        ? /mcq|ప్రశ్న|రౌండ్|ఎంపిక|సారాంశం|పాఠం|పరిచయం|ప్రారంభం|సెషన్|ఎలా ఉన్నారు|నమస్కారం/i
-        : /mcq|question round|tap one option|summary|lesson|classroom process|practice round|introduction|opening line|how are you/i;
+        ? /mcq|ప్రశ్నల రౌండ్|ఎంపిక చేయండి|సారాంశం|పరిచయం|ప్రారంభం|సెషన్|ఎలా ఉన్నారు|నమస్కారం/i
+        : /mcq|question round|tap one option|today.?s summary|classroom process|practice round|introduction|opening line|how are you/i;
 
-  const facts: string[] = [];
-  for (const source of sources) {
-    const isExercise = source.startsWith(EXERCISE_FACT_TAG);
-    const stripped = isExercise ? source.slice(EXERCISE_FACT_TAG.length) : source;
-    const compacted = _compactQuestionFact(stripped, lang);
-    if (!compacted || compacted.length < 18 || weakFactPattern.test(compacted)) continue;
-    const fact = isExercise ? `${EXERCISE_FACT_TAG}${compacted}` : compacted;
+  // Exercises only get filtered when they look like UI/meta chrome, never
+  // for legitimate textbook vocabulary like "lesson" / "practice" / "exercise".
+  const exerciseMetaPattern =
+    lang === "ta"
+      ? /mcq|கேள்வி சுற்று|விருப்பம் தேர்வு|வணக்கம்|எப்படி இருக்க/i
+      : lang === "te"
+        ? /mcq|ప్రశ్నల రౌండ్|ఎంపిక చేయండి|నమస్కారం|ఎలా ఉన్నారు/i
+        : /mcq|question round|tap one option|how are you/i;
+
+  const exerciseFacts: string[] = [];
+  for (const chunk of exerciseChunks) {
+    const compacted = _compactQuestionFact(chunk.text, lang);
+    if (!compacted || compacted.length < MIN_EXERCISE_FACT_LENGTH) continue;
+    if (exerciseMetaPattern.test(compacted)) continue;
+    const fact = `${EXERCISE_FACT_TAG}${compacted}`;
     const lowered = fact.toLowerCase();
-    if (facts.some((existing) => existing.toLowerCase() === lowered)) continue;
-    facts.push(fact);
-    if (facts.length >= MAX_QUESTION_CONTEXT_FACTS) break;
+    if (exerciseFacts.some((existing) => existing.toLowerCase() === lowered)) continue;
+    exerciseFacts.push(fact);
+    if (exerciseFacts.length >= RESERVED_EXERCISE_SLOTS) break;
   }
 
-  return facts;
+  const summaryFacts: string[] = [];
+  const summaryBudget = MAX_QUESTION_CONTEXT_FACTS - exerciseFacts.length;
+  for (const source of summaryLines) {
+    const compacted = _compactQuestionFact(source, lang);
+    if (!compacted || compacted.length < MIN_SUMMARY_FACT_LENGTH) continue;
+    if (summaryWeakPattern.test(compacted)) continue;
+    const lowered = compacted.toLowerCase();
+    if (
+      summaryFacts.some((existing) => existing.toLowerCase() === lowered) ||
+      exerciseFacts.some((existing) =>
+        existing.slice(EXERCISE_FACT_TAG.length).toLowerCase() === lowered,
+      )
+    ) {
+      continue;
+    }
+    summaryFacts.push(compacted);
+    if (summaryFacts.length >= summaryBudget) break;
+  }
+
+  return [...exerciseFacts, ...summaryFacts];
 }
 
 function _collectQuestionKeywords(
@@ -785,29 +825,33 @@ function _isNearDuplicateQuestion(
   existing: SocraticQuestion[],
   lang: SupportedLanguage,
 ): boolean {
-  return existing.some((candidate) => {
-    if (candidate.q.trim().toLowerCase() === question.q.trim().toLowerCase()) {
+  const candidateSig = _normalizedAnswerSignature(question, lang);
+  return existing.some((other) => {
+    if (other.q.trim().toLowerCase() === question.q.trim().toLowerCase()) {
       return true;
     }
 
-    const stemSimilarity = _questionSimilarity(question.q, candidate.q, lang);
+    const stemSimilarity = _questionSimilarity(question.q, other.q, lang);
     if (stemSimilarity >= QUESTION_DUPLICATE_SIMILARITY) {
+      return true;
+    }
+
+    const otherSig = _normalizedAnswerSignature(other, lang);
+    const sameAnswerSignature = candidateSig.length > 0 && otherSig === candidateSig;
+
+    // Two questions with the exact same correct-answer token signature are
+    // almost always the same fact rephrased. Block unless their stems are
+    // visibly different (which would imply a genuine new angle).
+    if (sameAnswerSignature && stemSimilarity >= 0.20) {
       return true;
     }
 
     const answerSimilarity = _questionSimilarity(
       question.options[question.answerIndex] ?? "",
-      candidate.options[candidate.answerIndex] ?? "",
+      other.options[other.answerIndex] ?? "",
       lang,
     );
-    const sameAnswerSignature =
-      _normalizedAnswerSignature(candidate, lang) === _normalizedAnswerSignature(question, lang);
-
-    if (sameAnswerSignature && stemSimilarity >= 0.34) {
-      return true;
-    }
-
-    return answerSimilarity >= 0.6 && stemSimilarity >= 0.2;
+    return answerSimilarity >= 0.55 && stemSimilarity >= 0.18;
   });
 }
 
@@ -826,12 +870,83 @@ function _mergeQuestions(
   return merged;
 }
 
+type DifficultyTier = "recall" | "application" | "reasoning";
+
+function _tierForRound(round: number, totalRounds: number): DifficultyTier {
+  // Divide rounds into three tiers so successive batches escalate clearly.
+  // Round 0 -> recall, middle -> application, final -> reasoning.
+  const safeTotal = Math.max(1, totalRounds);
+  const ratio = round / safeTotal;
+  if (ratio < 0.34) return "recall";
+  if (ratio < 0.67) return "application";
+  return "reasoning";
+}
+
+function _tierBlock(tier: DifficultyTier, lang: SupportedLanguage): string[] {
+  // Per-batch instruction telling the LLM the *single* difficulty tier for
+  // this batch. Replaces the prior vague "easier first, harder later" hint
+  // which the model ignored when generating one batch at a time.
+  if (lang === "ta") {
+    if (tier === "recall") {
+      return [
+        "இந்த batch difficulty: நினைவுபடுத்தும் (RECALL) கேள்விகள் மட்டும்.",
+        "ஒவ்வொரு கேள்வியும் ஒரு உண்மை, பெயர், வரையறை, அல்லது ஒரு பகுதி (part) என்னவென்று நேரடியாகக் கேட்க வேண்டும். சிந்தனை சங்கிலி வேண்டாம்.",
+      ];
+    }
+    if (tier === "application") {
+      return [
+        "இந்த batch difficulty: பயன்படுத்தும் (APPLICATION) கேள்விகள் மட்டும்.",
+        "ஒவ்வொரு கேள்வியும் ஒரு உண்மையை ஒரு குறிப்பிட்ட சூழ்நிலையில் பயன்படுத்தச் சொல்ல வேண்டும் (உதாரணம், எண் மாற்றம், எடுத்துக்காட்டில் சரியான பதில்).",
+      ];
+    }
+    return [
+      "இந்த batch difficulty: காரணம்-விளைவு (REASONING) கேள்விகள் மட்டும்.",
+      "ஒவ்வொரு கேள்வியும் 'ஏன்', 'எது நடந்தால் என்ன ஆகும்', 'எது சரி/தவறு' என ஒரு சிறிய ஊகத்தைக் கேட்க வேண்டும். வெறும் நினைவுபடுத்தல் வேண்டாம்.",
+    ];
+  }
+  if (lang === "te") {
+    if (tier === "recall") {
+      return [
+        "ఈ బ్యాచ్ difficulty: కేవలం RECALL (గుర్తుచేసుకునే) ప్రశ్నలు.",
+        "ప్రతి ప్రశ్న ఒక నిజం, పేరు, నిర్వచనం లేదా ఒక భాగాన్ని నేరుగా అడగాలి. తర్క శ్రేణి అవసరం లేదు.",
+      ];
+    }
+    if (tier === "application") {
+      return [
+        "ఈ బ్యాచ్ difficulty: కేవలం APPLICATION (అన్వయించే) ప్రశ్నలు.",
+        "ప్రతి ప్రశ్న ఒక నిజాన్ని కొత్త పరిస్థితిలో అన్వయించడం పరీక్షించాలి (ఉదాహరణ లెక్క, చిన్న మార్పుతో).",
+      ];
+    }
+    return [
+      "ఈ బ్యాచ్ difficulty: కేవలం REASONING (కారణం-ఫలితం) ప్రశ్నలు.",
+      "ప్రతి ప్రశ్న 'ఎందుకు', 'ఇది జరిగితే ఏమవుతుంది', 'ఏది సరి/తప్పు' వంటి చిన్న తర్కం అడగాలి.",
+    ];
+  }
+  if (tier === "recall") {
+    return [
+      "Batch difficulty for THIS batch: RECALL only.",
+      "Every question must directly ask for a fact, a name, a definition, or what a part is. No multi-step reasoning.",
+    ];
+  }
+  if (tier === "application") {
+    return [
+      "Batch difficulty for THIS batch: APPLICATION only.",
+      "Every question must apply a fact to a small scenario or a single-step example. Not pure recall, not deep reasoning.",
+    ];
+  }
+  return [
+    "Batch difficulty for THIS batch: REASONING only.",
+    "Every question must ask 'why', 'what happens if', or 'which is true/false' — a small inference using the facts. No bare recall.",
+  ];
+}
+
 function _buildQuestionPrompt(
   input: QuestionBankRequest,
   questionFacts: string[],
   anchorWords: string[],
   existingQuestions: SocraticQuestion[],
   batchSize: number,
+  tier: DifficultyTier = "recall",
 ): string {
   const _exerciseLabel =
     input.lang === "ta"
@@ -840,6 +955,7 @@ function _buildQuestionPrompt(
         ? "[పాఠ్యపుస్తక వ్యాయామం]"
         : "[TEXTBOOK EXERCISE]";
   const hasExerciseFacts = questionFacts.some((f) => f.startsWith(EXERCISE_FACT_TAG));
+  const tierLines = _tierBlock(tier, input.lang);
   const factsBlock =
     questionFacts.length > 0
       ? questionFacts
@@ -884,6 +1000,7 @@ function _buildQuestionPrompt(
       "",
       "விதிகள்:",
       `- இந்த batch-க்கு ${batchSize} MCQ மட்டும் உருவாக்கவும்.`,
+      ...tierLines.map((line) => `- ${line}`),
       ...(hasExerciseFacts
         ? [
             "- [பாடப்புத்தக பயிற்சி] என குறிக்கப்பட்ட facts-ஐ முதன்மையாக பயன்படுத்தவும் — அவை உண்மையான பாடப்புத்தக கேள்விகள். அவற்றை அதே வடிவில் நகலெடுக்காமல், அதே கருத்தை சோதிக்கும் புதிய MCQ-ஆக மறுவடிவமைக்கவும்.",
@@ -891,9 +1008,8 @@ function _buildQuestionPrompt(
         : []),
       "- மேலே உள்ள facts-இல் இல்லாத தகவலை உருவாக்க வேண்டாம்.",
       "- ஒவ்வொரு கேள்வியும் தலைப்பின் ஒரு தெளிவான உண்மை, பகுதி, வேலை, உதாரணம், வரிசை, காரணம் அல்லது விளைவைச் சோதிக்க வேண்டும்.",
-      "- பாடம், சுருக்கம், வகுப்பு நடைமுறை, அல்லது பொதுவான subject பற்றி கேள்வி கேட்க வேண்டாம்.",
+      "- பாடம், சுருக்கம், வகுப்பு நடைமுறை, ஆசிரியர் முகபாவம், ஆசிரியர் என்ன காட்டுகிறார் என்பது போன்ற meta கேள்விகள் வேண்டாம்.",
       "- ஒவ்வொரு கேள்வியும் வேறு fact அல்லது வேறு reasoning angle-ஐ பயன்படுத்த வேண்டும்.",
-      "- முதல் கேள்விகள் எளிதாகவும், பின்னைய கேள்விகள் சிந்திக்க வைக்கும் வகையிலும் இருக்கட்டும்.",
       "- ஒவ்வொரு கேள்விக்கும் 4 விருப்பங்கள் மட்டும்; 1 சரியான பதில் மட்டும்.",
       "- விருப்பங்கள் குறுகிய சொற்கள் அல்லது சிறு சொற்றொடர்கள் மட்டும்; முழு வாக்கியங்கள் வேண்டாம்.",
       "- தவறான விருப்பங்கள் இதே topic-இல் வரும் நம்பகமான குழப்பங்கள் ஆக இருக்க வேண்டும்.",
@@ -921,6 +1037,7 @@ function _buildQuestionPrompt(
       "",
       "నియమాలు:",
       `- ఈ బ్యాచ్‌కు ఖచ్చితంగా ${batchSize} MCQలు తయారు చేయండి.`,
+      ...tierLines.map((line) => `- ${line}`),
       ...(hasExerciseFacts
         ? [
             "- [పాఠ్యపుస్తక వ్యాయామం] అని గుర్తు పెట్టిన facts ను ముఖ్యంగా వాడండి — అవి అసలైన పాఠ్యపుస్తక ప్రశ్నలు. వాటిని యథాతథంగా కాపీ చేయకుండా, అదే భావనను పరీక్షించే కొత్త MCQ గా రూపొందించండి.",
@@ -928,9 +1045,8 @@ function _buildQuestionPrompt(
         : []),
       "- పై నిజాలకు బయట సమాచారం కల్పించకండి.",
       "- ప్రతి ప్రశ్న టాపిక్‌లోని స్పష్టమైన నిజం, భాగం, పని, ఉదాహరణ, కారణం లేదా ఫలితాన్ని పరీక్షించాలి.",
-      "- పాఠం నడిపిన విధానం, సారాంశం, సెషన్ గురించి మెటా ప్రశ్నలు అడగకండి.",
+      "- పాఠం నడిపిన విధానం, ఉపాధ్యాయుని హావభావం, ఏమి చూపిస్తున్నారు అనే మెటా ప్రశ్నలు అడగకండి.",
       "- ప్రతి ప్రశ్న వేర్వేరు నిజం లేదా వేర్వేరు reasoning angle ను ఉపయోగించాలి.",
-      "- మొదట సులభ recall ప్రశ్నలు, తర్వాత సులభ reasoning ప్రశ్నలు ఇవ్వండి.",
       "- ప్రతి ప్రశ్నకు 4 ఎంపికలు, 1 సరైన సమాధానం మాత్రమే ఉండాలి.",
       "- ఎంపికలు చిన్న పదాలు లేదా చిన్న పదబంధాలుగా ఉండాలి; పూర్తి వాక్యాలు కాదు.",
       "- తప్పు ఎంపికలు అదే టాపిక్‌లో సాధారణ గందరగోళాలుగా ఉండాలి.",
@@ -957,6 +1073,7 @@ function _buildQuestionPrompt(
     "",
     "Rules:",
     `- Create exactly ${batchSize} MCQs for this batch.`,
+    ...tierLines.map((line) => `- ${line}`),
     ...(hasExerciseFacts
       ? [
           "- Facts tagged [TEXTBOOK EXERCISE] are real exercises from the textbook — prefer them as the primary source. Do NOT copy them verbatim; rewrite each as a new MCQ that tests the same concept.",
@@ -964,9 +1081,8 @@ function _buildQuestionPrompt(
       : []),
     "- Use only the facts above. If a detail is not supported there, do not invent it.",
     "- Every question must test a concrete topic fact, part, function, sequence, example, cause, or effect.",
-    "- Do not ask about the lesson, summary, classroom process, or the subject in general.",
+    "- Do not ask about the lesson, the summary, classroom process, or about what the teacher is showing/expressing/demonstrating while teaching. These are META questions and must NEVER appear.",
     "- Each question must use a different fact or a clearly different reasoning angle from the previous questions.",
-    "- Start with easier recall questions and move toward simple reasoning.",
     "- Each question must have exactly 4 options and exactly 1 correct answer.",
     "- Options must be short words or short phrases, never full sentences.",
     "- Wrong options must be plausible confusions from the same topic.",
@@ -1001,16 +1117,18 @@ async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQ
 
   for (let round = 0; round < maxRounds && collected.length < targetCount; round += 1) {
     const batchSize = Math.min(QUESTION_GENERATION_BATCH_SIZE, targetCount - collected.length);
+    const tier = _tierForRound(round, maxRounds);
     const prompt = _buildQuestionPrompt(
       { ...input, questionCount: targetCount },
       questionFacts,
       groundingKeywords,
       collected,
       batchSize,
+      tier,
     );
 
     try {
-      const generated = await generateLlmJson<{ questions: SocraticQuestion[] }>(prompt);
+      const generated = await _generateSocraticJson<{ questions: SocraticQuestion[] }>(prompt);
       const normalized = _normalizeQuestions(generated.questions, batchSize, input.lang);
       collected = _mergeQuestions(collected, normalized, targetCount, input.lang);
       if (collected.length >= targetCount) {
@@ -1022,12 +1140,7 @@ async function _buildQuestionBank(input: QuestionBankRequest): Promise<SocraticQ
     }
 
     try {
-      const raw =
-        input.lang === "ta"
-          ? await generateTamilResponse(prompt)
-          : input.lang === "te"
-            ? await generateTeluguResponse(prompt)
-            : await generateLlmResponse(prompt);
+      const raw = await _generateSocraticText(prompt, input.lang);
       const parsed = _parseQuestionEnvelope(raw);
       if (parsed) {
         const normalized = _normalizeQuestions(parsed.questions, batchSize, input.lang);
@@ -1573,13 +1686,27 @@ function _normalizeQuestions(
     .slice(0, expectedCount);
 }
 
-/** Reject questions about the session/summary/lesson rather than topic content. */
+/** Reject questions about the session/summary/lesson or the teacher's
+ *  presentation, rather than the actual topic content. */
 function _isMetaQuestion(q: SocraticQuestion): boolean {
   const lower = q.q.toLowerCase();
   const optionsLower = q.options.map((o) => o.toLowerCase()).join(" ");
-  // Meta patterns: questions about the lesson/summary itself
+  // Meta patterns: questions about the lesson/summary itself or about HOW
+  // the teacher is presenting (expression/way/method/while teaching/etc.).
   if (
     /which option matches|today.?s summary|what did we learn|main idea of (the|this) (lesson|summary)|what is this (lesson|topic) about|introduction|opening line|how are you|general start of the lesson/i.test(
+      lower,
+    )
+  )
+    return true;
+  if (
+    /\b(teacher|tutor|instructor)\b.*\b(showing|displaying|presenting|demonstrating|explaining|using|saying|teaching|writing|drawing|expression|gesture|tone|attitude|emotion|mood|style|manner|way|method)\b/i.test(
+      lower,
+    )
+  )
+    return true;
+  if (
+    /\bwhile\s+(teaching|explaining|presenting|showing|demonstrating)\b|\bhow (is|does) (the )?(teacher|tutor|instructor)\b|\bkind of (expression|gesture|tone|style|manner)\b/i.test(
       lower,
     )
   )
@@ -1590,7 +1717,21 @@ function _isMetaQuestion(q: SocraticQuestion): boolean {
     )
   )
     return true;
+  // Tamil teacher-presentation meta
+  if (
+    /ஆசிரியர்.*(காட்டுகி|விளக்கு|பேசு|எழுது|நடித்து|பாவனை|முகபாவம்|முக பாவம்|பாணி|வழி|முறை|பேச்சு|குரல்)|எப்படி கற்பி|என்ன பாவனை/i.test(
+      q.q,
+    )
+  )
+    return true;
   if (/ఈరోజు సారాంశం|ఈ పాఠం ఏమిటి|పరిచయం|ప్రారంభం|సెషన్|ఎలా ఉన్నారు|నమస్కారం/i.test(q.q))
+    return true;
+  // Telugu teacher-presentation meta
+  if (
+    /ఉపాధ్యాయు.*(చూపిస్తున్నా|చెబుతున్నా|వివరిస్తున్నా|నేర్పిస్తున్నా|వ్రాస్తున్నా|హావభావ|భావ వ్యక్తీకరణ|శైలి|విధానం|పద్ధతి|మాట|స్వరం)|ఎలా బోధిస్తున్నా|ఏ హావభావ/i.test(
+      q.q,
+    )
+  )
     return true;
   // Options that are statements about the lesson
   if (
@@ -1615,15 +1756,20 @@ async function _fallbackQuestions(
   existing: SocraticQuestion[] = [],
 ): Promise<SocraticQuestion[]> {
   const remaining = Math.max(1, input.questionCount - existing.length);
-  const prompt = _buildQuestionPrompt(input, questionFacts, groundingKeywords, existing, remaining);
+  // Fallback runs after all primary rounds — escalate to reasoning tier so
+  // the last-resort top-up doesn't just repeat the recall stems we already
+  // collected.
+  const prompt = _buildQuestionPrompt(
+    input,
+    questionFacts,
+    groundingKeywords,
+    existing,
+    remaining,
+    "reasoning",
+  );
 
   try {
-    const raw =
-      input.lang === "ta"
-        ? await generateTamilResponse(prompt)
-        : input.lang === "te"
-          ? await generateTeluguResponse(prompt)
-          : await generateLlmResponse(prompt);
+    const raw = await _generateSocraticText(prompt, input.lang);
     const parsed = _parseQuestionEnvelope(raw);
     if (parsed) {
       const normalized = _normalizeQuestions(parsed.questions, remaining, input.lang);

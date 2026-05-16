@@ -981,6 +981,14 @@
     stopSpeech();
   }
 
+  function finishSummaryPlayback(showLastLine = false): void {
+    stopSummaryPlayback();
+    if (showLastLine && summaryLines.length > 0) {
+      summaryIdx = summaryLines.length - 1;
+    }
+    phase = "session";
+  }
+
   async function scrollSummaryToLine(idx: number): Promise<void> {
     await tick();
 
@@ -1055,8 +1063,7 @@
     if (runId !== summaryRunId) return;
 
     if (summaryLines.length === 0) {
-      resetSummarySpeechHighlight();
-      phase = "session";
+      finishSummaryPlayback();
       return;
     }
 
@@ -1084,8 +1091,7 @@
       summaryFlowTimer = setTimeout(() => {
         if (runId !== summaryRunId || phase !== "summarizing") return;
         if (isLastLine) {
-          resetSummarySpeechHighlight();
-          phase = "session";
+          finishSummaryPlayback(true);
           return;
         }
         revealSummaryLine(nextIdx + 1, runId);
@@ -1094,9 +1100,7 @@
   }
 
   function skipSummary(): void {
-    stopSummaryPlayback();
-    if (summaryLines.length > 0) summaryIdx = summaryLines.length - 1;
-    phase = "session";
+    finishSummaryPlayback(true);
   }
 
   function customTopicLoadErrorMessage(): string {
@@ -1136,7 +1140,7 @@
         const normalizedPlan = buildQuestionPlan(normalizeQuestions(data.questions, expectedTurns));
 
         if (topic?.source === "custom") {
-          if (lines.length === 0 || normalizedPlan.length === 0) {
+          if (lines.length === 0) {
             summaryError = typeof data.error === "string" && data.error.trim()
               ? data.error
               : customTopicLoadErrorMessage();
@@ -1145,6 +1149,15 @@
           } else {
             summaryLines = lines;
             questionPlan = normalizedPlan;
+            if (questionPlan.length === 0) {
+              questionPlan = buildQuestionPlan(fallbackQuestions(expectedTurns));
+            }
+            if (questionPlan.length === 0) {
+              summaryError = typeof data.error === "string" && data.error.trim()
+                ? data.error
+                : customTopicLoadErrorMessage();
+              summaryLines = normalizeSummaryLines([summaryError]);
+            }
           }
         } else {
           summaryLines = lines.length > 0 ? lines : normalizeSummaryLines(fallbackLines());

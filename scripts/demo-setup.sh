@@ -3,7 +3,8 @@
 # Arivonriyam — one-command demo setup
 #
 # What this does (idempotent — safe to re-run):
-#   1. Verifies prerequisites: node, pnpm, uv, ollama, and Postgres access
+#   1. Verifies prerequisites: node, pnpm, uv, ollama, tesseract (+ eng/tam/tel), and Postgres access
+#      (Bruno CLI is optional — warns only if absent.)
 #   2. Ensures Ollama is running and `gemma4:latest` is pulled
 #   3. Creates the `arivonriyam_rag` Postgres DB + required extensions
 #   4. Ensures runtime tables exist for school setup, alerts, and reteach state
@@ -12,8 +13,10 @@
 #   7. `pnpm install` at the repo root
 #   8. `uv sync` inside packages/ingestion
 #   9. Pre-downloads BGE-M3 + YOLO + Table-Transformer (offline cache)
-#  10. Copies repo-root PDFs into packages/ingestion/data/pdfs
-#  11. Runs ingestion on those PDFs
+#  10. Stages repo-root PDFs under packages/ingestion/data/pdfs
+#
+# NOTE: This script does NOT run ingestion. Run it manually per demo.md:
+#   cd packages/ingestion && uv run python src/main.py ingest --no-questions
 #
 # Default mode expects a local PostgreSQL instance.
 # Docker fallback: USE_DOCKER_POSTGRES=1 bash scripts/demo-setup.sh
@@ -45,6 +48,155 @@ require() {
   ok "$cmd found: $(command -v "$cmd")"
 }
 
+# Like `require`, but attempts an automated install when the binary is missing
+# instead of stopping. Supports uv and ollama on macOS/Linux. Falls back to
+# `fail` (with the manual install hint) if the auto install does not succeed.
+require_or_install() {
+  local cmd="$1"; local install_hint="$2"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    ok "$cmd found: $(command -v "$cmd")"
+    return 0
+  fi
+
+  warn "'$cmd' not found — attempting automatic install..."
+  local os; os="$(uname -s)"
+  case "$cmd" in
+    uv)
+      curl -LsSf https://astral.sh/uv/install.sh | sh \
+        || warn "uv installer exited non-zero"
+      # The uv installer drops the binary in ~/.local/bin or ~/.cargo/bin
+      for dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+        [[ -x "$dir/uv" && ":$PATH:" != *":$dir:"* ]] && export PATH="$dir:$PATH"
+      done
+      ;;
+    ollama)
+      if [[ "$os" == "Darwin" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+          brew install ollama || warn "brew install ollama failed"
+        else
+          warn "Homebrew not present. Install Ollama manually: $install_hint"
+        fi
+      elif [[ "$os" == "Linux" ]]; then
+        curl -fsSL https://ollama.com/install.sh | sh \
+          || warn "ollama installer exited non-zero"
+      else
+        warn "Unsupported OS '$os' for auto-install. Install manually: $install_hint"
+      fi
+      ;;
+    tesseract)
+      # OCR engine used by ingestion when a PDF page is image-only.
+      # Need English, Tamil, and Telugu language packs.
+      log "Tesseract is going to be installed (needed for OCR during ingestion)."
+      if [[ "$os" == "Darwin" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+          brew install tesseract tesseract-lang \
+            || warn "brew install tesseract failed"
+        else
+          warn "Homebrew not present. Install tesseract manually: $install_hint"
+        fi
+      elif [[ "$os" == "Linux" ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update -y \
+            && sudo apt-get install -y tesseract-ocr \
+                 tesseract-ocr-eng tesseract-ocr-tam tesseract-ocr-tel \
+            || warn "apt-get install tesseract failed"
+        elif command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y tesseract tesseract-langpack-eng \
+                              tesseract-langpack-tam tesseract-langpack-tel \
+            || warn "dnf install tesseract failed"
+        else
+          warn "No supported package manager. Install tesseract + eng/tam/tel packs manually: $install_hint"
+        fi
+      else
+        warn "Unsupported OS '$os' for auto-install. Install manually: $install_hint"
+      fi
+      ;;
+    *)
+      warn "No auto-installer defined for '$cmd'."
+      ;;
+  esac
+
+  if command -v "$cmd" >/dev/null 2>&1; then
+    ok "$cmd installed: $(command -v "$cmd")"
+  else
+    fail "'$cmd' still not on PATH after auto-install. Install it manually: $install_hint"
+  fi
+}
+
+# Make sure tesseract has the English, Tamil, and Telugu language packs.
+# Tesseract may be on PATH from a prior install without the packs the
+# ingestion pipeline needs, so verify and top up.
+ensure_tesseract_langs() {
+  if ! command -v tesseract >/dev/null 2>&1; then
+    return 0
+  fi
+  local installed; installed="$(tesseract --list-langs 2>/dev/null | tail -n +2 | tr '\n' ' ')"
+  local missing=()
+  for lang in eng tam tel; do
+    if ! grep -qw "$lang" <<<"$installed"; then
+      missing+=("$lang")
+    fi
+  done
+  if (( ${#missing[@]} == 0 )); then
+    ok "tesseract languages OK (eng, tam, tel)"
+    return 0
+  fi
+  log "tesseract is missing language pack(s): ${missing[*]} — installing now..."
+  local os; os="$(uname -s)"
+  if [[ "$os" == "Darwin" ]]; then
+    if command -v brew >/dev/null 2>&1; then
+      brew install tesseract-lang || warn "brew install tesseract-lang failed"
+    else
+      warn "Homebrew not present. Install tesseract-lang manually."
+    fi
+  elif [[ "$os" == "Linux" ]]; then
+    local pkgs=()
+    for lang in "${missing[@]}"; do
+      case "$lang" in
+        eng) pkgs+=("tesseract-ocr-eng") ;;
+        tam) pkgs+=("tesseract-ocr-tam") ;;
+        tel) pkgs+=("tesseract-ocr-tel") ;;
+      esac
+    done
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -y && sudo apt-get install -y "${pkgs[@]}" \
+        || warn "apt-get install ${pkgs[*]} failed"
+    elif command -v dnf >/dev/null 2>&1; then
+      local rpms=()
+      for lang in "${missing[@]}"; do
+        rpms+=("tesseract-langpack-${lang}")
+      done
+      sudo dnf install -y "${rpms[@]}" || warn "dnf install ${rpms[*]} failed"
+    else
+      warn "No supported package manager. Install language packs manually: ${missing[*]}"
+    fi
+  else
+    warn "Unsupported OS '$os' for auto-install of language packs."
+  fi
+
+  installed="$(tesseract --list-langs 2>/dev/null | tail -n +2 | tr '\n' ' ')"
+  local still_missing=()
+  for lang in "${missing[@]}"; do
+    grep -qw "$lang" <<<"$installed" || still_missing+=("$lang")
+  done
+  if (( ${#still_missing[@]} == 0 )); then
+    ok "tesseract languages now OK (eng, tam, tel)"
+  else
+    fail "tesseract still missing language packs: ${still_missing[*]}. Install them manually."
+  fi
+}
+
+# Bruno (the `bru` CLI) is used for API smoke-tests during demos. It's
+# optional — warn if missing but never fail.
+check_bruno() {
+  if command -v bru >/dev/null 2>&1; then
+    ok "bru (Bruno CLI) found: $(command -v bru)"
+  else
+    warn "'bru' (Bruno CLI) not found — optional, only needed if you run the Bruno API collection."
+    warn "  Install: npm install -g @usebruno/cli   (or download from https://www.usebruno.com/downloads)"
+  fi
+}
+
 is_safe_ident() {
   [[ "$1" =~ ^[A-Za-z0-9_]+$ ]]
 }
@@ -70,7 +222,7 @@ run_pg_query() {
 }
 
 ensure_runtime_schema() {
-  log "Ensuring Arivonriyam runtime tables exist…"
+  log "Ensuring Arivonriyam runtime tables exist..."
   run_pg_query "$PG_DB" "
     CREATE TABLE IF NOT EXISTS school_config (
       id           SERIAL PRIMARY KEY,
@@ -124,7 +276,7 @@ ensure_runtime_schema() {
 }
 
 seed_demo_data() {
-  log "Seeding sample school and student roster data…"
+  log "Seeding sample school and student roster data..."
   run_pg_query "$PG_DB" "
     BEGIN;
 
@@ -176,7 +328,7 @@ stage_repo_pdfs() {
     return 0
   fi
 
-  log "Copying $source_count repo PDF(s) from $PDF_SOURCE_DIR to $PDF_TARGET_DIR…"
+  log "Copying $source_count repo PDF(s) from $PDF_SOURCE_DIR to $PDF_TARGET_DIR..."
   mkdir -p "$PDF_TARGET_DIR"
 
   while IFS= read -r -d '' src; do
@@ -211,7 +363,7 @@ if [[ "$USE_DOCKER_POSTGRES" == "1" ]]; then
   PG_USER="${PG_USER:-arivonriyam}"
   PG_DSN_DEFAULT="postgresql://${PG_USER}:${DOCKER_POSTGRES_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_DB}"
 else
-  PG_USER="${PG_USER:-$USER}"
+  PG_USER="postgres"
   PG_DSN_DEFAULT="postgresql://${PG_USER}@${PG_HOST}:${PG_PORT}/${PG_DB}"
 fi
 
@@ -221,11 +373,14 @@ is_safe_ident "$PG_DB" || fail "PG_DB must contain only letters, numbers, and un
 
 # --- 1. prerequisites ------------------------------------------------------
 
-log "Checking prerequisites…"
+log "Checking prerequisites..."
 require node   "https://nodejs.org/  (need v20+)"
 require pnpm   "npm install -g pnpm"
-require uv     "curl -LsSf https://astral.sh/uv/install.sh | sh"
-require ollama "https://ollama.com/download"
+require_or_install uv        "curl -LsSf https://astral.sh/uv/install.sh | sh"
+require_or_install ollama    "https://ollama.com/download"
+require_or_install tesseract "macOS: brew install tesseract tesseract-lang  |  Debian/Ubuntu: sudo apt-get install tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam tesseract-ocr-tel"
+ensure_tesseract_langs
+check_bruno
 
 if [[ "$USE_DOCKER_POSTGRES" == "1" ]]; then
   require docker "https://www.docker.com/products/docker-desktop/"
@@ -241,9 +396,9 @@ ok "node version is $(node -v)"
 
 # --- 2. ollama -------------------------------------------------------------
 
-log "Checking Ollama daemon on :11434…"
+log "Checking Ollama daemon on :11434..."
 if ! curl -sf http://localhost:11434/api/tags >/dev/null; then
-  warn "Ollama not responding. Attempting 'ollama serve' in background…"
+  warn "Ollama not responding. Attempting 'ollama serve' in background..."
   (ollama serve >/dev/null 2>&1 &)
   for _ in {1..20}; do
     sleep 1
@@ -257,7 +412,7 @@ ok "Ollama is up"
 if curl -s http://localhost:11434/api/tags | grep -q "\"${OLLAMA_MODEL}\""; then
   ok "$OLLAMA_MODEL already pulled"
 else
-  log "Pulling $OLLAMA_MODEL (this can take a few minutes)…"
+  log "Pulling $OLLAMA_MODEL (this can take a few minutes)..."
   ollama pull "$OLLAMA_MODEL"
   ok "$OLLAMA_MODEL ready"
 fi
@@ -265,20 +420,20 @@ fi
 # --- 3. postgres -----------------------------------------------------------
 
 if [[ "$USE_DOCKER_POSTGRES" == "1" ]]; then
-  log "Preparing Docker-backed PostgreSQL (container=$DOCKER_POSTGRES_CONTAINER)…"
+  log "Preparing Docker-backed PostgreSQL (container=$DOCKER_POSTGRES_CONTAINER)..."
 
   docker info >/dev/null 2>&1 \
     || fail "Docker daemon is not running. Start Docker Desktop and re-run."
 
   if docker_container_exists "$DOCKER_POSTGRES_CONTAINER"; then
     if [[ "$(docker inspect -f '{{.State.Running}}' "$DOCKER_POSTGRES_CONTAINER")" != "true" ]]; then
-      log "Starting existing container '$DOCKER_POSTGRES_CONTAINER'…"
+      log "Starting existing container '$DOCKER_POSTGRES_CONTAINER'..."
       docker start "$DOCKER_POSTGRES_CONTAINER" >/dev/null
     else
       ok "Docker Postgres container already running"
     fi
   else
-    log "Creating pgvector container '$DOCKER_POSTGRES_CONTAINER' on port $PG_PORT…"
+    log "Creating pgvector container '$DOCKER_POSTGRES_CONTAINER' on port $PG_PORT..."
     docker run -d \
       --name "$DOCKER_POSTGRES_CONTAINER" \
       -e POSTGRES_PASSWORD="$DOCKER_POSTGRES_PASSWORD" \
@@ -302,16 +457,16 @@ if [[ "$USE_DOCKER_POSTGRES" == "1" ]]; then
   if docker exec "$DOCKER_POSTGRES_CONTAINER" psql -U "$PG_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1; then
     ok "Database '$PG_DB' already exists"
   else
-    log "Creating database '$PG_DB' inside Docker Postgres…"
+    log "Creating database '$PG_DB' inside Docker Postgres..."
     docker_exec_psql postgres "CREATE DATABASE ${PG_DB};" >/dev/null
     ok "Database '$PG_DB' created"
   fi
 
-  log "Enabling required extensions in '$PG_DB'…"
+  log "Enabling required extensions in '$PG_DB'..."
   docker_exec_psql "$PG_DB" "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null
   ok "Extensions ready (vector, pgcrypto)"
 else
-  log "Checking PostgreSQL connection (user=$PG_USER host=$PG_HOST port=$PG_PORT)…"
+  log "Checking PostgreSQL connection (user=$PG_USER host=$PG_HOST port=$PG_PORT)..."
   if ! psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
     fail "Cannot connect to Postgres as '$PG_USER' at $PG_HOST:$PG_PORT. Start Postgres, set PG_USER/PG_HOST/PG_PORT, or re-run with USE_DOCKER_POSTGRES=1."
   fi
@@ -320,12 +475,12 @@ else
   if psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1; then
     ok "Database '$PG_DB' already exists"
   else
-    log "Creating database '$PG_DB'…"
+    log "Creating database '$PG_DB'..."
     psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -c "CREATE DATABASE $PG_DB;" >/dev/null
     ok "Database '$PG_DB' created"
   fi
 
-  log "Enabling required extensions in '$PG_DB'…"
+  log "Enabling required extensions in '$PG_DB'..."
   psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null
   ok "Extensions ready (vector, pgcrypto)"
 fi
@@ -344,7 +499,7 @@ INGEST_ENV="$REPO_ROOT/packages/ingestion/.env"
 if [[ -f "$SERVER_ENV" ]]; then
   ok "$SERVER_ENV already exists (leaving untouched)"
 else
-  log "Writing $SERVER_ENV…"
+  log "Writing $SERVER_ENV..."
   cat > "$SERVER_ENV" <<EOF
 PORT=9012
 OLLAMA_BASE_URL=http://localhost:11434/
@@ -357,7 +512,7 @@ fi
 if [[ -f "$INGEST_ENV" ]]; then
   ok "$INGEST_ENV already exists (leaving untouched)"
 else
-  log "Writing $INGEST_ENV…"
+  log "Writing $INGEST_ENV..."
   cat > "$INGEST_ENV" <<EOF
 HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
@@ -368,58 +523,53 @@ fi
 
 # --- 5. node deps ----------------------------------------------------------
 
-log "Installing Node dependencies (pnpm install)…"
+log "Installing Node dependencies (pnpm install)..."
 pnpm install
 ok "Node dependencies installed"
 
 # --- 6. python deps --------------------------------------------------------
 
-log "Syncing Python dependencies (uv sync)…"
+log "Syncing Python dependencies (uv sync)..."
 (cd packages/ingestion && uv sync)
 ok "Python dependencies ready"
 
 # --- 7. ML model pre-download ---------------------------------------------
 
-log "Pre-downloading ML models for offline use (~3.7 GB, one-time)…"
+log "Pre-downloading ML models for offline use (~3.7 GB, one-time)..."
 (cd packages/ingestion && uv run python download_models.py)
 ok "ML models cached under ~/.cache/huggingface/hub/"
 
-# --- 8. ingest -------------------------------------------------------------
+# --- 8. stage PDFs (no auto-ingest) ---------------------------------------
 
-log "Preparing textbook PDFs from repo source…"
+log "Staging textbook PDFs from repo source for manual ingestion..."
 stage_repo_pdfs
 
 PDF_COUNT=$(find "$PDF_TARGET_DIR" -name '*.pdf' 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$PDF_COUNT" == "0" ]]; then
-  warn "No PDFs found under $PDF_TARGET_DIR. Skipping ingestion."
-  warn "Drop PDFs under $PDF_SOURCE_DIR/class_<N>/<Subject>.pdf and re-run this script."
+  warn "No PDFs found under $PDF_TARGET_DIR."
+  warn "Drop PDFs under $PDF_SOURCE_DIR/class_<N>/<Subject>.pdf before running ingestion."
 else
-  log "Found $PDF_COUNT PDF(s) — running ingestion (this can take 5–15 minutes)…"
-  log "Ingestion command: cd packages/ingestion && uv run python src/main.py ingest $INGEST_FLAGS"
-  (cd packages/ingestion && uv run python src/main.py ingest $INGEST_FLAGS)
-  ok "Ingestion complete"
+  ok "Staged $PDF_COUNT PDF(s) under $PDF_TARGET_DIR — ready for manual ingestion."
 fi
 
 # --- 9. final summary ------------------------------------------------------
 
-if [[ "$USE_DOCKER_POSTGRES" == "1" ]]; then
-  CHUNK_COUNT=$(docker exec "$DOCKER_POSTGRES_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc 'SELECT COUNT(*) FROM rag_chunks' 2>/dev/null || echo "0")
-else
-  CHUNK_COUNT=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAc 'SELECT COUNT(*) FROM rag_chunks' 2>/dev/null || echo "0")
-fi
 log "----------------------------------------------------------------"
-ok  "Setup complete."
-ok  "rag_chunks rows in Postgres: $CHUNK_COUNT"
+ok  "Setup complete. (Ingestion has NOT been run — do it manually.)"
 log ""
-log "Next:"
-log "  pnpm dev          # client on http://localhost:5173, server on :9012"
-log "  Manual re-ingest: cd packages/ingestion && uv run python src/main.py ingest $INGEST_FLAGS"
-log "  Class-only ingest: cd packages/ingestion && uv run python src/main.py ingest --class class_3 --no-questions"
+log "Next steps — follow demo.md for the full judge walkthrough:"
+log "  1. Start the dev servers:"
+log "       pnpm dev          # client on http://localhost:5173, server on :9012"
+log ""
+log "  2. Run ingestion manually from the repo root:"
+log "       cd packages/ingestion && uv run python src/main.py ingest $INGEST_FLAGS"
+log "     (class-only: cd packages/ingestion && uv run python src/main.py ingest --class class_3 --no-questions)"
 log ""
 if [[ "$SEED_DEMO_DATA" == "1" ]]; then
   log "Sample school + roster were auto-seeded because SEED_DEMO_DATA=1 was set."
 else
   log "Optional school setup: use the UI at /setup, set SEED_DEMO_DATA=1, or use the sample SQL in demo.md."
 fi
-log "Then follow demo.md for the judge walkthrough and setup details."
+log ""
+log "👉 Follow demo.md for the judge walkthrough and setup details."
 log "----------------------------------------------------------------"

@@ -1,17 +1,32 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { Wifi, Lock, Users, Tablet as TabletIcon, ArrowRight, Heart, AlertCircle } from "lucide-svelte";
+  import { Lock, Users, Tablet as TabletIcon, ArrowRight, Heart, AlertCircle } from "lucide-svelte";
   import { Button, Card } from "@shadcn";
 
   import { DateNav, Page, PageHeader, Pill } from "@components";
   import { CLASSES, type ClassInfo } from "@mocks";
-  import { activeClass, reteachTopics } from "@stores";
+  import { activeClass, reteachTopics, schoolConfig } from "@stores";
 
   void reteachTopics.load();
+  void schoolConfig.load();
   const readOnly = $derived(reteachTopics.readOnly);
-  const pairedTabletCount = $derived(CLASSES.length);
+
+  // Only classes that actually exist in this school's roster render. The
+  // visual presets (color/Tamil name) for grade-levels 1-5 still come from
+  // the CLASSES mock — but the student count is the live roster size, and
+  // a class with zero students never shows.
+  const classList = $derived.by<ClassInfo[]>(() => {
+    const byClass = schoolConfig.studentsByClass;
+    return CLASSES
+      .map((preset) => {
+        const roster = byClass[preset.id] ?? [];
+        return { ...preset, students: roster.length };
+      })
+      .filter((cls) => cls.students > 0);
+  });
+
   const activeHandoff = $derived.by(() => {
-    const cls = CLASSES.find((candidate) => candidate.id === activeClass.id);
+    const cls = classList.find((candidate) => candidate.id === activeClass.id);
     if (!cls) return null;
 
     const selectedTopic = reteachTopics.getSelectedTopic(cls.id);
@@ -42,7 +57,6 @@
         value={reteachTopics.currentDate}
         onChange={(d) => void reteachTopics.setDate(d)}
       />
-      <Pill tone="success"><Wifi class="size-3" /> {pairedTabletCount} tablets paired</Pill>
       {#if activeHandoff}
         <Pill tone="cobalt">
           <Lock class="size-3" />
@@ -63,8 +77,17 @@
     </div>
   {/if}
 
+  {#if classList.length === 0}
+    <Card class="border-clay-100 bg-clay-50 p-8 text-center">
+      <div class="text-[16px] font-semibold">No classes set up yet</div>
+      <div class="text-text-secondary mx-auto mt-1.5 max-w-md text-[12px]">
+        Add students to at least one class from the school setup screen, and the handoff cards will appear here.
+      </div>
+    </Card>
+  {/if}
+
   <div class="grid grid-cols-1 gap-4.5 sm:grid-cols-2 lg:grid-cols-3">
-    {#each CLASSES as cls (cls.id)}
+    {#each classList as cls (cls.id)}
       {@const topics = reteachTopics.get(cls.id)}
       {@const hasTopics = topics.length > 0}
       {@const isActive = activeHandoff?.cls.id === cls.id}
